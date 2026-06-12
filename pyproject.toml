@@ -1,9 +1,56 @@
 [project]
 name = "aio-codenova-aic2026"
 version = "0.1.0"
-description = "Add your description here"
+description = "Resumable video retrieval pipeline using shot decomposition and CLIP-style search"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "faiss-gpu-cu12>=1.14.1.post1",
+    "numpy>=2.4.6",
+    "opencv-python>=4.13.0.92",
+    "pillow>=12.2.0",
     "pre-commit>=4.6.0",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "transformers>=5.12.0",
 ]
+
+[project.scripts]
+codenova = "cli.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+exclude = ["external"]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/cli",
+    "src/config",
+    "src/core",
+    "src/embedding",
+    "src/index",
+    "src/pipeline",
+    "src/retrieval",
+    "src/video",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
