@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import json
 
 from config.settings import Experiment
-from core.types import FrameRecord, SearchResult
+from core.types import FrameRecord, SearchResult, VideoRecord
 from embedding.clip_model import TransformersClipEmbedder
 from index.faiss_index import FaissVectorIndex
 from pipeline.manifest import JsonlManifest
@@ -44,18 +45,24 @@ def search_index(experiment: Experiment, query: str, top_k: int) -> list[SearchR
     )
     raw_results = index.search(embedder.embed_text(query), top_k=top_k)
     frame_lookup = _load_frame_lookup(experiment)
+    video_lookup = _load_video_lookup(experiment)
     hydrated = []
     for result in raw_results:
         frame = frame_lookup.get(result.frame_id)
         if frame is None:
             hydrated.append(result)
             continue
+        video = video_lookup.get(frame.video_id)
         hydrated.append(
             SearchResult(
                 frame_id=frame.frame_id,
                 video_id=frame.video_id,
                 score=result.score,
                 frame_path=frame.frame_path,
+                video_path=video.path if video else None,
+                video_name=Path(video.path).name if video else None,
+                shot_id=frame.shot_id,
+                frame_index=frame.frame_index,
                 timestamp_sec=frame.timestamp_sec,
             )
         )
@@ -66,3 +73,9 @@ def _load_frame_lookup(experiment: Experiment) -> dict[str, FrameRecord]:
     manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
     frames = [FrameRecord.from_dict(row) for row in manifest.read_all()]
     return {frame.frame_id: frame for frame in frames}
+
+
+def _load_video_lookup(experiment: Experiment) -> dict[str, VideoRecord]:
+    manifest = JsonlManifest(experiment.run_dir / "manifests" / "videos.jsonl")
+    videos = [VideoRecord.from_dict(row) for row in manifest.read_all()]
+    return {video.video_id: video for video in videos}

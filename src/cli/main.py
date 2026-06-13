@@ -16,6 +16,7 @@ from pipeline.frames import extract_frames
 from pipeline.ingest import ingest_videos
 from pipeline.indexing import build_index, search_index
 from pipeline.shots import detect_shots
+from ui.server import serve_ui
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,6 +64,11 @@ def build_parser() -> ArgumentParser:
     search_parser = subparsers.add_parser("search", help="Search videos by text query")
     add_run_args(search_parser)
     search_parser.add_argument("query")
+
+    ui_parser = subparsers.add_parser("serve-ui", help="Serve the local retrieval UI")
+    add_run_args(ui_parser)
+    ui_parser.add_argument("--host", default="127.0.0.1")
+    ui_parser.add_argument("--port", default=7860, type=int)
 
     validate_parser = subparsers.add_parser("validate-experiment-name", help="Validate a run name")
     validate_parser.add_argument("name", help="Experiment name to validate")
@@ -189,6 +195,19 @@ def handle_search(args: Namespace) -> int:
     return 0
 
 
+def handle_serve_ui(args: Namespace) -> int:
+    """Serve browser UI for one experiment."""
+    experiment = load_experiment(args)
+    print(f"Serving retrieval UI at http://{args.host}:{args.port}")
+    serve_ui(
+        experiment=experiment,
+        host=args.host,
+        port=args.port,
+        default_top_k=args.top_k,
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the command-line interface."""
     parser = build_parser()
@@ -211,6 +230,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_build_index(args)
         if args.command == "search":
             return handle_search(args)
+        if args.command == "serve-ui":
+            return handle_serve_ui(args)
     except CodeNovaError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

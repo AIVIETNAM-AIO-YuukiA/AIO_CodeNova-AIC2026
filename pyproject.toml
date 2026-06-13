@@ -48,6 +48,7 @@ packages = [
     "src/index",
     "src/pipeline",
     "src/retrieval",
+    "src/ui",
     "src/video",
 ]
 

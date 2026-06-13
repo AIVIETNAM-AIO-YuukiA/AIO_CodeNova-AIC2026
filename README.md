@@ -243,6 +243,219 @@ uv run codenova search \
   "a person riding a motorbike"
 ```
 
+### 7. Serve local UI
+
+The UI shows a query form, retrieval-track selector, and result frame images:
+
+```bash
+uv run codenova serve-ui \
+  --experiment-name "$EXPERIMENT" \
+  --host 127.0.0.1 \
+  --port 7860
+```
+
+Open:
+
+```text
+http://127.0.0.1:7860
+```
+
+Supported UI tracks:
+
+| Track | Current behavior |
+|-------|------------------|
+| Textual KIS | Uses the query/context text to search CLIP frame embeddings |
+| VQA | Combines scene context + question + query, then searches CLIP frame embeddings |
+| Question Answering | Combines question + context + query, then searches CLIP frame embeddings |
+| Visual KIS | Uses query/context text until image-query support is added |
+
+Example Textual KIS query:
+
+```text
+A sequence of shots taken from a moving motorbike. In the first shot we see a
+view under the rider's left arm, the handlebar, both mirrors and the rider's hands
+are visible.
+```
+
+Example VQA context/question:
+
+```text
+Context:
+Two women are having a conversation over the telephone. One is trying to hang
+pictures from the wall and is asking the other for advice. The video cuts back
+and forth between them. The woman with the pictures then drives to a hardware store.
+
+Question:
+What are the names of the two women?
+```
+
+Important: the UI is track-aware, but the backend currently routes every track through CLIP text-to-frame retrieval. It is useful for inspecting evidence frames now; it is not yet a full VQA answer generator.
+
+Search results include submission-friendly metadata:
+
+```text
+video_name      # original file name, e.g. sample.mp4
+video_path      # original file path from videos.jsonl
+frame_index     # frame number in the source video
+timestamp_sec   # timestamp in seconds
+shot_id         # detected shot id
+frame_id        # internal keyframe id
+score           # CLIP/FAISS similarity score
+```
+
+## Feature status
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Video ingest | Done | Discovers videos and writes `videos.jsonl` |
+| Shot detection | Done | Uses TransNetV2 PyTorch with windowed inference |
+| Keyframe extraction | Done | Uses OpenCV, currently one or more frames per shot |
+| CLIP embeddings | Done | Uses Transformers + PyTorch CUDA |
+| FAISS search | Done | Searches existing embedded keyframes |
+| Local UI | Done | Supports track selector, query fields, result images, and video/frame metadata |
+| Query result persistence | Not yet | UI searches are temporary and are not saved automatically |
+| Batch query testing | Not yet | Needs a `batch-search` command |
+| VQA answer generation | Not yet | Current VQA mode retrieves evidence frames only |
+| Visual query upload | Not yet | Current Visual KIS mode still uses text fields |
+| OCR/ASR indexing | Not yet | Needed for names, signs, dialogue, and text-heavy questions |
+| Incremental FAISS update | Not yet | Current safe path is to rebuild the index |
+
+## Large query testing
+
+The current CLI and UI can run many queries manually, but they are not optimized for large query sets. For hundreds or thousands of queries, add a dedicated batch runner that loads CLIP, FAISS, and metadata once, then loops through all queries.
+
+Proposed input format:
+
+```jsonl
+{"query_id":"q001","track":"textual_kis","query":"a person riding a motorbike","top_k":20}
+{"query_id":"q002","track":"vqa","context":"Two women talk on the phone...", "question":"What are the names of the two women?", "top_k":20}
+```
+
+Proposed command:
+
+```bash
+uv run codenova batch-search \
+  --experiment-name "$EXPERIMENT" \
+  --queries queries/sample_queries.jsonl \
+  --output "runs/$EXPERIMENT/query_results/results.jsonl" \
+  --top-k 20
+```
+
+Proposed output format:
+
+```jsonl
+{"query_id":"q001","track":"textual_kis","retrieval_text":"a person riding a motorbike","results":[...]}
+{"query_id":"q002","track":"vqa","retrieval_text":"Two women talk on the phone... What are the names of the two women?","results":[...]}
+```
+
+The batch runner should support:
+
+- resume by skipping completed `query_id`;
+- per-query errors without stopping the whole run;
+- JSONL output for easy evaluation;
+- optional metrics when labels are available;
+- loading CLIP/FAISS/metadata once per process.
+
+## Backend work needed for multiple contest tracks
+
+The UI keeps track-specific fields separate so the backend can evolve without changing the browser contract. The main backend gaps are:
+
+- Add a `TrackQuery`/result schema to persisted search logs, not only UI requests.
+- Add video/shot-level aggregation so Textual KIS can return ranked video segments, not only individual frames.
+- Add VQA answer generation after evidence retrieval, likely using an image/video-language model over top frames or shot clips.
+- Add OCR/ASR metadata indexes for questions involving names, signs, spoken dialogue, or on-screen text.
+- Add visual-query support for Visual KIS, including image upload, image embedding, and image-to-frame search.
+- Add reranking that can combine CLIP score, temporal continuity, OCR/ASR hits, and track-specific signals.
+- Add export formats expected by the contest submission system.
+- Add evaluation scripts per track, for example Recall@K for KIS and answer accuracy/evidence recall for VQA.
+
+## Backend performance and scaling notes
+
+### ONNX and TensorRT
+
+Converting models to ONNX/TensorRT is a useful benchmark path, but it should be treated as an experiment, not assumed faster upfront.
+
+Best candidates:
+
+- CLIP image/text encoders: likely useful for faster embedding and query encoding.
+- TransNetV2: possible, but the current PyTorch windowed inference may already be acceptable compared with video decoding cost.
+
+Recommended plan:
+
+1. Export each model separately to ONNX.
+2. Validate numerical similarity against PyTorch outputs.
+3. Benchmark throughput and latency on the target GPU.
+4. Convert ONNX to TensorRT only if ONNX/runtime benchmarks justify it.
+5. Keep PyTorch as the reference backend for correctness.
+
+### Large datasets and storage
+
+Large datasets can create storage pressure because the pipeline saves:
+
+- extracted JPEG keyframes;
+- CLIP embeddings;
+- FAISS indexes;
+- manifests and logs.
+
+Main risks:
+
+- too many keyframes per shot;
+- high JPEG quality or duplicate frames;
+- rebuilding experiments instead of resuming;
+- storing every sweep/run separately without cleanup.
+
+Mitigations:
+
+- keep `keyframes_per_shot=1` as the baseline;
+- store frames under `runs/<experiment>/frames`;
+- keep manifests as source of truth for resumability;
+- periodically remove failed/obsolete runs;
+- for very large data, consider sharded experiments and indexes.
+
+### Adding new data and FAISS
+
+The current implementation builds a FAISS index from saved embeddings and persists it to disk. If new videos/keyframes are added, the simplest safe workflow is:
+
+```text
+ingest new videos -> detect shots -> extract frames -> embed frames -> rebuild index
+```
+
+FAISS itself can support adding vectors to some index types, but our current metadata files and row-id mapping are written as a full build. For contest reliability, rebuild first. Later we can add an incremental index updater that appends embeddings and updates `frame_ids.json` atomically.
+
+### Vector database decision
+
+Do not replace FAISS immediately. The current contest baseline benefits from FAISS because it is fast, local, reproducible, and simple to store under each experiment.
+
+A vector database becomes useful if the project needs:
+
+- frequent online inserts/deletes;
+- metadata filtering at query time;
+- many users querying at once;
+- many datasets served simultaneously;
+- remote API access;
+- distributed storage or managed index lifecycle.
+
+Good future candidates:
+
+```text
+Qdrant
+Milvus
+LanceDB
+Weaviate
+Chroma
+```
+
+Recommended design before adding one:
+
+```text
+VectorStore
+  add(frame_ids, embeddings, metadata)
+  search(query_embedding, top_k, filters)
+  save/load
+```
+
+Then keep FAISS as the default backend and add a vector database backend only when the metadata/filtering or serving needs justify the extra operational complexity.
+
 ## Artifacts của một run
 
 Kết quả được lưu theo từng experiment:

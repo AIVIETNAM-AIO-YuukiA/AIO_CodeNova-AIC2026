@@ -93,9 +93,13 @@ class SearchResult:
     video_id: str
     score: float
     frame_path: str | None = None
+    video_path: str | None = None
+    video_name: str | None = None
+    shot_id: str | None = None
+    frame_index: int | None = None
     timestamp_sec: float | None = None
 
-    def to_dict(self) -> dict[str, str | float | None]:
+    def to_dict(self) -> dict[str, str | int | float | None]:
         """Serialize the result."""
         return asdict(self)
 
