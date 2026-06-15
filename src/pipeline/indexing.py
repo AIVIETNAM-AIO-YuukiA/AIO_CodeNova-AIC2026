@@ -10,6 +10,7 @@ from core.types import FrameRecord, SearchResult, VideoRecord
 from embedding.clip_model import TransformersClipEmbedder
 from index.faiss_index import FaissVectorIndex
 from pipeline.manifest import JsonlManifest
+from retrieval.query_processor import get_query_processor
 
 
 def build_index(experiment: Experiment, force: bool = False) -> int:
@@ -39,11 +40,17 @@ def search_index(experiment: Experiment, query: str, top_k: int) -> list[SearchR
         model_name=experiment.config.clip_model,
         device=experiment.config.device,
     )
+    # Check if we should use GPU based on experiment device setting
+    use_gpu = experiment.config.device != "cpu"
     index = FaissVectorIndex(
         index_path=experiment.run_dir / "index" / "frames.faiss",
         mapping_path=experiment.run_dir / "index" / "frame_ids.json",
+        use_gpu=use_gpu,
+        require_gpu=False,
     )
-    raw_results = index.search(embedder.embed_text(query), top_k=top_k)
+    processor = get_query_processor()
+    processed = processor.process(query)
+    raw_results = index.search(embedder.embed_text(processed.visual_prompt), top_k=top_k)
     frame_lookup = _load_frame_lookup(experiment)
     video_lookup = _load_video_lookup(experiment)
     hydrated = []
