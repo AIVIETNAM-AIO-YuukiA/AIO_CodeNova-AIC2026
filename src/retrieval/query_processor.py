@@ -39,22 +39,18 @@ class PassThroughQueryProcessor(QueryProcessor):
 class LlmQueryProcessor(QueryProcessor):
     """Query processor backed by Gemini LLM to translate, expand, and parse queries."""
 
-    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash") -> None:
+    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash") -> None:
         self.api_key = api_key
         self.model_name = model_name
-        self._model = None
+        self._client = None
         self._initialized = False
 
     def _init_client(self) -> bool:
         if self._initialized:
             return True
         try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel(
-                model_name=self.model_name,
-                generation_config={"response_mime_type": "application/json"}
-            )
+            from google import genai
+            self._client = genai.Client(api_key=self.api_key)
             self._initialized = True
             return True
         except Exception as exc:
@@ -88,7 +84,14 @@ class LlmQueryProcessor(QueryProcessor):
         }}
         """
         try:
-            response = self._model.generate_content(prompt)
+            from google.genai import types
+            response = self._client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                )
+            )
             data = json.loads(response.text.strip())
             return ProcessedQuery(
                 raw_query=query,
