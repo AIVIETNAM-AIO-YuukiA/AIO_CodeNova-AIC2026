@@ -1,13 +1,22 @@
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import pytest
 
-# Mock google.generativeai module so that the tests can run without installing it
-mock_google = MagicMock()
-mock_genai = MagicMock()
-mock_google.generativeai = mock_genai
-sys.modules["google"] = mock_google
-sys.modules["google.generativeai"] = mock_genai
+# Mock google package and submodules so that the tests can run without installing google-genai
+from types import ModuleType
+google_mock = ModuleType("google")
+genai_mock = ModuleType("google.genai")
+genai_types_mock = ModuleType("google.genai.types")
+
+mock_client_instance = MagicMock()
+genai_mock.Client = MagicMock(return_value=mock_client_instance)
+
+sys.modules["google"] = google_mock
+sys.modules["google.genai"] = genai_mock
+sys.modules["google.genai.types"] = genai_types_mock
+google_mock.genai = genai_mock
+genai_mock.types = genai_types_mock
+genai_types_mock.GenerateContentConfig = MagicMock()
 
 from retrieval.query_processor import (
     ProcessedQuery,
@@ -44,7 +53,7 @@ def test_get_query_processor_resolves_to_llm_when_key_present(monkeypatch) -> No
 
 def test_llm_query_processor_fallback_on_init_failure() -> None:
     # Reset mock to simulate import/config failure
-    mock_genai.configure.side_effect = Exception("Config error")
+    genai_mock.Client.side_effect = Exception("Config error")
     
     processor = LlmQueryProcessor(api_key="test_key")
     processed = processor.process("cảnh nấu ăn")
@@ -53,7 +62,7 @@ def test_llm_query_processor_fallback_on_init_failure() -> None:
     assert processed.visual_prompt == "cảnh nấu ăn"
     
     # Restore mock
-    mock_genai.configure.side_effect = None
+    genai_mock.Client.side_effect = None
 
 
 def test_llm_query_processor_success() -> None:
@@ -67,17 +76,13 @@ def test_llm_query_processor_success() -> None:
     }
     """
     
-    mock_model = MagicMock()
-    mock_model.generate_content.return_value = mock_response
-    mock_genai.GenerativeModel.return_value = mock_model
-
-    mock_genai.configure.reset_mock()
-    mock_genai.reset_mock()
+    mock_client_instance.models.generate_content.return_value = mock_response
+    genai_mock.Client.reset_mock()
     
     processor = LlmQueryProcessor(api_key="test_key")
     processed = processor.process("cảnh nấu ăn")
     
-    mock_genai.configure.assert_called_once_with(api_key="test_key")
+    genai_mock.Client.assert_called_once_with(api_key="test_key")
     assert processed.raw_query == "cảnh nấu ăn"
     assert processed.visual_prompt == "A person preparing food in the kitchen"
     assert processed.ocr_keywords == ["kitchen", "food"]
@@ -90,9 +95,7 @@ def test_llm_query_processor_json_failure_fallback() -> None:
     mock_response = MagicMock()
     mock_response.text = "invalid json response"
     
-    mock_model = MagicMock()
-    mock_model.generate_content.return_value = mock_response
-    mock_genai.GenerativeModel.return_value = mock_model
+    mock_client_instance.models.generate_content.return_value = mock_response
 
     processor = LlmQueryProcessor(api_key="test_key")
     processed = processor.process("cảnh nấu ăn")
