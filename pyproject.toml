@@ -16,8 +16,14 @@ dependencies = [
     "transformers>=5.12.0",
 ]
 
+[project.optional-dependencies]
+# Full-text search backend (OCR/ASR). Not required for the core KIS vector flow.
+text = [
+    "elasticsearch>=8.0.0",
+]
+
 [project.scripts]
-codenova = "cli.main:main"
+codenova = "codenova.cli.main:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -41,19 +47,7 @@ src = ["src", "tests"]
 exclude = ["external"]
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    "src/cli",
-    "src/config",
-    "src/core",
-    "src/index",
-    "src/indexing",
-    "src/modules",
-    "src/prompts",
-    "src/repository",
-    "src/retrieval",
-    "src/ui",
-    "src/video",
-]
+packages = ["src/codenova"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

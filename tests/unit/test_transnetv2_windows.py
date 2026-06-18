@@ -1,6 +1,6 @@
 import numpy as np
 
-from video.shots import transnetv2_windows
+from codenova.video.shots import transnetv2_windows
 
 
 def test_transnetv2_windows_use_fixed_100_frame_inputs() -> None:

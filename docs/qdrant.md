@@ -1,90 +1,78 @@
-# Qdrant — Hướng dẫn sử dụng
+# Qdrant usage
 
-Vector index của project dùng **Qdrant**, một vector database chạy như một service
-riêng (khác FAISS cũ vốn nhúng trong process). Trước khi chạy `build-index` hoặc
-`search`, Qdrant phải đang chạy và biến môi trường trong `.env` phải trỏ đúng vào nó.
+The vector index uses **Qdrant**, which runs as a separate service. Qdrant must be running
+and `.env` must point at it before `build-index` or `search`.
 
-## 1. Khởi động Qdrant
+> 🇻🇳 Bản tiếng Việt: [vi/qdrant.md](vi/qdrant.md)
 
-Cách đơn giản nhất là Docker Compose (đã có sẵn `docker-compose.yml`):
+## 1. Start Qdrant
 
-```bash
-docker compose up -d qdrant      # chạy nền
-docker compose ps                # kiểm tra container
-docker compose logs -f qdrant    # xem log
-docker compose down              # dừng (dữ liệu vẫn giữ trong ./qdrant_storage)
-```
-
-Dữ liệu được lưu vào `./qdrant_storage/` (đã gitignore) nên restart không mất index.
-
-Kiểm tra Qdrant sống:
+The simplest way is Docker Compose (`docker-compose.yml` is included):
 
 ```bash
-curl http://localhost:6333/healthz        # -> "healthz check passed"
+make qdrant-up                   # docker compose up -d qdrant
+docker compose ps                # check the container
+docker compose logs -f qdrant    # view logs
+make qdrant-down                 # stop (data kept in ./qdrant_storage)
 ```
 
-Dashboard web: mở http://localhost:6333/dashboard để xem collection và điểm dữ liệu.
+Data is persisted to `./qdrant_storage/` (git-ignored), so restarts keep the index.
 
-## 2. Cấu hình `.env`
+Health check:
 
-File `.env` ở thư mục gốc (được `python-dotenv` tự load khi chạy `codenova`):
+```bash
+make qdrant-health               # curl http://localhost:6333/healthz
+```
+
+Dashboard: http://localhost:6333/dashboard
+
+## 2. Configure `.env`
 
 ```bash
 QDRANT_URL=http://localhost:6333
 QDRANT_COLLECTION=codenova_frames
-QDRANT_API_KEY=                  # để trống khi chạy local; điền khi dùng Qdrant Cloud
+QDRANT_API_KEY=                  # empty for local; set for Qdrant Cloud
 ```
 
-Mỗi experiment dùng một collection riêng, đặt tên `{QDRANT_COLLECTION}__{experiment_name}`,
-nên nhiều run dùng chung một Qdrant không đè lên nhau.
+Each experiment uses a collection named `{QDRANT_COLLECTION}__{experiment}`, so multiple
+runs sharing one Qdrant never collide.
 
-## 3. Luồng chạy
+## 3. What Qdrant stores
 
-```bash
-# Offline indexing
-codenova ingest        --input data/raw_videos --experiment-name demo
-codenova detect-shots  --experiment-name demo --transnetv2-weights <path.pth>
-codenova extract-frames --experiment-name demo
-codenova embed-frames  --experiment-name demo
-codenova build-index   --experiment-name demo   # <-- upsert embeddings vào Qdrant
+Each point holds the CLIP embedding plus a payload with `frame_id`. Keyframe images stay on
+disk (`runs/<exp>/frames/`); full metadata lives in the run manifests and is joined at query
+time via `frame_id`. `build-index` recreates the collection then upserts all embeddings, so
+rebuilds are idempotent.
 
-# Online retrieval
-codenova search "a person riding a motorbike" --experiment-name demo
-codenova serve-ui --experiment-name demo        # UI tại http://127.0.0.1:7860
-```
-
-`build-index` luôn **recreate** collection rồi upsert lại toàn bộ embeddings, nên chạy
-lại là idempotent (không cần xoá tay).
-
-## 4. Một số thao tác kiểm tra nhanh
+## 4. Quick inspection
 
 ```bash
-# Liệt kê các collection
+# List collections
 curl http://localhost:6333/collections
 
-# Xem thông tin một collection (đổi tên cho đúng experiment)
+# Inspect one collection (replace with your experiment)
 curl http://localhost:6333/collections/codenova_frames__demo
 
-# Xoá một collection nếu muốn build lại từ đầu
+# Delete a collection to rebuild from scratch
 curl -X DELETE http://localhost:6333/collections/codenova_frames__demo
 ```
 
-## 5. Dùng Qdrant Cloud thay vì local
+## 5. Qdrant Cloud
 
-Tạo cluster trên Qdrant Cloud, lấy URL + API key, rồi sửa `.env`:
+Create a cluster, then set in `.env`:
 
 ```bash
 QDRANT_URL=https://<your-cluster>.qdrant.io:6333
 QDRANT_API_KEY=<your-api-key>
 ```
 
-Không cần đổi code — `index/factory.py` đọc thẳng các biến này.
+No code change needed — `codenova.stores.vector.factory` reads these from the environment.
 
-## 6. Lỗi thường gặp
+## 6. Troubleshooting
 
-| Triệu chứng | Nguyên nhân & cách xử lý |
-|---|---|
-| `Connection refused` / `Failed to connect` | Qdrant chưa chạy → `docker compose up -d qdrant` |
-| `Install qdrant-client before using the Qdrant index` | Thiếu dependency → `uv sync` |
-| Search trả về rỗng | Chưa `build-index`, hoặc sai `--experiment-name` (khác collection) |
-| `Cannot build a Qdrant index with zero embeddings` | Chưa chạy `embed-frames` hoặc không có frame nào |
+| Symptom | Cause / fix |
+|---------|-------------|
+| `Connection refused` | Qdrant not running → `make qdrant-up` |
+| `Install qdrant-client ...` | Missing dependency → `uv sync` |
+| Empty search results | Index not built, or wrong `--experiment-name` |
+| `Cannot build a Qdrant index with zero embeddings` | Run `embed-frames` first / no frames found |

@@ -1,6 +1,6 @@
 import pytest
 
-from retrieval.tracks import TrackQuery, build_retrieval_text
+from codenova.retrieval.tracks import TrackQuery, build_retrieval_text
 
 
 def test_textual_kis_uses_query_first() -> None:

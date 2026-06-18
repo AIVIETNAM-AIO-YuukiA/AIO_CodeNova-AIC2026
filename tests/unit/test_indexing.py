@@ -1,7 +1,7 @@
-from config.settings import Experiment, PipelineConfig
-from core.types import SearchResult
-from indexing.manifest import JsonlManifest
-from retrieval.hydrator import ResultHydrator
+from codenova.config.settings import Experiment, PipelineConfig
+from codenova.core.types import SearchResult
+from codenova.indexing.manifest import JsonlManifest
+from codenova.retrieval.hydrator import ResultHydrator
 
 
 def test_hydrator_attaches_video_filename_and_frame_index(tmp_path) -> None:

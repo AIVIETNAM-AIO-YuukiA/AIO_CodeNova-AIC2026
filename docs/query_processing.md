@@ -64,4 +64,4 @@ uv run codenova search --experiment-name "ten-experiment" --device <device> "c�
 ```bash
 uv run codenova serve-ui --experiment-name "ten-experiment" --device <device>
 ```
-Khi bạn nhập câu hỏi tiếng Việt trên giao diện Web, hệ thống sẽ tự động dịch, mở rộng câu lệnh sang tiếng Anh chuẩn xác ở phía backend trước khi truy xuất dữ liệu từ FAISS.
+Khi bạn nhập câu hỏi tiếng Việt trên giao diện Web, hệ thống sẽ tự động dịch, mở rộng câu lệnh sang tiếng Anh chuẩn xác ở phía backend trước khi truy xuất dữ liệu từ Qdrant.

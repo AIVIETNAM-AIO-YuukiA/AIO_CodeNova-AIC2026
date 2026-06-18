@@ -2,8 +2,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from config.settings import PipelineConfig, validate_experiment_name
-from core.errors import ExperimentNameError
+from codenova.config.settings import PipelineConfig, validate_experiment_name
+from codenova.core.errors import ExperimentNameError
 
 
 def test_default_experiment_name_is_valid_and_stable() -> None:
