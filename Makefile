@@ -8,6 +8,7 @@ EXP         ?= demo
 INPUT       ?= data/raw_videos
 TOPK        ?= 20
 QUERY       ?= a person riding a motorbike
+RESUME      ?=          # set to 1 to resume an existing experiment (e.g. make pipeline RESUME=1)
 # HOST/PORT empty -> fall back to CODENOVA_UI_HOST/PORT in .env (CLI defaults)
 HOST        ?=
 PORT        ?=
@@ -57,8 +58,8 @@ qdrant-health: ## Check Qdrant health
 	curl -sf http://localhost:6333/healthz && echo
 
 ## --- Offline indexing pipeline ---
-ingest: ## Discover videos (INPUT, EXP)
-	uv run codenova ingest --input $(INPUT) --experiment-name $(EXP)
+ingest: ## Discover videos (INPUT, EXP; RESUME=1 to reuse an existing run)
+	uv run codenova ingest --input $(INPUT) --experiment-name $(EXP) $(if $(RESUME),--resume)
 
 detect-shots: ## Detect shots with TransNetV2 (EXP)
 	uv run codenova detect-shots --experiment-name $(EXP) \

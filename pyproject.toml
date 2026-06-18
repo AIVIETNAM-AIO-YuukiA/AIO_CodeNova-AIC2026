@@ -23,7 +23,7 @@ text = [
 ]
 
 [project.scripts]
-codenova = "codenova.cli.main:main"
+codenova = "cli.main:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -33,6 +33,7 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
+    "elasticsearch>=8.0.0",  # also exposed as the `text` extra; here so dev env always has it
 ]
 
 [[tool.uv.index]]
@@ -47,7 +48,19 @@ src = ["src", "tests"]
 exclude = ["external"]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/codenova"]
+packages = [
+    "src/cli",
+    "src/config",
+    "src/core",
+    "src/indexing",
+    "src/modules",
+    "src/prompts",
+    "src/repository",
+    "src/retrieval",
+    "src/stores",
+    "src/ui",
+    "src/video",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

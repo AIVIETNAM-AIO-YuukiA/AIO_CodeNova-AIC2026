@@ -1,7 +1,7 @@
 import pytest
 
-from codenova.core.errors import FrameExtractionError
-from codenova.video.frames import DEFAULT_KEYFRAME_PERCENTILES, sample_frame_indices
+from core.errors import FrameExtractionError
+from video.frames import DEFAULT_KEYFRAME_PERCENTILES, sample_frame_indices
 
 
 def test_default_percentiles() -> None:

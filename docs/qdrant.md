@@ -66,7 +66,7 @@ QDRANT_URL=https://<your-cluster>.qdrant.io:6333
 QDRANT_API_KEY=<your-api-key>
 ```
 
-No code change needed — `codenova.stores.vector.factory` reads these from the environment.
+No code change needed — `stores.vector.factory` reads these from the environment.
 
 ## 6. Troubleshooting
 

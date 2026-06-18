@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from codenova.modules.embedding.clip import clip_features_tensor
+from modules.embedding.clip import clip_features_tensor
 
 
 def test_clip_features_tensor_accepts_plain_tensor() -> None:

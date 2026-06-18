@@ -1,26 +1,27 @@
 # CodeNova (Tiếng Việt)
 
-Pipeline truy hồi video có thể resume, dùng phân rã shot + tìm kiếm ngữ nghĩa kiểu CLIP.
+CodeNova là pipeline truy hồi video: tách video thành shot, lấy keyframe, embed bằng CLIP
+và index vào Qdrant; truy vấn bằng text để tìm đúng khoảnh khắc (known-item search, KIS).
 
-Video được tách thành shot, lấy keyframe, embed bằng CLIP và index vào Qdrant. Câu truy
-vấn dạng text được embed rồi so khớp với keyframe để làm known-item search (KIS).
+Pipeline chạy tiếp được sau khi gián đoạn: mỗi bước ghi tiến độ (vào `jobs.sqlite` và các
+manifest), nên khi chạy lại sẽ bỏ qua phần đã hoàn tất thay vì làm lại từ đầu.
 
 > Bản tiếng Anh: [../../README.md](../../README.md)
 
 ## Pipeline
 
 ```
-OFFLINE (codenova.indexing)
+OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
 
-ONLINE (codenova.retrieval)
+ONLINE (retrieval)
   text query → CLIP embed → Qdrant search → hydrate metadata → kết quả
 ```
 
 ## Cấu trúc thư mục
 
 ```
-src/codenova/
+src/
   cli/            # giao diện dòng lệnh
   config/         # cấu hình, đặt tên experiment, nạp .env
   core/           # logging, errors, kiểu dữ liệu
@@ -123,7 +124,7 @@ giữa, gần cuối). Với shot rất ngắn, các index trùng nhau sẽ gộ
 
 ## Storage backend
 
-Storage nằm trong `codenova.stores`, mỗi backend nằm sau một interface để thêm backend mới
+Storage nằm trong `stores`, mỗi backend nằm sau một interface để thêm backend mới
 mà không phải sửa pipeline:
 
 - **`stores/vector`** — Qdrant. Embedding đã L2-normalize nên cosine distance xếp hạng như

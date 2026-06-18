@@ -29,6 +29,7 @@ text = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "elasticsearch" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -50,6 +51,7 @@ provides-extras = ["text"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "elasticsearch", specifier = ">=8.0.0" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "ruff", specifier = ">=0.4.0" },
 ]

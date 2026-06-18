@@ -11,17 +11,17 @@ search (KIS).
 ## Pipeline
 
 ```
-OFFLINE (codenova.indexing)
+OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
 
-ONLINE (codenova.retrieval)
+ONLINE (retrieval)
   text query → CLIP embed → Qdrant search → hydrate metadata → results
 ```
 
 ## Project layout
 
 ```
-src/codenova/
+src/
   cli/            # command-line interface
   config/         # settings, experiment naming, .env loading
   core/           # logging, errors, typed records
@@ -136,7 +136,7 @@ keyframe.
 
 ## Storage backends
 
-Storage lives under `codenova.stores`, each backend behind an interface so new ones can be
+Storage lives under `stores`, each backend behind an interface so new ones can be
 added without touching the pipeline:
 
 - **`stores/vector`** — Qdrant. Embeddings are L2-normalized so cosine distance ranks like

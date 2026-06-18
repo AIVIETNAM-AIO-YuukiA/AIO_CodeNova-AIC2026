@@ -1,10 +1,10 @@
 import pytest
 
-from codenova.config.settings import Experiment, PipelineConfig
-from codenova.stores.text import TextDocument, TextIndex, build_text_index
-from codenova.stores.text.elasticsearch import ElasticTextIndex
-from codenova.stores.vector import QdrantVectorIndex, VectorIndex
-from codenova.stores.vector.factory import build_vector_index
+from config.settings import Experiment, PipelineConfig
+from stores.text import TextDocument, TextIndex, build_text_index
+from stores.text.elasticsearch import ElasticTextIndex
+from stores.vector import QdrantVectorIndex, VectorIndex
+from stores.vector.factory import build_vector_index
 
 
 def test_build_vector_index_returns_qdrant_with_namespaced_collection(
