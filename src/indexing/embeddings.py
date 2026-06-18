@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
-import logging
+from core.logging import get_logger
 
 from config.settings import Experiment
 from core.types import FrameRecord
-from embedding.clip_model import TransformersClipEmbedder
-from pipeline.manifest import JsonlManifest
-from pipeline.state import JobState
+from modules.embedding import TransformersClipEmbedder
+from indexing.manifest import JsonlManifest
+from indexing.state import JobState
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = False) -> int:

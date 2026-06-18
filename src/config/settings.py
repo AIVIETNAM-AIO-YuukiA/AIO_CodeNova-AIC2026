@@ -47,7 +47,7 @@ class PipelineConfig:
     pipeline: str = "retrieval"
     clip_model: str = "clip-vit-b-32"
     frame_sampling: str = "shot-midpoint"
-    index_backend: str = "faiss-flat-ip"
+    index_backend: str = "qdrant"
     keyframes_per_shot: int = 1
     top_k: int = 20
     device: str = "auto"

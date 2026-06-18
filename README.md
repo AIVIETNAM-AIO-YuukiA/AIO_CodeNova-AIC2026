@@ -27,10 +27,12 @@ src/
   config/       # cấu hình và experiment naming
   core/         # logging, errors, typed records
   video/        # video discovery, shot detection, frame extraction
-  embedding/    # CLIP interfaces
-  index/        # vector index interfaces
-  retrieval/    # query/search orchestration
-  pipeline/     # manifest, SQLite state, ingest/query flows
+  indexing/     # offline pipeline: ingest -> shots -> frames -> embeddings -> build_index
+  retrieval/    # online: search, metadata hydration, contest tracks
+  modules/      # AI models: embedding (CLIP) + stub asr/ocr/captioning/detection/reranker
+  index/        # vector index interface + Qdrant backend + factory
+  repository/   # data access layer (đọc records từ manifest)
+  prompts/      # prompt templates cho LLM/VLM (stub)
   cli/          # command-line interface
 ```
 
@@ -39,7 +41,7 @@ Các backend nặng được tách sau interface riêng:
 - TransNetV2: chạy qua PyTorch implementation khi truyền `--transnetv2-module-dir` và `--transnetv2-weights`;
 - OpenCV: đọc video và xuất keyframe;
 - CLIP: dùng Hugging Face Transformers + PyTorch CUDA;
-- FAISS: dùng `faiss-gpu-cu12` và tự kiểm tra GPU API khi build/search index.
+- Qdrant: vector index chạy như một service riêng (xem [docs/qdrant.md](docs/qdrant.md)).
 
 ## Experiment naming
 
@@ -59,13 +61,13 @@ uv run codenova name-experiment
 Ví dụ:
 
 ```text
-20260612_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_a13f9c2d
+20260612_retrieval_clip-vit-b-32_shot-midpoint_qdrant_506f72d1
 ```
 
 Kiểm tra tên:
 
 ```bash
-uv run codenova validate-experiment-name 20260612_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_a13f9c2d
+uv run codenova validate-experiment-name 20260612_retrieval_clip-vit-b-32_shot-midpoint_qdrant_506f72d1
 ```
 
 ## Kiểm tra GPU
@@ -77,7 +79,7 @@ Một số package là GPU-capable, một số chỉ là package hỗ trợ CPU:
 | `torch`, `torchvision` | Có | Cài CUDA-enabled wheel bằng `uv` |
 | CLIP qua `transformers` | Có | Model chạy trên CUDA thông qua PyTorch |
 | TransNetV2 PyTorch | Có | Code yêu cầu CUDA khi `--device auto` |
-| `faiss-gpu-cu12` | Có | Có FAISS GPU API |
+| `qdrant-client` | N/A | Client kết nối Qdrant service; tăng tốc nằm ở server |
 | `opencv-python` | Không chính | Dùng để decode video và ghi ảnh |
 | `pillow`, `numpy` | Không chính | Dùng cho load ảnh và array CPU |
 
@@ -86,14 +88,12 @@ Kiểm tra CUDA:
 ```bash
 uv run python - <<'PY'
 import torch
-import faiss
 
 print("torch:", torch.__version__)
 print("torch cuda runtime:", torch.version.cuda)
 print("cuda available:", torch.cuda.is_available())
 print("device count:", torch.cuda.device_count())
 print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
-print("faiss gpu api:", hasattr(faiss, "StandardGpuResources"))
 PY
 ```
 
@@ -103,7 +103,6 @@ Kết quả mong đợi nếu máy có GPU NVIDIA và CUDA hoạt động:
 cuda available: True
 device count: <number-of-gpus>
 device: <gpu-name>
-faiss gpu api: True
 ```
 
 `nvidia-smi` kiểm tra driver NVIDIA. `torch.cuda.is_available()` kiểm tra Python/PyTorch có khởi tạo CUDA được trong environment hiện tại không. Cả hai nên hoạt động.
@@ -228,7 +227,16 @@ uv run codenova embed-frames \
 
 Nếu CUDA OOM, giảm `--batch-size` xuống `4` hoặc `2`.
 
-### 5. Build FAISS GPU index
+### 5. Build Qdrant vector index
+
+Index dùng **Qdrant** (chạy như một service riêng). Bật Qdrant trước khi build:
+
+```bash
+docker compose up -d qdrant
+curl http://localhost:6333/healthz   # -> healthz check passed
+```
+
+Connection lấy từ `.env` ở thư mục gốc (xem `.env.example`). Chi tiết: [docs/qdrant.md](docs/qdrant.md).
 
 ```bash
 uv run codenova build-index \
@@ -300,7 +308,7 @@ frame_index     # frame number in the source video
 timestamp_sec   # timestamp in seconds
 shot_id         # detected shot id
 frame_id        # internal keyframe id
-score           # CLIP/FAISS similarity score
+score           # CLIP/Qdrant cosine similarity score
 ```
 
 ## Feature status
@@ -311,18 +319,18 @@ score           # CLIP/FAISS similarity score
 | Shot detection | Done | Uses TransNetV2 PyTorch with windowed inference |
 | Keyframe extraction | Done | Uses OpenCV, currently one or more frames per shot |
 | CLIP embeddings | Done | Uses Transformers + PyTorch CUDA |
-| FAISS search | Done | Searches existing embedded keyframes |
+| Qdrant search | Done | Searches existing embedded keyframes via Qdrant |
 | Local UI | Done | Supports track selector, query fields, result images, and video/frame metadata |
 | Query result persistence | Not yet | UI searches are temporary and are not saved automatically |
 | Batch query testing | Not yet | Needs a `batch-search` command |
 | VQA answer generation | Not yet | Current VQA mode retrieves evidence frames only |
 | Visual query upload | Not yet | Current Visual KIS mode still uses text fields |
 | OCR/ASR indexing | Not yet | Needed for names, signs, dialogue, and text-heavy questions |
-| Incremental FAISS update | Not yet | Current safe path is to rebuild the index |
+| Incremental index update | Not yet | Current safe path is to rebuild the Qdrant collection |
 
 ## Large query testing
 
-The current CLI and UI can run many queries manually, but they are not optimized for large query sets. For hundreds or thousands of queries, add a dedicated batch runner that loads CLIP, FAISS, and metadata once, then loops through all queries.
+The current CLI and UI can run many queries manually, but they are not optimized for large query sets. For hundreds or thousands of queries, add a dedicated batch runner that loads CLIP and metadata once (reusing a single `Retriever`), then loops through all queries.
 
 Proposed input format:
 
@@ -354,7 +362,7 @@ The batch runner should support:
 - per-query errors without stopping the whole run;
 - JSONL output for easy evaluation;
 - optional metrics when labels are available;
-- loading CLIP/FAISS/metadata once per process.
+- loading CLIP/metadata once per process (Qdrant runs as a shared service).
 
 ## Backend work needed for multiple contest tracks
 
@@ -394,8 +402,9 @@ Large datasets can create storage pressure because the pipeline saves:
 
 - extracted JPEG keyframes;
 - CLIP embeddings;
-- FAISS indexes;
 - manifests and logs.
+
+(Vector index nằm trong Qdrant — `qdrant_storage/` — không phải trong `runs/`.)
 
 Main risks:
 
@@ -412,49 +421,29 @@ Mitigations:
 - periodically remove failed/obsolete runs;
 - for very large data, consider sharded experiments and indexes.
 
-### Adding new data and FAISS
+### Adding new data
 
-The current implementation builds a FAISS index from saved embeddings and persists it to disk. If new videos/keyframes are added, the simplest safe workflow is:
+`build-index` đọc embeddings đã lưu rồi recreate + upsert vào Qdrant. Khi thêm video/keyframe mới, workflow an toàn nhất là:
 
 ```text
 ingest new videos -> detect shots -> extract frames -> embed frames -> rebuild index
 ```
 
-FAISS itself can support adding vectors to some index types, but our current metadata files and row-id mapping are written as a full build. For contest reliability, rebuild first. Later we can add an incremental index updater that appends embeddings and updates `frame_ids.json` atomically.
+`build-index` luôn recreate collection nên việc rebuild là idempotent. Sau này có thể thêm incremental updater chỉ upsert phần embeddings mới thay vì rebuild toàn bộ.
 
-### Vector database decision
+### Vector database backend
 
-Do not replace FAISS immediately. The current contest baseline benefits from FAISS because it is fast, local, reproducible, and simple to store under each experiment.
-
-A vector database becomes useful if the project needs:
-
-- frequent online inserts/deletes;
-- metadata filtering at query time;
-- many users querying at once;
-- many datasets served simultaneously;
-- remote API access;
-- distributed storage or managed index lifecycle.
-
-Good future candidates:
+Index dùng **Qdrant** qua interface `VectorIndex` ([src/index/base.py](src/index/base.py)):
 
 ```text
-Qdrant
-Milvus
-LanceDB
-Weaviate
-Chroma
+VectorIndex
+  build(embeddings, frame_ids)
+  search(query_embedding, top_k)
 ```
 
-Recommended design before adding one:
+`QdrantVectorIndex` ([src/index/qdrant_index.py](src/index/qdrant_index.py)) là implementation hiện tại; `build_vector_index()` ([src/index/factory.py](src/index/factory.py)) dựng nó từ config + biến môi trường. Muốn thêm backend khác (Milvus, LanceDB, ...) chỉ cần implement `VectorIndex` và mở rộng factory — phần `indexing/` và `retrieval/` không phải đổi.
 
-```text
-VectorStore
-  add(frame_ids, embeddings, metadata)
-  search(query_embedding, top_k, filters)
-  save/load
-```
-
-Then keep FAISS as the default backend and add a vector database backend only when the metadata/filtering or serving needs justify the extra operational complexity.
+Embeddings được L2-normalize nên Qdrant dùng cosine distance (tương đương inner-product). Mỗi experiment dùng collection riêng: `{QDRANT_COLLECTION}__{experiment_name}`.
 
 ## Artifacts của một run
 
@@ -476,12 +465,11 @@ runs/<experiment-name>/
   embeddings/
     frames.npz
     frame_ids.json
-  index/
-    frames.faiss
-    frame_ids.json
 ```
 
-`runs/`, `data/`, và `external/` được ignore khỏi git.
+Vector index không nằm trong `runs/` mà trong Qdrant (collection `{QDRANT_COLLECTION}__<experiment-name>`, lưu tại `qdrant_storage/`).
+
+`runs/`, `data/`, `external/`, `qdrant_storage/`, và `.env` đều được ignore khỏi git.
 
 ## Resume và chạy lại stage
 

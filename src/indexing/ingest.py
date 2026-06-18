@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-import logging
+from core.logging import get_logger
 
 from config.settings import Experiment
-from pipeline.manifest import JsonlManifest
-from pipeline.state import JobState
+from indexing.manifest import JsonlManifest
+from indexing.state import JobState
 from video.discovery import discover_videos
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def ingest_videos(experiment: Experiment, input_dir: Path, force: bool = False) -> int:

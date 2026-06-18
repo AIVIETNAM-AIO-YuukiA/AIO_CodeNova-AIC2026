@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import logging
+from core.logging import get_logger
 
 from config.settings import Experiment
 from core.types import VideoRecord
-from pipeline.manifest import JsonlManifest
-from pipeline.shots import load_shots_by_video
-from pipeline.state import JobState
+from indexing.manifest import JsonlManifest
+from indexing.shots import load_shots_by_video
+from indexing.state import JobState
 from video.frames import OpenCVFrameExtractor
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def extract_frames(experiment: Experiment, force: bool = False) -> int:

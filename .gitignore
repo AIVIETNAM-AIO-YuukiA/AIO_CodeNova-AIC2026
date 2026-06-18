@@ -224,3 +224,7 @@ __marimo__/
 
 # Queries
 query/
+
+hcmc_ai_challenge_pipeline_analysis.md
+# Qdrant local data
+qdrant_storage/

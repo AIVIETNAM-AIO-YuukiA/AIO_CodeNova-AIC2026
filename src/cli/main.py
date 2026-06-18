@@ -5,20 +5,22 @@ from __future__ import annotations
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
 import json
-import logging
 import sys
+
+from dotenv import load_dotenv
 
 from config.settings import Experiment, PipelineConfig, validate_experiment_name
 from core.errors import CodeNovaError
-from core.logging import configure_logging
-from pipeline.embeddings import embed_frames
-from pipeline.frames import extract_frames
-from pipeline.ingest import ingest_videos
-from pipeline.indexing import build_index, search_index
-from pipeline.shots import detect_shots
+from core.logging import configure_logging, get_logger
+from indexing.build_index import build_index
+from indexing.embeddings import embed_frames
+from indexing.frames import extract_frames
+from indexing.ingest import ingest_videos
+from indexing.shots import detect_shots
+from retrieval import build_retriever
 from ui.server import serve_ui
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def build_parser() -> ArgumentParser:
@@ -82,7 +84,7 @@ def add_config_args(parser: ArgumentParser) -> None:
     parser.add_argument("--runs-dir", default=Path("runs"), type=Path)
     parser.add_argument("--clip-model", default="clip-vit-b-32")
     parser.add_argument("--frame-sampling", default="shot-midpoint")
-    parser.add_argument("--index-backend", default="faiss-flat-ip")
+    parser.add_argument("--index-backend", default="qdrant")
     parser.add_argument("--keyframes-per-shot", default=1, type=int)
     parser.add_argument("--top-k", default=20, type=int)
     parser.add_argument("--device", default="auto")
@@ -190,7 +192,8 @@ def handle_build_index(args: Namespace) -> int:
 def handle_search(args: Namespace) -> int:
     """Run text search."""
     experiment = load_experiment(args)
-    results = search_index(experiment=experiment, query=args.query, top_k=args.top_k)
+    retriever = build_retriever(experiment)
+    results = retriever.search(query=args.query, top_k=args.top_k)
     print(json.dumps([result.to_dict() for result in results], indent=2))
     return 0
 
@@ -210,6 +213,7 @@ def handle_serve_ui(args: Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the command-line interface."""
+    load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
 

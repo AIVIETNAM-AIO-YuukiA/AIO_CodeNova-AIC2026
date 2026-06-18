@@ -7,15 +7,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import json
-import logging
+from core.logging import get_logger
 import mimetypes
 
 from config.settings import Experiment
 from core.types import SearchResult
-from pipeline.indexing import search_index
+from retrieval import build_retriever
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def serve_ui(
@@ -25,7 +25,8 @@ def serve_ui(
     default_top_k: int = 20,
 ) -> None:
     """Serve the local retrieval UI until interrupted."""
-    handler = build_handler(experiment=experiment, default_top_k=default_top_k)
+    retriever = build_retriever(experiment)
+    handler = build_handler(experiment=experiment, retriever=retriever, default_top_k=default_top_k)
     server = ThreadingHTTPServer((host, port), handler)
     LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
     try:
@@ -36,8 +37,8 @@ def serve_ui(
         server.server_close()
 
 
-def build_handler(experiment: Experiment, default_top_k: int):
-    """Create a request handler bound to one experiment."""
+def build_handler(experiment: Experiment, retriever, default_top_k: int):
+    """Create a request handler bound to one experiment and its retriever."""
 
     class RetrievalUiHandler(BaseHTTPRequestHandler):
         server_version = "CodeNovaRetrievalUI/0.1"
@@ -70,7 +71,7 @@ def build_handler(experiment: Experiment, default_top_k: int):
                 )
                 top_k = int(payload.get("top_k") or default_top_k)
                 retrieval_text = build_retrieval_text(request)
-                results = search_index(experiment=experiment, query=retrieval_text, top_k=top_k)
+                results = retriever.search(query=retrieval_text, top_k=top_k)
                 self._send_json(
                     {
                         "track": request.track,

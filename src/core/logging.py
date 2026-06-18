@@ -37,3 +37,13 @@ def configure_logging(log_dir: Path, verbose: bool = False) -> None:
     root.addHandler(console)
     root.addHandler(pipeline_file)
     root.addHandler(error_file)
+
+
+def get_logger(name: str) -> logging.Logger:
+    """Return a module logger.
+
+    Use ``get_logger(__name__)`` instead of ``logging.getLogger(__name__)`` so
+    every module obtains its logger the same way; output formatting and handlers
+    are owned by :func:`configure_logging`.
+    """
+    return logging.getLogger(name)

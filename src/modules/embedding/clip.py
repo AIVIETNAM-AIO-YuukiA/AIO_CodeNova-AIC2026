@@ -1,4 +1,4 @@
-"""CLIP model interface."""
+"""Transformers-backed CLIP embedder."""
 
 from __future__ import annotations
 
@@ -6,22 +6,11 @@ from pathlib import Path
 
 from core.errors import EmbeddingError
 from core.types import FrameRecord
-
-
-class ClipEmbedder:
-    """Interface for CLIP image/text embeddings."""
-
-    def embed_images(self, frames: list[FrameRecord]) -> list[list[float]]:
-        """Embed image frames."""
-        raise NotImplementedError
-
-    def embed_text(self, query: str) -> list[float]:
-        """Embed a text query."""
-        raise NotImplementedError
+from modules.embedding.base import ClipEmbedder
 
 
 class TransformersClipEmbedder(ClipEmbedder):
-    """Transformers-backed CLIP embedder."""
+    """CLIP image/text embeddings backed by Hugging Face Transformers."""
 
     def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32) -> None:
         self.model_name = normalize_clip_model_name(model_name)

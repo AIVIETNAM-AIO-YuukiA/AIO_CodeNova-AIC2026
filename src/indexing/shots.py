@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-import logging
+from core.logging import get_logger
 
 from config.settings import Experiment
 from core.types import ShotRecord, VideoRecord
-from pipeline.manifest import JsonlManifest
-from pipeline.state import JobState
+from indexing.manifest import JsonlManifest
+from indexing.state import JobState
 from video.shots import TransNetV2ShotDetector
 
-LOGGER = logging.getLogger(__name__)
+LOGGER = get_logger(__name__)
 
 
 def detect_shots(
