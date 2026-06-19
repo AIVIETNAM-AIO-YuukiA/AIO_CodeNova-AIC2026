@@ -1,6 +1,5 @@
 import sys
 from unittest.mock import MagicMock
-import pytest
 
 # Mock google package and submodules so that the tests can run without installing google-genai
 from types import ModuleType

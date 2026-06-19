@@ -1,0 +1,426 @@
+╔════════════════════════════════════════════════════════════════════╗
+║         HƯỚNG DẪN SỬ DỤNG UI - CodeNova Retrieval & VQA        ║
+╚════════════════════════════════════════════════════════════════════╝
+
+────────────────────────────────────────────────────────────────────
+PHẦN 1: CHẠY UI
+────────────────────────────────────────────────────────────────────
+
+Bước 1: Mở Terminal (Command Prompt / PowerShell)
+
+Bước 2: Set API key (CHỈ cần nếu bạn định dùng VQA track)
+  set GEMINI_API_KEY=AIzaSy...
+  (Lấy key từ https://aistudio.google.com/apikey)
+
+  Nếu không set key: VQA/QA track sẽ báo lỗi, nhưng 2 track còn lại
+  (Textual KIS, Visual KIS) vẫn chạy bình thường.
+
+Bước 3: Chạy lệnh
+  uv run python -m src.cli.main serve-ui ^
+    --experiment-name "20260616_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_c045cd0b"
+
+  (Nếu dùng PowerShell, thay ^ bằng ` )
+
+  Kết quả: "Serving retrieval UI at http://127.0.0.1:7860"
+
+Bước 4: Mở trình duyệt → vào http://127.0.0.1:7860
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 2: GIAO DIỆN UI
+────────────────────────────────────────────────────────────────────
+
+┌───────────────────────────────────────────────────────────────────┐
+│  CodeNova Retrieval UI                                           │
+│  ┌──────────────────────┐  ┌────────────────────────────────────┐│
+│  │ TRACK SELECTION      │  │  KẾT QUẢ                          ││
+│  │ [VQA              ▼] │  │                                    ││
+│  │                      │  │  (Answer / frame cards / events)   ││
+│  │ QUERY (bắt buộc)     │  │                                    ││
+│  │ [..................] │  │  ┌─────┐ ┌─────┐ ┌─────┐         ││
+│  │ Mô tả nội dung       │  │  │ img │ │ img │ │ img │         ││
+│  │                      │  │  │     │ │     │ │     │         ││
+│  │ CONTEXT (tùy chọn)   │  │  └─────┘ └─────┘ └─────┘         ││
+│  │ [..................] │  │                                    ││
+│  │ Bối cảnh bổ sung     │  │                                    ││
+│  │                      │  │                                    ││
+│  │ QUESTION (VQA only)  │  │                                    ││
+│  │ [..................] │  │                                    ││
+│  │ Câu hỏi cần trả lời  │  │                                    ││
+│  │                      │  │                                    ││
+│  │ TOP K  [20      ▲]   │  │                                    ││
+│  │ Số frame tối đa      │  │                                    ││
+│  │                      │  │                                    ││
+│  │ [ ===== SEARCH ===== ]│  │                                    ││
+│  │                      │  │                                    ││
+│  │ Hint: VQA/QA...      │  │                                    ││
+│  │ Status: Ready.       │  │                                    ││
+│  └──────────────────────┘  └────────────────────────────────────┘│
+└───────────────────────────────────────────────────────────────────┘
+
+─── GIẢI THÍCH TỪNG Ô ────────────────────────────────────────────────
+
+  TRACK
+  ─────
+  Chọn bài toán muốn giải:
+    - Textual KIS: Tìm frame giống query text (CLIP search thuần)
+    - Video KIS:   (placeholder)
+    - VQA:         Hỏi-đáp về nội dung video (3-stage pipeline)
+    - TRAKE:       Tìm danh sách sự kiện/thời điểm
+
+  QUERY
+  ─────
+  Mô tả nội dung cần tìm, bằng tiếng Anh (khuyến khích).
+  Đây là đầu vào chính cho CLIP embedding → FAISS search.
+
+  Viết query càng chi tiết càng tốt, VD:
+    "a woman riding a red motorbike on a street"
+  thay vì "a motorbike".
+
+  Với VQA: query = mô tả ngữ cảnh tổng quát để CLIP tìm đúng
+            khoảnh khắc, sau đó Agent mới trả lời question.
+
+  Dùng cho: ✅ Textual KIS  ✅ VQA  ✅ TRAKE
+            ❌ Video KIS (chưa implement)
+
+  CONTEXT (tùy chọn)
+  ──────────────────
+  Mô tả thêm về bối cảnh, giúp CLIP tìm chính xác hơn.
+
+  Khác với query: context là background info bổ sung,
+  query là trọng tâm chính.
+
+  VD:
+    Query:   "a person buying water"
+    Context: "outdoor market, daytime, crowded street"
+
+  Cách dùng trong pipeline:
+    Query → dùng để embed và search chính
+    Context → kết hợp với query trong CLIP embedding (fusion)
+
+  Dùng cho: ✅ Textual KIS  ✅ VQA  ✅ TRAKE
+            ❌ Video KIS
+
+  QUESTION (chỉ dùng cho VQA)
+  ───────────────────────────
+  Câu hỏi cụ thể về nội dung video.
+
+  VQA pipeline:
+    1. CLIP search dùng query + context → top-K frame
+    2. Temporal search xác định shot chính xác
+    3. Agent (Gemini) nhận frames + question → trả lời
+
+  VD:
+    Query:    "a person working on a laptop"
+    Question: "anh ấy đang code bằng ngôn ngữ gì?"
+
+  Lưu ý: Question không ảnh hưởng đến CLIP search,
+  chỉ dùng cho Agent. Nếu bạn muốn hỏi nhiều câu,
+  chạy lại VQA với question khác (query giữ nguyên).
+
+  Dùng cho: ✅ VQA
+            ❌ Textual KIS  ❌ TRAKE  ❌ Video KIS
+
+  TOP K
+  ─────
+  Số lượng frame tối đa mà CLIP trả về từ FAISS index.
+
+  - Mặc định: 20
+  - Giá trị lớn hơn (30-50): chậm hơn, phù hợp khi cần
+    tìm frame hiếm/khó
+  - Giá trị nhỏ hơn (5-10): nhanh hơn, phù hợp khi query
+    rất chính xác
+
+  Với VQA: Top K càng lớn → temporal search càng kỹ →
+  tốn thời gian nhưng tăng độ chính xác.
+
+  Với TRAKE: Top K lớn để không bỏ sót event.
+
+  SEARCH BUTTON
+  ─────────────
+  Click để bắt đầu search.
+  Kết quả hiển thị bên phải, có thể là:
+    - Textual KIS: grid frame ảnh + score
+    - VQA:         answer + pipeline details + evidence frames
+    - TRAKE:       event cards + frame ảnh mỗi event
+    - Video KIS:  (placeholder)
+
+  Ở dưới cùng kết quả có timestamp tổng thời gian xử lý.
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 3: 4 BÀI TOÁN (CHỌN Ở Ô "Retrieval Track")
+  Khớp với 4 bài toán chính trong cuộc thi:
+
+  1. Textual KIS - Tìm video từ mô tả văn bản
+  2. Video KIS   - Tìm video từ đoạn video mẫu (chưa implement)
+  3. VQA         - Tìm khoảnh khắc + trả lời câu hỏi
+  4. TRAKE       - Tìm danh sách sự kiện từ mô tả văn bản
+────────────────────────────────────────────────────────────────────
+
+┌───────────────────────────────────────────────────────────────────┐
+│  1. VQA (Video Question Answering) ★ MỚI NHẤT                    │
+│                                                                   │
+│  Dùng để: Hỏi về nội dung video, nhận câu trả lời                 │
+│                                                                   │
+│  Các ô cần điền:                                                  │
+│   - Query: mô tả ngữ cảnh (vd: "a person riding a motorbike")    │
+│   - Question: câu hỏi (vd: "Cô ấy đội mũ bảo hiểm màu gì?")     │
+│   - Context: (tùy chọn) mô tả thêm                                │
+│   - Top K: số frame muốn lấy (mặc định 20)                       │
+│                                                                   │
+│  Pipeline 3 giai đoạn:                                            │
+│    CLIP Search → Temporal Search → Agent (Gemini)                 │
+│                                                                   │
+│  Kết quả:                                                         │
+│   ┌─────────────────────────────────────────────────────┐         │
+│   │  Answer                                               │         │
+│   │  ┌─────────────────────────────────────────────────┐│         │
+│   │  │ Cô ấy đội mũ bảo hiểm màu trắng.                ││         │
+│   │  └─────────────────────────────────────────────────┘│         │
+│   │                                                     │         │
+│   │  [Show Pipeline Details ▼]                          │         │
+│   │  Stage 1: CLIP Search                              │         │
+│   │  Stage 2: Temporal Search                          │         │
+│   │  Stage 3: Shot Gather                              │         │
+│   │  Stage 4: Shot Validation                          │         │
+│   │  Stage 5: Agent (Gemini)                           │         │
+│   └─────────────────────────────────────────────────────┘         │
+│                                                                   │
+│  Phía dưới: evidence frames (các frame mà Agent đã dùng)         │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  2. Video KIS (Known-Item Search bằng video)                     │
+│                                                                   │
+│  (Chưa implement đầy đủ - hiện chạy giống Textual KIS)           │
+│                                                                   │
+│  Kết quả: danh sách frame ảnh (giống Textual KIS)                │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  3. Textual KIS (Textual Keyframe Image Search)                   │
+│                                                                   │
+│  Dùng để: Tìm frame có nội dung giống với mô tả text             │
+│  (chức năng gốc, KHÔNG dùng Agent)                                │
+│                                                                   │
+│  Các ô cần điền:                                                  │
+│   - Query: mô tả nội dung cần tìm (vd: "a red car")              │
+│   - Top K: số frame muốn lấy                                      │
+│   - Context, Question: không cần (bỏ trống)                       │
+│                                                                   │
+│  Kết quả: danh sách frame ảnh xếp theo độ tương đồng             │
+│   ┌─────┐ ┌─────┐ ┌─────┐                                       │
+│   │ img │ │ img │ │ img │                                       │
+│   │#1    │ │#2    │ │#3    │                                       │
+│   │score │ │score │ │score │                                       │
+│   │0.85  │ │0.82  │ │0.78  │                                       │
+│   └─────┘ └─────┘ └─────┘                                       │
+│                                                                   │
+│  Mỗi card hiển thị:                                               │
+│   - Ảnh frame                                                     │
+│   - Score (cao = giống query hơn)                                 │
+│   - Timestamp (vị trí trong video)                                │
+│   - Video name + frame index + shot ID                            │
+└───────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────┐
+│  4. TRAKE (Text Retrieval of Knowledge Events)                   │
+│                                                                   │
+│  Dùng để: Tìm danh sách sự kiện/khoảnh khắc dựa trên mô tả vb   │
+│  Khác VQA: trả về event segment (có timestamp), không hỏi đáp   │
+│                                                                   │
+│  Pipeline: CLIP Search → Temporal Search → Gather Shot → Event   │
+│                                                                   │
+│  Các ô cần điền:                                                  │
+│   - Query: mô tả sự kiện (vd: "a person buying water")           │
+│   - Context: (tùy chọn)                                           │
+│   - Top K: số frame để phân tích                                  │
+│                                                                   │
+│  Kết quả:                                                         │
+│   ┌──────────────────────────────────────────────────┐            │
+│   │ Event #1                                          │            │
+│   │ Video: test.mp4 · Time: 10.0s - 18.0s            │            │
+│   │ Score: 0.75                                       │            │
+│   └──────────────────────────────────────────────────┘            │
+│   Phía dưới: danh sách frame ảnh trong event                     │
+└───────────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 4: VÍ DỤ CỤ THỂ
+────────────────────────────────────────────────────────────────────
+
+  VÍ DỤ 1: VQA - Hỏi về màu sắc
+  ─────────────────────────────
+  Track:          VQA
+  Query:          a person on a motorbike
+  Context:        (để trống)
+  Question:       người phụ nữ mặc áo màu gì?
+  Top K:          20
+
+  Kết quả:
+    Answer: "Người phụ nữ mặc áo màu xanh dương."
+
+  VÍ DỤ 2: TRAKE - Tìm sự kiện
+  ──────────────────────────────
+  Track:          TRAKE
+  Query:          a person buying something from a street vendor
+  Context:        (để trống)
+  Top K:          20
+
+  Kết quả:
+    Event #1 — 5 frames, 8.0s - 16.0s, score 0.82
+    [evidence frames bên dưới]
+
+  VÍ DỤ 3: VQA - Hỏi về hành động
+  ─────────────────────────────────
+  Track:          VQA
+  Query:          street scene
+  Context:        (để trống)
+  Question:       cô ấy đang làm gì?
+  Top K:          20
+
+  Kết quả:
+    Answer: "Cô ấy đang đi xe máy trên đường."
+
+  VÍ DỤ 4: Textual KIS - Tìm frame
+  ──────────────────────────────────
+  Track:          Textual KIS
+  Query:          a red motorbike
+  Context:        (để trống)
+  Question:       (để trống)
+  Top K:          10
+
+  Kết quả:
+    10 frame ảnh có score cao nhất, frame nào có xe máy đỏ sẽ lên đầu.
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 5: CÁC LỖI THƯỜNG GẶP
+────────────────────────────────────────────────────────────────────
+
+  LỖI #1: "GEMINI_API_KEY environment variable not set"
+  → Bạn chưa set API key.
+    Khắc phục: set GEMINI_API_KEY=AIza...
+    Hoặc dùng track Textual KIS (không cần key).
+
+  LỖI #2: "this model does not support image input"
+  → Sai model (đã fix, nếu còn thì báo tôi).
+
+  LỖI #3: "FAISS index or mapping file is missing"
+  → Chưa chạy build-index.
+    Khắc phục: chạy lệnh build-index trước.
+
+  LỖI #4: "Connection refused"
+  → Server chưa chạy.
+    Khắc phục: chạy lệnh serve-ui ở Phần 1.
+
+  LỖI #5: Trang web không hiển thị ảnh
+  → Đường dẫn frame không đúng.
+    Kiểm tra thư mục runs/.../frames/ có ảnh không.
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 6: DÙNG LOCAL MODEL (OLLAMA) THAY CHO GEMINI API
+────────────────────────────────────────────────────────────────────
+
+  Nếu không có GEMINI_API_KEY hoặc bị quota, bạn có thể dùng Ollama
+  với model vision (llava 7B) chạy local hoàn toàn.
+
+  Bước 1: Cài Ollama
+    https://ollama.com/download  →  tải bản Windows, cài đặt
+
+  Bước 2: Pull model
+    RTX 3050 4GB: dùng moondream (1.8B, ~1GB, chạy vừa VRAM):
+      ollama pull moondream
+
+    Nếu có GPU >8GB VRAM: dùng llava (7B, ~4.7GB, chính xác hơn):
+      ollama pull llava
+
+  Bước 3: Chạy Ollama server
+      ollama serve
+
+  Bước 4: Chạy UI (Ollama tự động được phát hiện)
+    uv run python -m src.cli.main serve-ui ^
+      --experiment-name "20260616_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_c045cd0b"
+
+    Code sẽ tự động:
+      1. Kiểm tra http://localhost:11434 (Ollama API)
+      2. Nếu có → dùng LocalBrain + LocalCaptionTool + LocalOCRTool
+      3. Nếu không → fallback về Gemini API (nếu có key)
+
+  Lưu ý: RTX 3050 4GB không đủ VRAM cho llava:7b (OOM). Code ưu tiên
+  moondream trước (nhẹ, 1.8B, ~1GB), nếu không có mới dùng llava.
+  Mỗi lần caption/OCR với moondream mất ~3-8s.
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 7: TEST NHANH BẰNG CLI (không cần mở browser)
+────────────────────────────────────────────────────────────────────
+
+  Text search (không cần API key):
+    uv run python -m src.cli.main search ^
+      --experiment-name "20260616_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_c045cd0b" ^
+      "a person riding a motorbike"
+
+  Kết quả in ra JSON: danh sách frame + score + timestamp.
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 8: CẤU TRÚC THƯ MỤC
+────────────────────────────────────────────────────────────────────
+
+  runs/
+  └── 20260616_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_c045cd0b/
+      ├── config.json           # Cấu hình experiment
+      ├── manifests/
+      │   ├── videos.jsonl      # Danh sách video
+      │   ├── shots.jsonl       # 31 shots
+      │   ├── frames.jsonl      # 31 keyframes metadata
+      │   └── embeddings.jsonl  # Embedding metadata
+      ├── embeddings/
+      │   ├── frames.npz        # Vector CLIP (512 chiều)
+      │   └── frame_ids.json    # Danh sách frame_id
+      ├── index/
+      │   ├── frames.faiss      # FAISS index
+      │   └── frame_ids.json    # Mapping file
+      ├── frames/
+      │   └── 16d7041bfc71e93c/ # 31 ảnh JPG
+      │       ├── ...s000000_f00000003.jpg
+      │       ├── ...s000001_f00000019.jpg
+      │       └── ...
+      └── logs/
+          ├── pipeline.log
+          └── errors.log
+
+
+────────────────────────────────────────────────────────────────────
+PHẦN 9: GIẢI THÍCH NHANH
+────────────────────────────────────────────────────────────────────
+
+  Q: 4 track khác nhau thế nào?
+  A: Textual KIS: tìm frame giống text (CLIP search thuần).
+     Video KIS: tìm video từ video mẫu (chưa implement).
+     VQA: tìm khoảnh khắc → AI phân tích → trả lời câu hỏi.
+     TRAKE: tìm sự kiện từ mô tả, trả về segment thời gian.
+
+  Q: Tại sao VQA cần API key?
+  A: Vì VQA dùng Gemini (Google AI) để xem ảnh và trả lời.
+     Textual KIS / TRAKE chỉ dùng CLIP (chạy local, không cần Internet).
+
+  Q: Top K là gì?
+  A: Số frame CLIP lấy ra nhiều nhất để phân tích.
+     Lớn hơn = chậm hơn nhưng có thể tìm đúng hơn.
+
+  Q: Context dùng làm gì?
+  A: Mô tả thêm về bối cảnh, giúp CLIP tìm chính xác hơn.
+     Ví dụ: "outdoor street scene, daytime, sunny"
+
+  Q: Có thể chạy VQA không cần Gemini API không?
+  A: Có. Cài Ollama + llava (xem Phần 6), code tự động dùng local model.
+
+  Q: Ollama với Gemini cái nào tốt hơn?
+  A: Gemini nhanh hơn và chính xác hơn. Ollama ổn định hơn (không quota,
+     không cần Internet). RTX 3050 4GB chạy llava:7b mỗi lần ~5-15s.
+────────────────────────────────────────────────────────────────────

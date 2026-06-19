@@ -59,7 +59,9 @@ class TransformersClipEmbedder(ClipEmbedder):
     def embed_text(self, query: str) -> list[float]:
         """Embed a text query with CLIP text features."""
         model, processor, torch, device = self._load()
-        inputs = processor(text=[query], return_tensors="pt", padding=True).to(device)
+        inputs = processor(text=[query], return_tensors="pt", padding=True, truncation=True).to(
+            device
+        )
         with torch.no_grad():
             features = clip_features_tensor(model.get_text_features(**inputs))
             features = torch.nn.functional.normalize(features, p=2, dim=-1)
@@ -78,8 +80,8 @@ class TransformersClipEmbedder(ClipEmbedder):
             ) from exc
 
         device = resolve_torch_device(torch, self.device)
-        processor = CLIPProcessor.from_pretrained(self.model_name)
-        model = CLIPModel.from_pretrained(self.model_name).eval().to(device)
+        processor = CLIPProcessor.from_pretrained(self.model_name, local_files_only=True)
+        model = CLIPModel.from_pretrained(self.model_name, local_files_only=True).eval().to(device)
         self._model = model
         self._processor = processor
         self._torch = torch
@@ -111,13 +113,11 @@ def clip_features_tensor(features):
 
 
 def resolve_torch_device(torch, requested: str):
-    """Resolve a torch device and require CUDA for auto/cuda modes."""
+    """Resolve a torch device, falling back to CPU when CUDA is unavailable."""
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
-        raise EmbeddingError(
-            "CUDA is not available; CLIP embedding requires a GPU in this project."
-        )
+        return torch.device("cpu")
     if requested.startswith("cuda") and not torch.cuda.is_available():
         raise EmbeddingError(f"Requested device '{requested}' but CUDA is not available.")
     return torch.device(requested)

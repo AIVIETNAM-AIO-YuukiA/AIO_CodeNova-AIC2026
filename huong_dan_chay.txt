@@ -1,0 +1,65 @@
+======================= HƯỚNG DẪN CHẠY PIPELINE =======================
+Truy xuất video bằng ngôn ngữ tự nhiên
+
+Yêu cầu: Python >= 3.13, đã cài uv, đã uv sync
+
+----------------------------------------------------------------------
+BƯỚC 0: Xoá dữ liệu cũ (nếu muốn chạy lại từ đầu)
+----------------------------------------------------------------------
+rmdir /s /q "runs\20260616_retrieval_clip-vit-b-32_shot-midpoint_faiss-flat-ip_c045cd0b"
+
+----------------------------------------------------------------------
+BƯỚC 1: Tạo experiment name
+----------------------------------------------------------------------
+uv run codenova name-experiment
+-> Copy tên experiment hiện ra (vd: 20260616_retrieval_...)
+
+----------------------------------------------------------------------
+BƯỚC 2: Ingest video (quét video từ thư mục data/raw_videos)
+----------------------------------------------------------------------
+uv run codenova ingest --input data/raw_videos --experiment-name "TEN_EXPERIMENT"
+
+----------------------------------------------------------------------
+BƯỚC 3: Detect shots (dùng TransNetV2 để tách shot)
+----------------------------------------------------------------------
+uv run codenova detect-shots --experiment-name "TEN_EXPERIMENT" --transnetv2-weights "external\TransNetV2\inference-pytorch\transnetv2-pytorch-weights.pth" --transnetv2-module-dir external\TransNetV2\inference-pytorch
+
+(Lưu ý: bước này chậm nếu video dài, phải chờ)
+
+----------------------------------------------------------------------
+BƯỚC 4: Extract keyframes (trích xuất frame đại diện cho mỗi shot)
+----------------------------------------------------------------------
+uv run codenova extract-frames --experiment-name "TEN_EXPERIMENT"
+
+Frame được lưu tại: runs\<TEN_EXPERIMENT>\frames\<video_id>\
+
+----------------------------------------------------------------------
+BƯỚC 5: Embed frames (dùng CLIP để tạo vector embedding)
+----------------------------------------------------------------------
+uv run codenova embed-frames --experiment-name "TEN_EXPERIMENT" --batch-size 8
+
+----------------------------------------------------------------------
+BƯỚC 6: Build FAISS index
+----------------------------------------------------------------------
+uv run codenova build-index --experiment-name "TEN_EXPERIMENT"
+
+----------------------------------------------------------------------
+BƯỚC 7: Search (tìm kiếm video bằng text)
+----------------------------------------------------------------------
+uv run codenova search --experiment-name "TEN_EXPERIMENT" "nội dung cần tìm"
+
+----------------------------------------------------------------------
+BƯỚC 8: Serve web UI (mở giao diện trên trình duyệt)
+----------------------------------------------------------------------
+uv run codenova serve-ui --experiment-name "TEN_EXPERIMENT" --host 127.0.0.1 --port 7860
+
+Mở: http://127.0.0.1:7860
+
+======================================================================
+
+GHI CHÚ:
+- Thay TEN_EXPERIMENT bằng tên lấy từ bước 1
+- Các bước phải chạy đúng thứ tự: 1->2->3->4->5->6->7
+- Nếu muốn chạy lại một bước, dùng thêm --force
+  vd: uv run codenova extract-frames --experiment-name "TEN_EXPERIMENT" --force
+- Cần có GPU (CUDA) để chạy TransNetV2 và CLIP

@@ -13,6 +13,7 @@ import mimetypes
 from config.settings import Experiment
 from core.types import SearchResult
 from pipeline.indexing import search_index
+from pipeline.vqa import vqa_search, trake_search
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 
 LOGGER = logging.getLogger(__name__)
@@ -56,7 +57,51 @@ def build_handler(experiment: Experiment, default_top_k: int):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def do_POST(self) -> None:
-            if urlparse(self.path).path != "/api/search":
+            parsed = urlparse(self.path)
+
+            # TRAKE track: CLIP → Temporal → event segments
+            if parsed.path == "/api/trake-search":
+                try:
+                    payload = self._read_json()
+                    top_k = int(payload.get("top_k") or default_top_k)
+                    result = trake_search(
+                        experiment=experiment,
+                        query=str(payload.get("query", "")),
+                        context=str(payload.get("context", "")),
+                        top_k=top_k,
+                    )
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("TRAKE search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # VQA track uses full pipeline (CLIP → Temporal → Agent)
+            if parsed.path == "/api/vqa-search":
+                try:
+                    payload = self._read_json()
+                    top_k = int(payload.get("top_k") or default_top_k)
+                    result = vqa_search(
+                        experiment=experiment,
+                        query=str(payload.get("query", "")),
+                        question=str(payload.get("question", "")),
+                        context=str(payload.get("context", "")),
+                        top_k=top_k,
+                    )
+                    # Hydrate frame paths for image serving
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("VQA search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            if parsed.path != "/api/search":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
 
@@ -266,6 +311,55 @@ INDEX_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 700;
     }
+    .answer-box {
+      margin-bottom: 18px;
+      padding: 18px 20px;
+      border: 2px solid var(--accent);
+      border-radius: 10px;
+      background: #f0fdf8;
+    }
+    .answer-box .label {
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+    }
+    .answer-box .answer-text {
+      margin-top: 6px;
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--accent-strong);
+      line-height: 1.45;
+    }
+    .pipeline-toggle {
+      margin-top: 10px;
+      background: none;
+      border: 1px solid var(--line);
+      padding: 6px 12px;
+      border-radius: 6px;
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .pipeline-toggle:hover { background: var(--panel); }
+    .pipeline-detail {
+      display: none;
+      margin-top: 10px;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .pipeline-detail.open { display: block; }
+    .pipeline-detail code {
+      display: block;
+      white-space: pre-wrap;
+      font-size: 12px;
+      color: var(--muted);
+    }
     @media (max-width: 860px) {
       main { grid-template-columns: 1fr; }
       aside { border-right: 0; border-bottom: 1px solid var(--line); }
@@ -282,9 +376,9 @@ INDEX_HTML = r"""<!doctype html>
         <label for="track">Retrieval Track</label>
         <select id="track" name="track">
           <option value="textual_kis">Textual KIS</option>
+          <option value="video_kis">Video KIS</option>
           <option value="vqa">VQA</option>
-          <option value="qa">Question Answering</option>
-          <option value="visual_kis">Visual KIS</option>
+          <option value="trake">TRAKE</option>
         </select>
 
         <label for="query">Query</label>
@@ -303,11 +397,17 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <button id="submit" type="submit">Search</button>
         </div>
+        <div id="sidebar-answer" style="display:none; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 8px; background: #f0fdf8;">
+          <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);">Answer</div>
+          <div id="sidebar-answer-text" style="margin-top: 4px; font-size: 15px; font-weight: 700; color: var(--accent-strong); line-height: 1.4;"></div>
+        </div>
       </form>
-      <p class="hint">Current backend routes all tracks through CLIP text-to-frame search. VQA fields are preserved so the backend can later add answer generation and evidence ranking without changing the UI contract.</p>
+      <p class="hint">VQA: 3-stage pipeline (CLIP → Temporal → Agent). TRAKE: temporal search + event grouping. Textual/Video KIS: CLIP search only.</p>
       <div id="status" class="status">Ready.</div>
     </aside>
     <section>
+      <div id="answer-box"></div>
+      <div id="pipeline-box"></div>
       <div id="results" class="results"></div>
     </section>
   </main>
@@ -315,7 +415,11 @@ INDEX_HTML = r"""<!doctype html>
     const form = document.getElementById("search-form");
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
+    const answerBox = document.getElementById("answer-box");
+    const pipelineBox = document.getElementById("pipeline-box");
     const submitEl = document.getElementById("submit");
+    const sidebarAnswer = document.getElementById("sidebar-answer");
+    const sidebarAnswerText = document.getElementById("sidebar-answer-text");
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
@@ -323,17 +427,30 @@ INDEX_HTML = r"""<!doctype html>
       statusEl.className = "status";
       statusEl.textContent = "Searching...";
       resultsEl.innerHTML = "";
+      answerBox.innerHTML = "";
+      pipelineBox.innerHTML = "";
+      sidebarAnswer.style.display = "none";
 
+      const track = form.track.value;
       const payload = {
-        track: form.track.value,
+        track: track,
         query: form.query.value,
         context: form.context.value,
         question: form.question.value,
         top_k: Number(form.top_k.value || 20)
       };
 
+      let endpoint;
+      if (track === "vqa") {
+        endpoint = "/api/vqa-search";
+      } else if (track === "trake") {
+        endpoint = "/api/trake-search";
+      } else {
+        endpoint = "/api/search";
+      }
+
       try {
-        const response = await fetch("/api/search", {
+        const response = await fetch(endpoint, {
           method: "POST",
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify(payload)
@@ -342,8 +459,25 @@ INDEX_HTML = r"""<!doctype html>
         if (!response.ok || data.error) {
           throw new Error(data.error || "Search failed");
         }
-        statusEl.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${data.track_label}</span>`;
-        renderResults(data.results);
+
+        if (track === "vqa" && data.answer) {
+          statusEl.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
+          renderAnswer(data.answer);
+          renderPipeline(data);
+          renderResults(data.results || []);
+          sidebarAnswer.style.display = "block";
+          sidebarAnswerText.textContent = data.answer;
+        } else if (track === "trake") {
+          const eventCount = (data.events || []).length;
+          statusEl.innerHTML = `<strong>${eventCount}</strong> event(s) found <span class="pill">TRAKE</span>`;
+          renderTrakeEvents(data.events || []);
+          renderPipeline(data);
+          renderResults(data.results || []);
+        } else {
+          const trackLabel = track === "textual_kis" ? "Textual KIS" : "Video KIS";
+          statusEl.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${trackLabel}</span>`;
+          renderResults(data.results);
+        }
       } catch (error) {
         statusEl.className = "status warn";
         statusEl.textContent = error.message;
@@ -351,6 +485,62 @@ INDEX_HTML = r"""<!doctype html>
         submitEl.disabled = false;
       }
     });
+
+    function renderAnswer(answer) {
+      answerBox.innerHTML = `
+        <div class="answer-box">
+          <div class="label">Answer</div>
+          <div class="answer-text">${escapeHtml(answer)}</div>
+        </div>
+      `;
+    }
+
+    function renderPipeline(data) {
+      const pipeline = data.pipeline || {};
+      const hasAgent = pipeline.agent;
+      const stages = hasAgent ? [
+        { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
+        { key: "temporal_search", label: "Temporal Search", desc: `Best segment: ${JSON.stringify(pipeline.temporal_search?.top_k_results || "N/A")}` },
+        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.frame_count || 0} frames in shot` },
+        { key: "shot_validation", label: "Shot Validation", desc: `Score: ${(pipeline.shot_validation?.validation_score || 0).toFixed(4)}` },
+        { key: "agent", label: "Agent (Gemini)", desc: `Answer: ${(pipeline.agent?.answer || "N/A").substring(0, 100)}` },
+      ] : [
+        { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
+        { key: "temporal_search", label: "Temporal Search", desc: `Best segment: ${JSON.stringify(pipeline.temporal_search?.top_k_results || "N/A")}` },
+        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.frame_count || 0} frames in shot` },
+      ];
+      pipelineBox.innerHTML = `
+        <button class="pipeline-toggle" onclick="togglePipeline()">Show Pipeline Details</button>
+        <div id="pipeline-detail" class="pipeline-detail">
+          ${stages.map((s, i) => `
+            <div style="margin-bottom: 8px;">
+              <strong>Stage ${i + 1}: ${escapeHtml(s.label)}</strong><br>
+              ${escapeHtml(s.desc)}
+            </div>
+          `).join("")}
+          ${hasAgent ? `<hr style="margin: 10px 0; border-color: var(--line);"><div><strong>Reasoning:</strong></div><code>${escapeHtml(data.reasoning || "N/A")}</code>` : ""}
+        </div>
+      `;
+    }
+
+    function renderTrakeEvents(events) {
+      if (!events.length) return;
+      const html = events.map((ev, i) => `
+        <div style="margin-bottom: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);">
+          <div><strong>Event #${i + 1}</strong></div>
+          <div>Video: ${escapeHtml(ev.video_name || ev.video_id || "")}</div>
+          <div>Frames: ${ev.frame_count} · Time: ${formatTime(ev.start_timestamp)} - ${formatTime(ev.end_timestamp)}</div>
+          <div>Score: ${(ev.score || 0).toFixed(4)}</div>
+        </div>
+      `).join("");
+      const container = document.createElement("div");
+      container.innerHTML = html;
+      resultsEl.parentNode.insertBefore(container, resultsEl);
+    }
+
+    function togglePipeline() {
+      document.getElementById("pipeline-detail").classList.toggle("open");
+    }
 
     function renderResults(results) {
       resultsEl.innerHTML = results.map((result, index) => `

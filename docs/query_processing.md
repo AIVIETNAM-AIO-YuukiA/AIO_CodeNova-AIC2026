@@ -47,6 +47,13 @@ set GEMINI_API_KEY=AIzaSyYourGeminiApiKeyHere
 export GEMINI_API_KEY="AIzaSyYourGeminiApiKeyHere"
 ```
 
+#### Tự động qua file `.env` (khuyên dùng):
+Tạo file `.env` trong thư mục gốc dự án với nội dung:
+```
+GEMINI_API_KEY=AIzaSyYourGeminiApiKeyHere
+```
+Hệ thống tự động load mà không cần set thủ công mỗi lần mở terminal.
+
 ---
 
 ## 3. Cách sử dụng (Usage)
