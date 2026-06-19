@@ -9,7 +9,7 @@ from core.types import VideoRecord
 from indexing.manifest import JsonlManifest
 from indexing.shots import load_shots_by_video
 from indexing.state import JobState
-from video.frames import OpenCVFrameExtractor
+from video.frames import FFmpegFrameExtractor
 
 LOGGER = get_logger(__name__)
 
@@ -20,7 +20,7 @@ def extract_frames(experiment: Experiment, force: bool = False) -> int:
     frames_manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
     state = JobState(experiment.run_dir / "jobs.sqlite")
     shots_by_video = load_shots_by_video(experiment)
-    extractor = OpenCVFrameExtractor(
+    extractor = FFmpegFrameExtractor(
         output_dir=experiment.run_dir / "frames",
         keyframe_percentiles=experiment.config.keyframe_percentiles,
     )

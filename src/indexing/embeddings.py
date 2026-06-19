@@ -7,7 +7,7 @@ from core.logging import get_logger
 
 from config.settings import Experiment
 from core.types import FrameRecord
-from modules.embedding import TransformersClipEmbedder
+from modules.embedding import build_embedder
 from indexing.manifest import JsonlManifest
 from indexing.state import JobState
 
@@ -38,8 +38,8 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
         LOGGER.warning("No frames found to embed")
         return 0
 
-    embedder = TransformersClipEmbedder(
-        model_name=experiment.config.clip_model,
+    embedder = build_embedder(
+        model_name=experiment.config.embedding_model,
         device=experiment.config.device,
         batch_size=batch_size,
     )
@@ -52,7 +52,7 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
             "embedding_path": str(vectors_path),
             "frame_ids_path": str(frame_ids_path),
             "count": len(frame_ids),
-            "model_name": experiment.config.clip_model,
+            "model_name": experiment.config.embedding_model,
         }
     )
     state.mark("frames", "EMBED", "COMPLETED")

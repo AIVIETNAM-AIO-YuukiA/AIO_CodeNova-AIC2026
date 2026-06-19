@@ -6,7 +6,7 @@ from config.settings import Experiment
 from core.types import SearchResult
 from stores.vector.base import VectorIndex
 from stores.vector.factory import build_vector_index
-from modules.embedding import ClipEmbedder, TransformersClipEmbedder
+from modules.embedding import Embedder, build_embedder
 from retrieval.hydrator import ResultHydrator
 
 
@@ -19,7 +19,7 @@ class Retriever:
 
     def __init__(
         self,
-        embedder: ClipEmbedder,
+        embedder: Embedder,
         index: VectorIndex,
         hydrator: ResultHydrator,
     ) -> None:
@@ -36,8 +36,8 @@ class Retriever:
 
 def build_retriever(experiment: Experiment) -> Retriever:
     """Assemble a Retriever from an experiment's configuration."""
-    embedder = TransformersClipEmbedder(
-        model_name=experiment.config.clip_model,
+    embedder = build_embedder(
+        model_name=experiment.config.embedding_model,
         device=experiment.config.device,
     )
     index = build_vector_index(experiment)
