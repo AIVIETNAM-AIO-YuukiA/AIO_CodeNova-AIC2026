@@ -85,7 +85,7 @@ def add_config_args(parser: ArgumentParser) -> None:
     """Attach shared pipeline config arguments."""
     parser.add_argument("--data-dir", default=Path("data"), type=Path)
     parser.add_argument("--runs-dir", default=Path("runs"), type=Path)
-    parser.add_argument("--clip-model", default="clip-vit-b-32")
+    parser.add_argument("--embedding-model", default="siglip2-large")
     parser.add_argument("--frame-sampling", default="shot-percentile")
     parser.add_argument("--index-backend", default="qdrant")
     parser.add_argument(
@@ -113,7 +113,7 @@ def config_from_args(args: Namespace) -> PipelineConfig:
     return PipelineConfig(
         data_dir=args.data_dir,
         runs_dir=args.runs_dir,
-        clip_model=args.clip_model,
+        embedding_model=args.embedding_model,
         frame_sampling=args.frame_sampling,
         index_backend=args.index_backend,
         keyframe_percentiles=parse_percentiles(args.keyframe_percentiles),

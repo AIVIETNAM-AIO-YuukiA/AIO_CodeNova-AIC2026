@@ -1,4 +1,4 @@
-# CodeNova
+# Video Retrieval Pipeline
 
 Resumable video retrieval pipeline using shot decomposition and CLIP-style semantic search.
 
@@ -145,8 +145,6 @@ added without touching the pipeline:
 - **`stores/text`** — Elasticsearch (BM25) for OCR/ASR text. Interface + backend exist but
   are **not yet wired into the pipeline** (no OCR/ASR text is produced yet). Install with
   the `text` extra: `uv pip install -e '.[text]'`.
-
-There is no MongoDB: Qdrant payload + manifests cover metadata.
 
 ## Development
 
