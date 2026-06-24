@@ -8,14 +8,14 @@ from core.errors import ExperimentNameError
 
 def test_default_experiment_name_is_valid_and_stable() -> None:
     config = PipelineConfig(
-        clip_model="ViT-B/32",
+        embedding_model="SigLIP2 Large",
         frame_sampling="Shot Midpoint",
-        index_backend="FAISS Flat IP",
+        index_backend="Qdrant",
     )
 
     name = config.default_experiment_name(datetime(2026, 6, 12, tzinfo=UTC))
 
-    assert name.startswith("20260612_retrieval_vit-b-32_shot-midpoint_faiss-flat-ip_")
+    assert name.startswith("20260612_retrieval_siglip2-large_shot-midpoint_qdrant_")
     assert validate_experiment_name(name) == name
 
 

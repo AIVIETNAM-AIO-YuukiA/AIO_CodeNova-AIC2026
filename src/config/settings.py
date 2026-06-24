@@ -45,10 +45,10 @@ class PipelineConfig:
     data_dir: Path = Path("data")
     runs_dir: Path = Path("runs")
     pipeline: str = "retrieval"
-    clip_model: str = "clip-vit-b-32"
-    frame_sampling: str = "shot-midpoint"
-    index_backend: str = "faiss-flat-ip"
-    keyframes_per_shot: int = 1
+    embedding_model: str = "siglip2-large"
+    frame_sampling: str = "shot-percentile"
+    index_backend: str = "qdrant"
+    keyframe_percentiles: tuple[float, ...] = (0.15, 0.5, 0.85)
     top_k: int = 20
     device: str = "auto"
 
@@ -56,10 +56,10 @@ class PipelineConfig:
         """Return stable config values used for hashing and run metadata."""
         return {
             "pipeline": slugify(self.pipeline),
-            "clip_model": slugify(self.clip_model),
+            "embedding_model": slugify(self.embedding_model),
             "frame_sampling": slugify(self.frame_sampling),
             "index_backend": slugify(self.index_backend),
-            "keyframes_per_shot": self.keyframes_per_shot,
+            "keyframe_percentiles": ",".join(str(p) for p in self.keyframe_percentiles),
             "top_k": self.top_k,
             "device": slugify(self.device),
         }
@@ -75,7 +75,7 @@ class PipelineConfig:
         parts = [
             current.strftime("%Y%m%d"),
             slugify(self.pipeline),
-            slugify(self.clip_model),
+            slugify(self.embedding_model),
             slugify(self.frame_sampling),
             slugify(self.index_backend),
             self.config_hash(),

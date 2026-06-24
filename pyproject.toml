@@ -5,7 +5,8 @@ description = "Resumable video retrieval pipeline using shot decomposition and C
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "faiss-cpu",
+    "qdrant-client>=1.12.0",
+    "python-dotenv>=1.0.0",
     "numpy>=2.4.6",
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
@@ -15,6 +16,13 @@ dependencies = [
     "transformers>=5.12.0",
     "google-genai>=2.8.0",
     "ollama>=0.6.2",
+    "imageio-ffmpeg>=0.6.0",
+]
+
+[project.optional-dependencies]
+# Full-text search backend (OCR/ASR). Not required for the core KIS vector flow.
+text = [
+    "elasticsearch>=8.0.0",
 ]
 
 [project.scripts]
@@ -28,6 +36,7 @@ build-backend = "hatchling.build"
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
+    "elasticsearch>=8.0.0",  # also exposed as the `text` extra; here so dev env always has it
 ]
 
 [[tool.uv.index]]
@@ -46,10 +55,12 @@ packages = [
     "src/cli",
     "src/config",
     "src/core",
-    "src/embedding",
-    "src/index",
-    "src/pipeline",
+    "src/indexing",
+    "src/modules",
+    "src/prompts",
+    "src/repository",
     "src/retrieval",
+    "src/stores",
     "src/ui",
     "src/video",
 ]

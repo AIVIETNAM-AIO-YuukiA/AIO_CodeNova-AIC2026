@@ -1,4 +1,4 @@
-from pipeline.state import JobState
+from indexing.state import JobState
 
 
 def test_job_state_marks_and_skips_completed_items(tmp_path) -> None:
