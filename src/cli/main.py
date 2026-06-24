@@ -18,6 +18,7 @@ from indexing.embeddings import embed_frames
 from indexing.frames import extract_frames
 from indexing.ingest import ingest_videos
 from indexing.shots import detect_shots
+from indexing.text import build_text_index_from_artifacts, run_asr, run_ocr
 from retrieval import build_retriever
 from ui.server import serve_ui
 
@@ -63,6 +64,20 @@ def build_parser() -> ArgumentParser:
     index_parser = subparsers.add_parser("build-index", help="Build the Qdrant vector index")
     add_run_args(index_parser)
     index_parser.add_argument("--force", action="store_true")
+
+    ocr_parser = subparsers.add_parser("run-ocr", help="Run OCR over extracted keyframes")
+    add_run_args(ocr_parser)
+    ocr_parser.add_argument("--force", action="store_true")
+
+    asr_parser = subparsers.add_parser("run-asr", help="Run ASR over discovered videos")
+    add_run_args(asr_parser)
+    asr_parser.add_argument("--force", action="store_true")
+
+    text_index_parser = subparsers.add_parser(
+        "build-text-index", help="Build the Elasticsearch OCR/ASR text index"
+    )
+    add_run_args(text_index_parser)
+    text_index_parser.add_argument("--force", action="store_true")
 
     search_parser = subparsers.add_parser("search", help="Search videos by text query")
     add_run_args(search_parser)
@@ -201,6 +216,30 @@ def handle_build_index(args: Namespace) -> int:
     return 0
 
 
+def handle_run_ocr(args: Namespace) -> int:
+    """Run OCR over extracted frames."""
+    experiment = load_experiment(args)
+    count = run_ocr(experiment=experiment, force=args.force)
+    print(json.dumps({"experiment": experiment.name, "ocr_records": count}))
+    return 0
+
+
+def handle_run_asr(args: Namespace) -> int:
+    """Run ASR over discovered videos."""
+    experiment = load_experiment(args)
+    count = run_asr(experiment=experiment, force=args.force)
+    print(json.dumps({"experiment": experiment.name, "asr_segments": count}))
+    return 0
+
+
+def handle_build_text_index(args: Namespace) -> int:
+    """Build Elasticsearch text index from OCR/ASR artifacts."""
+    experiment = load_experiment(args)
+    count = build_text_index_from_artifacts(experiment=experiment, force=args.force)
+    print(json.dumps({"experiment": experiment.name, "text_documents": count}))
+    return 0
+
+
 def handle_search(args: Namespace) -> int:
     """Run text search."""
     experiment = load_experiment(args)
@@ -244,6 +283,12 @@ def main(argv: list[str] | None = None) -> int:
             return handle_embed_frames(args)
         if args.command == "build-index":
             return handle_build_index(args)
+        if args.command == "run-ocr":
+            return handle_run_ocr(args)
+        if args.command == "run-asr":
+            return handle_run_asr(args)
+        if args.command == "build-text-index":
+            return handle_build_text_index(args)
         if args.command == "search":
             return handle_search(args)
         if args.command == "serve-ui":
