@@ -100,3 +100,26 @@ def test_gather_frame_s_returns_shot_input() -> None:
 
 def test_gather_frame_s_none_on_empty() -> None:
     assert gather_frame_s(None, []) is None
+
+
+def test_temporal_search_stops_at_different_video() -> None:
+    rng = np.random.RandomState(42)
+    emb = rng.randn(5, 64).astype("float32")
+    emb = emb / np.linalg.norm(emb, axis=1, keepdims=True)
+
+    records = [
+        {"video_id": "v1"},
+        {"video_id": "v1"},
+        {"video_id": "v2"},
+        {"video_id": "v2"},
+        {"video_id": "v2"},
+    ]
+
+    # Forward search starting at 0 should stop at 1
+    end = temporal_search_forward(0, emb, frame_records=records, tolerance_threshold=2)
+    assert end == 1
+
+    # Backward search starting at 4 should stop at 2
+    start = temporal_search_backward(4, emb, frame_records=records, tolerance_threshold=2)
+    assert start == 2
+

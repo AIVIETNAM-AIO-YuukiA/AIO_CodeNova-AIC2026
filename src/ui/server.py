@@ -74,6 +74,10 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                     for r in result.get("results", []):
                         if r.get("frame_path"):
                             r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    for ev in result.get("events", []):
+                        ev["image_urls"] = [
+                            f"/frame?path={quote(fp)}" for fp in ev.get("frame_paths", []) if fp
+                        ]
                     self._send_json(result)
                 except Exception as exc:
                     LOGGER.exception("TRAKE search failed")
@@ -408,6 +412,7 @@ INDEX_HTML = r"""<!doctype html>
     </aside>
     <section>
       <div id="answer-box"></div>
+      <div id="events-box"></div>
       <div id="pipeline-box"></div>
       <div id="results" class="results"></div>
     </section>
@@ -417,6 +422,7 @@ INDEX_HTML = r"""<!doctype html>
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
     const answerBox = document.getElementById("answer-box");
+    const eventsEl = document.getElementById("events-box");
     const pipelineBox = document.getElementById("pipeline-box");
     const submitEl = document.getElementById("submit");
     const sidebarAnswer = document.getElementById("sidebar-answer");
@@ -429,6 +435,7 @@ INDEX_HTML = r"""<!doctype html>
       statusEl.textContent = "Searching...";
       resultsEl.innerHTML = "";
       answerBox.innerHTML = "";
+      eventsEl.innerHTML = "";
       pipelineBox.innerHTML = "";
       sidebarAnswer.style.display = "none";
 
@@ -527,16 +534,21 @@ INDEX_HTML = r"""<!doctype html>
     function renderTrakeEvents(events) {
       if (!events.length) return;
       const html = events.map((ev, i) => `
-        <div style="margin-bottom: 12px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);">
-          <div><strong>Event #${i + 1}</strong></div>
-          <div>Video: ${escapeHtml(ev.video_name || ev.video_id || "")}</div>
-          <div>Frames: ${ev.frame_count} · Time: ${formatTime(ev.start_timestamp)} - ${formatTime(ev.end_timestamp)}</div>
-          <div>Score: ${(ev.score || 0).toFixed(4)}</div>
+        <div style="margin-bottom: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel);">
+          <div style="margin-bottom: 8px;"><strong>Event #${i + 1}</strong></div>
+          <div style="font-size: 14px; margin-bottom: 4px;">Video: <strong>${escapeHtml(ev.video_name || ev.video_id || "")}</strong></div>
+          <div style="font-size: 13px; color: var(--muted); margin-bottom: 4px;">
+            Frames: ${ev.frame_count} · Time: ${formatTime(ev.start_timestamp)} - ${formatTime(ev.end_timestamp)}
+          </div>
+          <div style="font-size: 13px; color: var(--muted); margin-bottom: 12px;">Score: ${(ev.score || 0).toFixed(4)}</div>
+          <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+            ${(ev.image_urls || []).map(url => `
+              <img src="${escapeHtml(url)}" style="width: 100px; height: 56px; object-fit: cover; border-radius: 4px; border: 1px solid var(--line);" loading="lazy">
+            `).join("")}
+          </div>
         </div>
       `).join("");
-      const container = document.createElement("div");
-      container.innerHTML = html;
-      resultsEl.parentNode.insertBefore(container, resultsEl);
+      eventsEl.innerHTML = html;
     }
 
     function togglePipeline() {

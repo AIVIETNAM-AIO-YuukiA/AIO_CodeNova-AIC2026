@@ -94,6 +94,7 @@ def _run_temporal_pipeline(
     segments = find_segments(
         start_indices=list(hit_positions),
         frame_embeddings=frame_embeddings,
+        frame_records=frame_records,
         tolerance_threshold=3,
         min_gap=2,
     )
@@ -153,7 +154,7 @@ def vqa_search(
     Returns:
         Dict với answer, results, pipeline stages.
     """
-    retrieval_text = f"{context} {query} {question}".strip()
+    retrieval_text = f"{context} {query}".strip()
     data = _run_temporal_pipeline(experiment, retrieval_text, top_k)
     pipeline_stages = data.get("pipeline", {})
     clip_results = data.get("clip_results", [])
@@ -238,28 +239,189 @@ def trake_search(
     Returns:
         Dict với events list, results, pipeline stages.
     """
-    retrieval_text = f"{context} {query}".strip()
-    data = _run_temporal_pipeline(experiment, retrieval_text, top_k)
-    pipeline_stages = data.get("pipeline", {})
-    clip_results = data.get("clip_results", [])
-    shots = data.get("shots", [])
+    import re
+    from collections import defaultdict
+
+    # Parse multi-event format (e.g., lines starting with E1:, E2:, 1., etc.)
+    lines = [line.strip() for line in query.split('\n') if line.strip()]
+    event_pattern = re.compile(r'^(?:E\d+|Event\s*\d+|\d+)\s*[:.]\s*(.*)$', re.IGNORECASE)
+
+    event_queries = []
+    prefix_context = context.strip()
+
+    for line in lines:
+        match = event_pattern.match(line)
+        if match:
+            event_queries.append(match.group(1).strip())
+        else:
+            if not event_queries:
+                prefix_context = (prefix_context + " " + line).strip()
+            else:
+                event_queries[-1] = (event_queries[-1] + " " + line).strip()
+
+    # If no structured sub-queries were parsed, default to the whole query as a single event
+    if not event_queries:
+        event_queries = [query.strip()]
+
+    validator = ShotValidator(min_frames=1, min_clip_score=0.0)
+
+    # 1. Single Event Query: Preserve original behavior
+    if len(event_queries) == 1:
+        retrieval_text = f"{prefix_context} {event_queries[0]}".strip()
+        data = _run_temporal_pipeline(experiment, retrieval_text, top_k)
+        pipeline_stages = data.get("pipeline", {})
+        clip_results = data.get("clip_results", [])
+        shots = data.get("shots", [])
+
+        events = []
+        frame_embeddings = data.get("frame_embeddings")
+        frame_records = data.get("frame_records", [])
+        query_embedding = data.get("query_embedding")
+
+        for shot, seg in shots:
+            if frame_embeddings is not None and query_embedding is not None:
+                shot = validator.validate(shot, query_embedding, frame_embeddings, frame_records)
+            events.append(
+                {
+                    "video_id": shot.video_id,
+                    "video_name": shot.video_name,
+                    "frame_count": shot.frame_count,
+                    "start_timestamp": shot.start_timestamp,
+                    "end_timestamp": shot.end_timestamp,
+                    "score": shot.clip_score,
+                    "frame_paths": shot.frame_paths[:5],
+                }
+            )
+
+        events.sort(key=lambda x: x["score"], reverse=True)
+        return {
+            "events": events,
+            "results": [r.to_dict() for r in clip_results[:10]],
+            "pipeline": pipeline_stages,
+        }
+
+    # 2. Multi-Event Sequence Query
+    candidates = defaultdict(lambda: defaultdict(list))
+    all_clip_results = []
+    combined_pipeline_stages = {}
+
+    for idx, eq in enumerate(event_queries):
+        retrieval_text = f"{prefix_context} {eq}".strip()
+        data = _run_temporal_pipeline(experiment, retrieval_text, top_k)
+
+        clip_results = data.get("clip_results", [])
+        all_clip_results.extend(clip_results)
+
+        stages = data.get("pipeline", {})
+        combined_pipeline_stages[f"event_{idx + 1}"] = stages
+
+        shots = data.get("shots", [])
+        frame_embeddings = data.get("frame_embeddings")
+        frame_records = data.get("frame_records", [])
+        query_embedding = data.get("query_embedding")
+
+        for shot, seg in shots:
+            if frame_embeddings is not None and query_embedding is not None:
+                # Đặt min_clip_score hợp lý để chặn rác
+                validator = ShotValidator(min_frames=1, min_clip_score=0.15)
+                shot = validator.validate(shot, query_embedding, frame_embeddings, frame_records)
+            candidates[shot.video_id][idx].append(shot)
+
+    # Find the best video_id and events sequence using DP sequence search
+    best_video_id = None
+    best_video_score = -1.0
+    best_video_events = []
+
+    def find_best_sequence(event_map):
+        m_events = len(event_queries)
+        for i in range(m_events):
+            event_map[i].sort(key=lambda s: s.start_timestamp if s.start_timestamp is not None else 0.0)
+
+        memo = {}
+
+        def solve(idx, prev_end_time):
+            if idx == m_events:
+                return 0, 0.0, []
+
+            # Làm tròn thời gian để dùng làm dict key an toàn
+            state = (idx, round(prev_end_time, 1))
+            if state in memo:
+                return memo[state]
+
+            # Option 1: Skip event idx
+            best_covered, best_score, best_path = solve(idx + 1, prev_end_time)
+            best_path = [None] + best_path
+
+            # Option 2: Try all candidates
+            for shot in event_map[idx]:
+                shot_start = shot.start_timestamp if shot.start_timestamp is not None else 0.0
+                shot_end = shot.end_timestamp if shot.end_timestamp is not None else shot_start
+                
+                if shot_start > prev_end_time:
+                    # Tính khoảng cách thời gian giữa 2 event (càng gần càng tốt)
+                    gap_penalty = 0.0
+                    if prev_end_time > 0:
+                        gap_penalty = min((shot_start - prev_end_time) * 0.01, 0.5)
+
+                    cov, score, path = solve(idx + 1, shot_end)
+                    current_cov = 1 + cov
+                    current_score = shot.validation_score + score - gap_penalty
+
+                    if (current_cov > best_covered) or (current_cov == best_covered and current_score > best_score):
+                        best_covered = current_cov
+                        best_score = current_score
+                        best_path = [shot] + path
+
+            memo[state] = (best_covered, best_score, best_path)
+            return memo[state]
+
+        return solve(0, 0.0)
+
+    for video_id, event_map in candidates.items():
+        covered, score, path = find_best_sequence(event_map)
+        composite_score = covered * 1000.0 + score
+        if composite_score > best_video_score:
+            best_video_score = composite_score
+            best_video_id = video_id
+            best_video_events = path
 
     events = []
-    for shot, seg in shots:
-        events.append(
-            {
-                "video_id": shot.video_id,
-                "video_name": shot.video_name,
-                "frame_count": shot.frame_count,
-                "start_timestamp": shot.start_timestamp,
-                "end_timestamp": shot.end_timestamp,
-                "score": shot.clip_score,
-                "frame_paths": shot.frame_paths[:5],  # giới hạn số frame
-            }
-        )
+    if best_video_id is not None:
+        for shot in best_video_events:
+            if shot is not None:
+                if not shot.video_name and all_clip_results:
+                    for r in all_clip_results:
+                        if r.video_id == best_video_id:
+                            shot.video_name = r.video_name or ""
+                            break
+                events.append(
+                    {
+                        "video_id": shot.video_id,
+                        "video_name": shot.video_name,
+                        "frame_count": shot.frame_count,
+                        "start_timestamp": shot.start_timestamp,
+                        "end_timestamp": shot.end_timestamp,
+                        "score": shot.clip_score,
+                        "frame_paths": shot.frame_paths[:5],
+                    }
+                )
+
+    # Sort the events chronologically to respect the temporal ordering
+    events.sort(key=lambda x: x["start_timestamp"] if x["start_timestamp"] is not None else 0.0)
+
+    # Take unique clip results to show in results panel
+    seen_ids = set()
+    unique_results = []
+    for r in all_clip_results:
+        if r.frame_id not in seen_ids:
+            seen_ids.add(r.frame_id)
+            unique_results.append(r)
+
+    # Sort results globally by score descending
+    unique_results.sort(key=lambda r: r.score, reverse=True)
 
     return {
         "events": events,
-        "results": [r.to_dict() for r in clip_results[:10]],
-        "pipeline": pipeline_stages,
+        "results": [r.to_dict() for r in unique_results[:10]],
+        "pipeline": combined_pipeline_stages,
     }

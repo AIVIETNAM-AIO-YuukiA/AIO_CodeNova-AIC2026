@@ -47,6 +47,7 @@ def _norm(emb: np.ndarray) -> np.ndarray:
 def temporal_search_forward(
     start_idx: int,
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
 ) -> int:
     """Dò tìm phía trước từ start_idx.
@@ -57,6 +58,7 @@ def temporal_search_forward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
+        frame_records: Danh sách metadata frame để check video_id (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -68,10 +70,15 @@ def temporal_search_forward(
 
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
+    start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx + 1, n):
+        # Chặn nếu chuyển sang video khác
+        if frame_records and frame_records[idx].get("video_id") != start_video_id:
+            return idx - 1
+
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
             best = sim
@@ -79,13 +86,14 @@ def temporal_search_forward(
         else:
             tolerance += 1
             if tolerance >= tolerance_threshold:
-                return idx - tolerance_threshold
+                return max(start_idx, idx - tolerance_threshold)
     return n - 1
 
 
 def temporal_search_backward(
     start_idx: int,
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
 ) -> int:
     """Dò tìm phía trước từ start_idx (về phía đầu).
@@ -93,6 +101,7 @@ def temporal_search_backward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
+        frame_records: Danh sách metadata frame để check video_id (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -103,10 +112,15 @@ def temporal_search_backward(
 
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
+    start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx - 1, -1, -1):
+        # Chặn nếu chuyển sang video khác
+        if frame_records and frame_records[idx].get("video_id") != start_video_id:
+            return idx + 1
+
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
             best = sim
@@ -114,13 +128,14 @@ def temporal_search_backward(
         else:
             tolerance += 1
             if tolerance >= tolerance_threshold:
-                return idx + tolerance_threshold
+                return min(start_idx, idx + tolerance_threshold)
     return 0
 
 
 def find_segments(
     start_indices: list[int],
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
     min_gap: int = 2,
 ) -> list[dict]:
@@ -133,6 +148,7 @@ def find_segments(
     Args:
         start_indices: Danh sách vị trí frame từ CLIP search (sorted theo score).
         frame_embeddings: Ma trận [N, D] image embeddings.
+        frame_records: Danh sách metadata frame.
         tolerance_threshold: Ngưỡng tolerance cho temporal search.
         min_gap: Khoảng cách tối thiểu giữa 2 segment để không gộp.
 
@@ -143,8 +159,8 @@ def find_segments(
     raw_segments: list[tuple[int, int, int]] = []
 
     for idx in start_indices:
-        end_pos = temporal_search_forward(idx, frame_embeddings, tolerance_threshold)
-        start_pos = temporal_search_backward(idx, frame_embeddings, tolerance_threshold)
+        end_pos = temporal_search_forward(idx, frame_embeddings, frame_records, tolerance_threshold)
+        start_pos = temporal_search_backward(idx, frame_embeddings, frame_records, tolerance_threshold)
         raw_segments.append((start_pos, end_pos, idx))
 
     if not raw_segments:

@@ -43,11 +43,11 @@ def build_retrieval_text(request: TrackQuery) -> str:
 
     parts = []
     if track in ("vqa", "trake"):
-        parts.extend([request.context, request.question, request.query])
+        parts.extend([request.context, request.query])
     elif track == "video_kis":
-        parts.extend([request.query, request.context, request.question])
+        parts.extend([request.query, request.context])
     else:
-        parts.extend([request.query, request.context, request.question])
+        parts.extend([request.query, request.context])
 
     retrieval_text = " ".join(part.strip() for part in parts if part and part.strip())
     if not retrieval_text:
