@@ -14,8 +14,8 @@ import logging
 import numpy as np
 
 from config.settings import Experiment
-from embedding.clip_model import TransformersClipEmbedder
-from pipeline.indexing import search_index
+from modules.embedding import build_embedder
+from retrieval import build_retriever
 from retrieval.temporal_search import (
     ShotValidator,
     find_segments,
@@ -39,7 +39,8 @@ def _run_temporal_pipeline(
     pipeline_stages = {}
 
     # CLIP Search
-    clip_results = search_index(experiment=experiment, query=query, top_k=top_k)
+    retriever = build_retriever(experiment)
+    clip_results = retriever.search(query=query, top_k=top_k)
     pipeline_stages["clip_search"] = {
         "top_k": top_k,
         "results_count": len(clip_results),
@@ -102,8 +103,8 @@ def _run_temporal_pipeline(
     }
 
     # Query embedding cho shot validation
-    embedder = TransformersClipEmbedder(
-        model_name=experiment.config.clip_model,
+    embedder = build_embedder(
+        model_name=experiment.config.embedding_model,
         device=experiment.config.device,
     )
     query_embedding = embedder.embed_text(query)

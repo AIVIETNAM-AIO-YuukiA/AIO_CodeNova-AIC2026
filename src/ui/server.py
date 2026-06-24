@@ -12,8 +12,7 @@ import mimetypes
 
 from config.settings import Experiment
 from core.types import SearchResult
-from pipeline.indexing import search_index
-from pipeline.vqa import vqa_search, trake_search
+from retrieval.vqa import vqa_search, trake_search
 from retrieval import build_retriever
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 

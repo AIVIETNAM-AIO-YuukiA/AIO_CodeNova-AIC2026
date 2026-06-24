@@ -18,6 +18,7 @@ def mock_experiment(tmp_path: Path) -> Experiment:
     run_dir.mkdir(parents=True)
     config = MagicMock()
     config.clip_model = "ViT-B/32"
+    config.embedding_model = "ViT-B/32"
     config.device = "cpu"
     config.data_dir = tmp_path / "data"
     return Experiment(name="test", run_dir=run_dir, config=config)
@@ -44,16 +45,16 @@ class TestVqaSearch:
     """Test the VQA pipeline orchestrator."""
 
     def test_vqa_search_returns_expected_structure(self, mock_experiment, mock_search_results):
-        from pipeline.vqa import vqa_search
+        from retrieval.vqa import vqa_search
         from retrieval.temporal_search import ShotInput
 
         with (
-            patch("pipeline.vqa.search_index", return_value=mock_search_results),
-            patch("pipeline.vqa.load_temporal_data") as mock_load,
-            patch("pipeline.vqa.TransformersClipEmbedder") as mock_embedder_cls,
-            patch("pipeline.vqa.find_segments") as mock_find_seg,
-            patch("pipeline.vqa.gather_frame_s") as mock_gather,
-            patch("pipeline.vqa.create_agent") as mock_create_agent,
+            patch("retrieval.vqa.build_retriever") as mock_build_retriever,
+            patch("retrieval.vqa.load_temporal_data") as mock_load,
+            patch("retrieval.vqa.build_embedder") as mock_build_embedder,
+            patch("retrieval.vqa.find_segments") as mock_find_seg,
+            patch("retrieval.vqa.gather_frame_s") as mock_gather,
+            patch("retrieval.vqa.create_agent") as mock_create_agent,
         ):
             mock_embeddings = np.random.rand(10, 512).astype("float32")
             mock_records = [
@@ -69,9 +70,13 @@ class TestVqaSearch:
             ]
             mock_load.return_value = (mock_embeddings, mock_records)
 
+            mock_retriever = MagicMock()
+            mock_retriever.search.return_value = mock_search_results
+            mock_build_retriever.return_value = mock_retriever
+
             mock_embedder = MagicMock()
             mock_embedder.embed_text.return_value = [0.1] * 512
-            mock_embedder_cls.return_value = mock_embedder
+            mock_build_embedder.return_value = mock_embedder
 
             mock_find_seg.return_value = [
                 {"start_pos": 2, "end_pos": 6, "length": 5, "center_idx": 4}
@@ -115,9 +120,13 @@ class TestVqaSearch:
         assert "reasoning" in result
 
     def test_vqa_search_no_results(self, mock_experiment):
-        from pipeline.vqa import vqa_search
+        from retrieval.vqa import vqa_search
 
-        with patch("pipeline.vqa.search_index", return_value=[]):
+        with patch("retrieval.vqa.build_retriever") as mock_build:
+            mock_retriever = MagicMock()
+            mock_retriever.search.return_value = []
+            mock_build.return_value = mock_retriever
+
             result = vqa_search(
                 experiment=mock_experiment,
                 query="nothing",
@@ -129,12 +138,16 @@ class TestVqaSearch:
         assert result["results"] == []
 
     def test_vqa_search_temporal_fail_returns_fallback(self, mock_experiment, mock_search_results):
-        from pipeline.vqa import vqa_search
+        from retrieval.vqa import vqa_search
 
         with (
-            patch("pipeline.vqa.search_index", return_value=mock_search_results),
-            patch("pipeline.vqa.load_temporal_data", side_effect=FileNotFoundError("Missing")),
+            patch("retrieval.vqa.build_retriever") as mock_build,
+            patch("retrieval.vqa.load_temporal_data", side_effect=FileNotFoundError("Missing")),
         ):
+            mock_retriever = MagicMock()
+            mock_retriever.search.return_value = mock_search_results
+            mock_build.return_value = mock_retriever
+
             result = vqa_search(
                 experiment=mock_experiment,
                 query="test",
