@@ -1,0 +1,41 @@
+HƯỚNG DẪN CHẠY TRAKE PIPELINE
+=================================
+
+1. **Bật Qdrant** (nếu chưa chạy):
+   Mở terminal riêng và chạy:
+   > C:\qdrant\qdrant.exe
+   Đợi đến khi thấy "Qdrant started" (thường vài giây).
+
+2. **Chạy server UI**:
+   Mở terminal khác, cd vào thư mục project:
+   > cd D:\AIC-2026\AIO_CodeNova-AIC2026
+   > .venv\Scripts\activate
+   > uv run codenova serve-ui --experiment-name "20260625_retrieval_siglip2-large_shot-percentile_qdrant_3f9594ab" --device cpu
+
+3. **Mở trình duyệt** tại:
+   > http://127.0.0.1:7860
+
+4. **Chọn TRAKE** trong dropdown "Retrieval Track"
+
+5. **Nhập events** (tối thiểu 2):
+   - Mặc định có sẵn 2 events mẫu
+   - Có thể xoá/bớt/thêm event bằng nút "+ Add Event"
+   - Mỗi event là một mô tả ngắn gọn bằng tiếng Anh
+
+6. **Ấn Search** và chờ kết quả (5-30 giây tùy lượng dữ liệu)
+
+7. **Xem kết quả:**
+   - Video nào có ✓ temporal → khả năng đúng cao (đúng thứ tự thời gian)
+   - Video nào có ✗ temporal → vẫn hiện nhưng ưu tiên thấp hơn
+   - Click vào từng frame → modal xem full-size
+
+8. **Trong modal:**
+   - ← / → : chuyển shot khác
+   - Click 3 thumbnail dưới: đổi frame trong shot
+   - Click "Làm thumbnail": set frame làm thumbnail cho event đó
+   - Click "Revert": quay về frame gốc
+   - Escape: đóng modal
+
+9. **Nếu Gemini API báo lỗi 429 (quota):**
+   - Hệ thống tự động fallback → dùng thẳng text gốc → vẫn chạy bình thường
+   - Không cần API key để TRAKE hoạt động
