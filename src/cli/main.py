@@ -18,6 +18,7 @@ from indexing.embeddings import embed_frames
 from indexing.frames import extract_frames
 from indexing.ingest import ingest_videos
 from indexing.shots import detect_shots
+from modules.reranker.base import build_reranker
 from retrieval import build_retriever
 from ui.server import serve_ui
 
@@ -73,6 +74,21 @@ def build_parser() -> ArgumentParser:
     ui_parser.add_argument("--host", default=os.environ.get("CODENOVA_UI_HOST", "127.0.0.1"))
     ui_parser.add_argument(
         "--port", default=int(os.environ.get("CODENOVA_UI_PORT", "7860")), type=int
+    )
+    ui_parser.add_argument(
+        "--reranker-model",
+        default=None,
+        help=(
+            "Cross-encoder reranker model name or HuggingFace ID. "
+            "e.g. 'blip2-itm' or 'Salesforce/blip2-itm-vit-b'. "
+            "Omit to disable reranking."
+        ),
+    )
+    ui_parser.add_argument(
+        "--reranker-top-k",
+        default=10,
+        type=int,
+        help="Number of results to keep after reranking (default: 10).",
     )
 
     validate_parser = subparsers.add_parser("validate-experiment-name", help="Validate a run name")
@@ -213,12 +229,29 @@ def handle_search(args: Namespace) -> int:
 def handle_serve_ui(args: Namespace) -> int:
     """Serve browser UI for one experiment."""
     experiment = load_experiment(args)
+
+    # Build reranker if --reranker-model was supplied; None disables reranking.
+    reranker = build_reranker(
+        model_name=getattr(args, "reranker_model", None),
+        device=args.device,
+    )
+    if reranker:
+        LOGGER.info(
+            "Reranker enabled: model=%s top_k=%s",
+            getattr(reranker, "model_name", "?"),
+            getattr(args, "reranker_top_k", 10),
+        )
+    else:
+        LOGGER.info("Reranker: disabled (no --reranker-model supplied)")
+
     print(f"Serving retrieval UI at http://{args.host}:{args.port}")
     serve_ui(
         experiment=experiment,
         host=args.host,
         port=args.port,
         default_top_k=args.top_k,
+        reranker=reranker,
+        reranker_top_k=getattr(args, "reranker_top_k", 10),
     )
     return 0
 

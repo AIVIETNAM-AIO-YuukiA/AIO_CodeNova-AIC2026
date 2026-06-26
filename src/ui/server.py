@@ -24,10 +24,18 @@ def serve_ui(
     host: str = "127.0.0.1",
     port: int = 7860,
     default_top_k: int = 20,
+    reranker=None,
+    reranker_top_k: int = 10,
 ) -> None:
     """Serve the local retrieval UI until interrupted."""
     retriever = build_retriever(experiment)
-    handler = build_handler(experiment=experiment, retriever=retriever, default_top_k=default_top_k)
+    handler = build_handler(
+        experiment=experiment,
+        retriever=retriever,
+        default_top_k=default_top_k,
+        reranker=reranker,
+        reranker_top_k=reranker_top_k,
+    )
     server = ThreadingHTTPServer((host, port), handler)
     LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
     try:
@@ -38,7 +46,7 @@ def serve_ui(
         server.server_close()
 
 
-def build_handler(experiment: Experiment, retriever, default_top_k: int):
+def build_handler(experiment: Experiment, retriever, default_top_k: int, reranker=None, reranker_top_k: int = 10):
     """Create a request handler bound to one experiment and its retriever."""
 
     class RetrievalUiHandler(BaseHTTPRequestHandler):
@@ -47,7 +55,8 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                self._send_html(INDEX_HTML)
+                html = INDEX_HTML.replace('value="20"', f'value="{default_top_k}"')
+                self._send_html(html)
                 return
             if parsed.path == "/health":
                 self._send_json({"ok": True, "experiment": experiment.name})
@@ -60,16 +69,21 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
 
-            # TRAKE track: CLIP → Temporal → event segments
+            # TRAKE track: CLIP → Rerank (optional) → Temporal → event segments
             if parsed.path == "/api/trake-search":
                 try:
                     payload = self._read_json()
                     top_k = int(payload.get("top_k") or default_top_k)
+                    req_reranker_top_k = payload.get("reranker_top_k")
+                    req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+                    
                     result = trake_search(
                         experiment=experiment,
                         query=str(payload.get("query", "")),
                         context=str(payload.get("context", "")),
                         top_k=top_k,
+                        reranker=reranker if req_reranker_top_k else None,
+                        reranker_top_k=req_reranker_top_k or reranker_top_k,
                     )
                     for r in result.get("results", []):
                         if r.get("frame_path"):
@@ -89,12 +103,17 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                 try:
                     payload = self._read_json()
                     top_k = int(payload.get("top_k") or default_top_k)
+                    req_reranker_top_k = payload.get("reranker_top_k")
+                    req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+
                     result = vqa_search(
                         experiment=experiment,
                         query=str(payload.get("query", "")),
                         question=str(payload.get("question", "")),
                         context=str(payload.get("context", "")),
                         top_k=top_k,
+                        reranker=reranker if req_reranker_top_k else None,
+                        reranker_top_k=req_reranker_top_k or reranker_top_k,
                     )
                     # Hydrate frame paths for image serving
                     for r in result.get("results", []):
@@ -119,8 +138,15 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                     context=str(payload.get("context", "")),
                 )
                 top_k = int(payload.get("top_k") or default_top_k)
+                req_reranker_top_k = payload.get("reranker_top_k")
+                req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+
                 retrieval_text = build_retrieval_text(request)
                 results = retriever.search(query=retrieval_text, top_k=top_k)
+                
+                if reranker and req_reranker_top_k:
+                    results = reranker.rerank(query=retrieval_text, results=results)[:req_reranker_top_k]
+
                 self._send_json(
                     {
                         "track": request.track,
@@ -254,7 +280,7 @@ INDEX_HTML = r"""<!doctype html>
     }
     .row {
       display: grid;
-      grid-template-columns: 1fr 112px;
+      grid-template-columns: 1fr 1fr;
       gap: 10px;
       align-items: end;
     }
@@ -400,8 +426,12 @@ INDEX_HTML = r"""<!doctype html>
             <label for="top-k">Top K</label>
             <input id="top-k" name="top_k" type="number" value="20" min="1" max="100">
           </div>
-          <button id="submit" type="submit">Search</button>
+          <div>
+            <label for="reranker-top-k">Reranker Top K</label>
+            <input id="reranker-top-k" name="reranker_top_k" type="number" placeholder="Leave blank to disable" min="1" max="100">
+          </div>
         </div>
+        <button id="submit" type="submit">Search</button>
         <div id="sidebar-answer" style="display:none; margin-top: 14px; padding: 12px 14px; border: 1px solid var(--accent); border-radius: 8px; background: #f0fdf8;">
           <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);">Answer</div>
           <div id="sidebar-answer-text" style="margin-top: 4px; font-size: 15px; font-weight: 700; color: var(--accent-strong); line-height: 1.4;"></div>
@@ -447,6 +477,9 @@ INDEX_HTML = r"""<!doctype html>
         question: form.question.value,
         top_k: Number(form.top_k.value || 20)
       };
+      if (form.reranker_top_k.value) {
+        payload.reranker_top_k = Number(form.reranker_top_k.value);
+      }
 
       let endpoint;
       if (track === "vqa") {

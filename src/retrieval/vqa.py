@@ -15,6 +15,7 @@ import numpy as np
 
 from config.settings import Experiment
 from modules.embedding import build_embedder
+from modules.reranker.base import Reranker, build_reranker
 from retrieval import build_retriever
 from retrieval.temporal_search import (
     ShotValidator,
@@ -31,20 +32,41 @@ def _run_temporal_pipeline(
     experiment: Experiment,
     query: str,
     top_k: int = 20,
+    reranker: Reranker | None = None,
+    reranker_top_k: int = 10,
 ) -> dict:
-    """Chạy CLIP search + Temporal search, trả về raw segments + data.
+    """Run CLIP search, optional reranking, and temporal expansion.
 
-    Dùng chung cho cả VQA và TRAKE.
+    Shared by VQA and TRAKE pipelines.
+
+    Args:
+        experiment:     Active experiment.
+        query:          Text retrieval query.
+        top_k:          Candidates retrieved from Qdrant (first-stage pool).
+        reranker:       Optional cross-encoder reranker. ``None`` skips reranking.
+        reranker_top_k: Candidates kept after reranking (second-stage output).
     """
     pipeline_stages = {}
 
-    # CLIP Search
+    # Stage 1: fast bi-encoder retrieval via SigLIP + Qdrant.
     retriever = build_retriever(experiment)
     clip_results = retriever.search(query=query, top_k=top_k)
     pipeline_stages["clip_search"] = {
         "top_k": top_k,
         "results_count": len(clip_results),
     }
+
+    # Stage 2 (optional): cross-encoder reranking over the first-stage pool.
+    if reranker is not None and clip_results:
+        LOGGER.info("Reranker: scoring %d candidates...", len(clip_results))
+        clip_results = reranker.rerank(query=query, results=clip_results)
+        clip_results = clip_results[:reranker_top_k]
+        pipeline_stages["rerank"] = {
+            "model": getattr(reranker, "model_name", "unknown"),
+            "reranker_top_k": reranker_top_k,
+            "results_after_rerank": len(clip_results),
+        }
+        LOGGER.info("Reranker: kept %d results after reranking.", len(clip_results))
 
     if not clip_results:
         return {
@@ -141,21 +163,25 @@ def vqa_search(
     question: str,
     context: str = "",
     top_k: int = 20,
+    reranker=None,
+    reranker_top_k: int = 10,
 ) -> dict:
-    """VQA pipeline: CLIP search → Temporal → Shot Validation → Agent → Answer.
+    """VQA pipeline: CLIP search → (rerank) → temporal → shot validation → agent answer.
 
     Args:
-        experiment: Experiment instance.
-        query: Search query text.
-        question: VQA question.
-        context: Optional scene context.
-        top_k: Number of CLIP search results.
+        experiment:     Active experiment.
+        query:          Visual search query (describes the scene to locate).
+        question:       VQA question forwarded to the agent (e.g. ``"What is the plate number?"``).
+        context:        Optional scene context prepended to the retrieval query.
+        top_k:          First-stage candidate pool size (Qdrant).
+        reranker:       Optional cross-encoder reranker; ``None`` skips reranking.
+        reranker_top_k: Candidates retained after reranking.
 
     Returns:
-        Dict với answer, results, pipeline stages.
+        Dict with keys ``answer``, ``results``, ``pipeline``.
     """
     retrieval_text = f"{context} {query}".strip()
-    data = _run_temporal_pipeline(experiment, retrieval_text, top_k)
+    data = _run_temporal_pipeline(experiment, retrieval_text, top_k, reranker=reranker, reranker_top_k=reranker_top_k)
     pipeline_stages = data.get("pipeline", {})
     clip_results = data.get("clip_results", [])
     shots = data.get("shots", [])
@@ -227,17 +253,21 @@ def trake_search(
     query: str,
     context: str = "",
     top_k: int = 20,
+    reranker=None,
+    reranker_top_k: int = 10,
 ) -> dict:
-    """TRAKE pipeline: CLIP search → Temporal → N events.
+    """TRAKE pipeline: CLIP search → (rerank) → temporal expansion → N event segments.
 
     Args:
-        experiment: Experiment instance.
-        query: Event description text.
-        context: Optional context.
-        top_k: Number of CLIP search results.
+        experiment:     Active experiment.
+        query:          Event description; may contain multi-event lines (E1:, E2:, ...).
+        context:        Optional context prepended to each event query.
+        top_k:          First-stage candidate pool size (Qdrant).
+        reranker:       Optional cross-encoder reranker; ``None`` skips reranking.
+        reranker_top_k: Candidates retained after reranking.
 
     Returns:
-        Dict với events list, results, pipeline stages.
+        Dict with keys ``events``, ``results``, ``pipeline``.
     """
     import re
     from collections import defaultdict
