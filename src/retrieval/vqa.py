@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 
@@ -221,13 +222,12 @@ def vqa_search(
 
 
 def _search_event(
-    experiment: Experiment,
+    retriever,
     event_text: str,
     event_index: int,
     top_k: int = 50,
 ) -> list[dict]:
     """Search one event text and return scored results."""
-    retriever = build_retriever(experiment)
     results = retriever.search(query=event_text, top_k=top_k)
     out = []
     for rank, r in enumerate(results, start=1):
@@ -248,96 +248,104 @@ def _search_event(
     return out
 
 
-def _best_event_frames(
-    event_results: list[list[dict]],
-    vid: str,
-) -> tuple[float, list[dict], bool]:
-    """Pick best (lowest-rank) frame for each event, compute score, check temporal order.
-
-    For each event, select the best frame for this video (minimum rank).
-    Compute score = Σ e^(-0.02 * rank), and a temporal validity flag indicating whether
-    E1_time < E2_time < ... < En_time holds (strictly increasing).
-
-    Returns (total_score, [selected_frames], temporal_order_valid).
-    """
-    EXP_DECAY = 0.02
-    TEMPORAL_FACTOR = 2.0
-
-    selected = []
-    total_score = 0.0
-    timestamps = []
-
-    for er in event_results:
-        candidates = [h for h in er if h["video_id"] == vid]
-        if not candidates:
-            # This should never happen for videos that passed the intersection filter
-            continue
-        best = min(candidates, key=lambda h: h["rank"])
-        selected.append(best)
-        total_score += pow(2.718, -EXP_DECAY * best["rank"])
-        timestamps.append(best.get("timestamp_sec"))
-
-    if not timestamps:
-        return total_score, [], False
-
-    temporal_ok = True
-    for j in range(1, len(timestamps)):
-        if timestamps[j] <= timestamps[j - 1]:
-            temporal_ok = False
-            break
-
-    if temporal_ok:
-        total_score *= TEMPORAL_FACTOR
-
-    return total_score, selected, temporal_ok
-
-
 def trake_search(
     experiment: Experiment,
     events: list[str],
-    top_k: int = 50,
+    top_k: int = 200,
 ) -> dict:
-    """TRAKE pipeline: search multiple events independently, find ALL videos
-    containing every event with a temporally-valid frame sequence.
+    """TRAKE pipeline: Sequential Windowed Search.
 
-    For each event text, search top-K frames, intersect to find videos
-    appearing in ALL events, then use DP to pick the best frame per event
-    (by exponential-decay score) such that timestamps are strictly increasing.
-    Videos without a valid temporal ordering are excluded.
+    For each event, search globally. Then build valid chains of frames
+    (strictly increasing timestamps within a 5-minute window).
 
-    Returns ALL matching videos sorted by score descending.
+    Score = Mean_Similarity * exp(-0.5 * total_duration / 300)
     """
     if len(events) < 2:
         return {"error": "At least 2 events are required.", "videos": []}
 
-    # 1. Search each event independently
+    WINDOW_SIZE = 300  # 5 minutes
+    LAMBDA_TEMPORAL = 0.5
+
+    # 1. Search each event globally (reuse retriever)
+    retriever = build_retriever(experiment)
     event_results: list[list[dict]] = []
     for i, ev in enumerate(events):
         ev_text = ev.strip()
         if not ev_text:
             return {"error": f"Event {i+1} text is empty.", "videos": []}
-        event_results.append(_search_event(experiment, ev_text, i, top_k=top_k))
+        event_results.append(_search_event(retriever, ev_text, i, top_k=top_k))
 
-    # 2. Intersect: videos present in ALL events
-    video_sets: list[set[str]] = [set(r["video_id"] for r in er) for er in event_results]
-    common_videos = video_sets[0]
-    for vs in video_sets[1:]:
-        common_videos &= vs
+    # Group all event results by video_id for fast lookup
+    results_by_video: list[dict[str, list[dict]]] = []
+    for er in event_results:
+        by_vid: dict[str, list[dict]] = {}
+        for r in er:
+            vid = r["video_id"]
+            if vid not in by_vid:
+                by_vid[vid] = []
+            by_vid[vid].append(r)
+        results_by_video.append(by_vid)
 
-    if not common_videos:
-        return {"videos": [], "total_candidates": 0}
+    # 2. Build chains per video found in E1 results
+    e1_candidates_global = event_results[0]
+    e1_by_video: dict[str, list[dict]] = {}
+    for r in e1_candidates_global:
+        vid = r["video_id"]
+        if vid not in e1_by_video:
+            e1_by_video[vid] = []
+        e1_by_video[vid].append(r)
 
-    # 3. For each common video, select best frame per event and compute score
-    scored: list[tuple[float, list[dict], bool, str]] = []
-    for vid in common_videos:
-        total, chosen, temporal_ok = _best_event_frames(event_results, vid)
-        scored.append((total, chosen, temporal_ok, vid))
+    valid_chains: list[tuple[float, list[dict], str]] = []
 
-    scored.sort(key=lambda x: -x[0])
+    for vid, e1_list in e1_by_video.items():
+        e1_list.sort(key=lambda x: -x["score"])
+        best_chain_for_video = None
+        best_score_for_video = -1.0
 
-    # 4. Build result list (ALL matching videos) with temporal badges
+        for e1_cand in e1_list[:20]:
+            chain = [e1_cand]
+            used_ids = {e1_cand["frame_id"]}
+            current_time = e1_cand.get("timestamp_sec")
+            if current_time is None:
+                continue
+
+            valid = True
+            for ei in range(1, len(events)):
+                candidates = [
+                    r
+                    for r in results_by_video[ei].get(vid, [])
+                    if r.get("timestamp_sec") is not None
+                    and r["frame_id"] not in used_ids
+                    and current_time < r["timestamp_sec"] <= current_time + WINDOW_SIZE
+                ]
+                if not candidates:
+                    valid = False
+                    break
+
+                best = max(candidates, key=lambda x: x["score"])
+                chain.append(best)
+                used_ids.add(best["frame_id"])
+                current_time = best["timestamp_sec"]
+
+            if valid:
+                mean_sim = sum(c["score"] for c in chain) / len(chain)
+                duration = chain[-1]["timestamp_sec"] - chain[0]["timestamp_sec"]
+                temporal_factor = math.exp(-LAMBDA_TEMPORAL * duration / WINDOW_SIZE)
+                final_score = mean_sim * temporal_factor
+
+                if final_score > best_score_for_video:
+                    best_score_for_video = final_score
+                    best_chain_for_video = chain
+
+        if best_chain_for_video:
+            valid_chains.append((best_score_for_video, best_chain_for_video, vid))
+
+    # 3. Sort all found chains by score descending
+    valid_chains.sort(key=lambda x: -x[0])
+
+    # 4. Format output for UI
     out_videos = []
-    for total, chosen, temporal_ok, vid in scored:
+    for score, chain, vid in valid_chains:
         events_out = [
             {
                 "event_index": c["event_index"],
@@ -351,19 +359,19 @@ def trake_search(
                 "shot_id": c["shot_id"],
                 "frame_index": c["frame_index"],
             }
-            for c in chosen
+            for c in chain
         ]
         out_videos.append(
             {
                 "video_id": vid,
-                "video_name": chosen[0]["video_name"] if chosen else vid,
-                "score": round(total, 4),
-                "temporal_order_valid": temporal_ok,
+                "video_name": chain[0]["video_name"],
+                "score": round(score, 4),
+                "temporal_order_valid": True,
                 "events": events_out,
             }
         )
 
     return {
         "videos": out_videos,
-        "total_candidates": len(common_videos),
+        "total_candidates": len(out_videos),
     }

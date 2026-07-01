@@ -597,16 +597,21 @@ INDEX_HTML = r"""<!doctype html>
             originalUrl: ev.image_url||"", originalFrameId: ev.frame_id||"",
             originalTimestamp: ev.timestamp_sec,
             currentUrl: ev.image_url||"", currentTimestamp: ev.timestamp_sec,
+            currentFrameId: ev.frame_id||"",
             rank: ev.rank,
+            videoId: video.video_id,
+            eventIdx: ei,
           };
         }
         const st = thumbState[key];
         const url = st.currentUrl;
         const isCustom = url !== st.originalUrl;
+        const safeKey = key.replace("::","__");
         return `
-          <div class="ev-card${isCustom?" has-custom":""}" id="evcard-${esc(key.replace("::","__"))}">
+          <div class="ev-card${isCustom?" has-custom":""}" id="evcard-${safeKey}">
             <img src="${esc(url)}" alt="Event ${ei+1}" loading="lazy"
-              onclick="openModal('${esc(url)}','${esc(video.video_id)}','${esc(ev.frame_id||"")}',${ei},'${esc(video.video_id)}')">
+              id="evimg-${safeKey}"
+              onclick="openModalFromCard('${safeKey}')">
             <button class="revert-badge" onclick="revertCard('${esc(video.video_id)}',${ei})">&#x21a9; Revert</button>
             <div class="ev-info">
               <span id="evinfo-text-${esc(key.replace("::","__"))}"><strong>Event ${ei+1}</strong> &middot; rank ${st.rank} &middot; ${fmtTime(st.currentTimestamp)}</span>
@@ -631,6 +636,7 @@ INDEX_HTML = r"""<!doctype html>
     if (!st) return;
     st.currentUrl = st.originalUrl;
     st.currentTimestamp = st.originalTimestamp;
+    st.currentFrameId = st.originalFrameId;
     refreshCard(videoId, eventIdx);
     STATUS.innerHTML = `<strong>Reverted</strong> Event ${eventIdx+1} to original <span class="pill">ORIGINAL</span>`;
     // sync modal if it's open on this card
@@ -679,6 +685,14 @@ INDEX_HTML = r"""<!doctype html>
     videoId: "",
     eventIdx: null,   // null for non-trake cards
   };
+
+  // ─── Open modal from card (reads live thumbState, not stale render values) ───
+  function openModalFromCard(safeKey) {
+    const key = safeKey.replace('__','::');
+    const st = thumbState[key];
+    if (!st) return;
+    openModal(st.currentUrl, st.videoId, st.currentFrameId, st.eventIdx);
+  }
 
   // ─── Modal open ───────────────────────────────────────────────────────────────
   function openModal(imgSrc, videoId, frameId, eventIdx, _unused) {
@@ -797,6 +811,7 @@ INDEX_HTML = r"""<!doctype html>
     if (!thumbState[key]) return;
     thumbState[key].currentUrl = frame.image_url;
     thumbState[key].currentTimestamp = frame.timestamp_sec;
+    thumbState[key].currentFrameId = frame.frame_id;
     refreshCard(modal.videoId, modal.eventIdx);
     renderModal(); // update button text + revert visibility
     STATUS.innerHTML = `<strong>Thumbnail updated</strong> — Event ${modal.eventIdx+1} <span class="pill">CUSTOM</span>`;
