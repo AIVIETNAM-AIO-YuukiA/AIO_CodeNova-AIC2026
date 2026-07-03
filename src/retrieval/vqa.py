@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import numpy as np
 
@@ -221,157 +220,22 @@ def vqa_search(
     }
 
 
-def _search_event(
-    retriever,
-    event_text: str,
-    event_index: int,
-    top_k: int = 50,
-) -> list[dict]:
-    """Search one event text and return scored results."""
-    results = retriever.search(query=event_text, top_k=top_k)
-    out = []
-    for rank, r in enumerate(results, start=1):
-        out.append(
-            {
-                "event_index": event_index,
-                "rank": rank,
-                "score": r.score,
-                "frame_id": r.frame_id,
-                "video_id": r.video_id,
-                "video_name": r.video_name or r.video_id,
-                "frame_path": r.frame_path,
-                "timestamp_sec": r.timestamp_sec,
-                "shot_id": r.shot_id,
-                "frame_index": r.frame_index,
-            }
-        )
-    return out
-
-
 def trake_search(
     experiment: Experiment,
     events: list[str],
-    top_k: int = 200,
+    top_k: int = 300,
+    window: int = 300,
 ) -> dict:
-    """TRAKE pipeline: Sequential Windowed Search.
+    """TRAKE pipeline: Bidirectional Pair Join (BPJ).
 
-    For each event, search globally. Then build valid chains of frames
-    (strictly increasing timestamps within a 5-minute window).
-
-    Score = Mean_Similarity * exp(-0.5 * total_duration / 300)
+    Delegates to :mod:`retrieval.trake_search` — the core BPJ algorithm.
+    See that module for full documentation.
     """
-    if len(events) < 2:
-        return {"error": "At least 2 events are required.", "videos": []}
+    from retrieval.trake_search import trake_search as _bpj_search
 
-    WINDOW_SIZE = 300  # 5 minutes
-    LAMBDA_TEMPORAL = 0.5
-
-    # 1. Search each event globally (reuse retriever)
-    retriever = build_retriever(experiment)
-    event_results: list[list[dict]] = []
-    for i, ev in enumerate(events):
-        ev_text = ev.strip()
-        if not ev_text:
-            return {"error": f"Event {i+1} text is empty.", "videos": []}
-        event_results.append(_search_event(retriever, ev_text, i, top_k=top_k))
-
-    # Group all event results by video_id for fast lookup
-    results_by_video: list[dict[str, list[dict]]] = []
-    for er in event_results:
-        by_vid: dict[str, list[dict]] = {}
-        for r in er:
-            vid = r["video_id"]
-            if vid not in by_vid:
-                by_vid[vid] = []
-            by_vid[vid].append(r)
-        results_by_video.append(by_vid)
-
-    # 2. Build chains per video found in E1 results
-    e1_candidates_global = event_results[0]
-    e1_by_video: dict[str, list[dict]] = {}
-    for r in e1_candidates_global:
-        vid = r["video_id"]
-        if vid not in e1_by_video:
-            e1_by_video[vid] = []
-        e1_by_video[vid].append(r)
-
-    valid_chains: list[tuple[float, list[dict], str]] = []
-
-    for vid, e1_list in e1_by_video.items():
-        e1_list.sort(key=lambda x: -x["score"])
-        best_chain_for_video = None
-        best_score_for_video = -1.0
-
-        for e1_cand in e1_list[:20]:
-            chain = [e1_cand]
-            used_ids = {e1_cand["frame_id"]}
-            current_time = e1_cand.get("timestamp_sec")
-            if current_time is None:
-                continue
-
-            valid = True
-            for ei in range(1, len(events)):
-                candidates = [
-                    r
-                    for r in results_by_video[ei].get(vid, [])
-                    if r.get("timestamp_sec") is not None
-                    and r["frame_id"] not in used_ids
-                    and current_time < r["timestamp_sec"] <= current_time + WINDOW_SIZE
-                ]
-                if not candidates:
-                    valid = False
-                    break
-
-                best = max(candidates, key=lambda x: x["score"])
-                chain.append(best)
-                used_ids.add(best["frame_id"])
-                current_time = best["timestamp_sec"]
-
-            if valid:
-                mean_sim = sum(c["score"] for c in chain) / len(chain)
-                duration = chain[-1]["timestamp_sec"] - chain[0]["timestamp_sec"]
-                temporal_factor = math.exp(-LAMBDA_TEMPORAL * duration / WINDOW_SIZE)
-                final_score = mean_sim * temporal_factor
-
-                if final_score > best_score_for_video:
-                    best_score_for_video = final_score
-                    best_chain_for_video = chain
-
-        if best_chain_for_video:
-            valid_chains.append((best_score_for_video, best_chain_for_video, vid))
-
-    # 3. Sort all found chains by score descending
-    valid_chains.sort(key=lambda x: -x[0])
-
-    # 4. Format output for UI
-    out_videos = []
-    for score, chain, vid in valid_chains:
-        events_out = [
-            {
-                "event_index": c["event_index"],
-                "rank": c["rank"],
-                "frame_id": c["frame_id"],
-                "frame_path": c["frame_path"],
-                "video_id": c["video_id"],
-                "video_name": c["video_name"],
-                "timestamp_sec": c["timestamp_sec"],
-                "score": c["score"],
-                "shot_id": c["shot_id"],
-                "frame_index": c["frame_index"],
-            }
-            for c in chain
-        ]
-        out_videos.append(
-            {
-                "video_id": vid,
-                "video_name": chain[0]["video_name"],
-                "score": round(score, 4),
-                "temporal_order_valid": True,
-                "events": events_out,
-            }
-        )
-
-    return {
-        "videos": out_videos,
-        "total_candidates": len(out_videos),
-    }
+    return _bpj_search(
+        experiment=experiment,
+        events=events,
+        top_k=top_k,
+        window=window,
+    )

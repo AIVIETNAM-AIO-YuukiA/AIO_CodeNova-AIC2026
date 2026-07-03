@@ -262,6 +262,8 @@ def load_temporal_data(
     records = []
     for fid in id_list:
         meta = frame_map.get(fid, {})
+        if meta.get("frame_id") is None:
+            meta["frame_id"] = fid
         records.append(meta)
 
     sorted_indices = sorted(

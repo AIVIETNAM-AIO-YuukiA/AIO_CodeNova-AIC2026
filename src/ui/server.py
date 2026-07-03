@@ -71,8 +71,8 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                     if not isinstance(events_raw, list) or len(events_raw) < 2:
                         raise ValueError("At least 2 events are required.")
                     events: list[str] = [str(e).strip() for e in events_raw if str(e).strip()]
-                    # Fixed to 100 frames for TRAKE (hard-coded, user cannot override)
-                    top_k = 100
+                    # Fixed to 300 frames for TRAKE (hard-coded, user cannot override)
+                    top_k = 300
                     result = trake_search(
                         experiment=experiment,
                         events=events,

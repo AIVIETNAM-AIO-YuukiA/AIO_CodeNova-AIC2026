@@ -1,4 +1,4 @@
-# TRAKE Pipeline — Sequential Windowed Search Diagram
+# TRAKE Pipeline — Bidirectional Pair Join (BPJ) Diagram
 
 ```mermaid
 flowchart TD
@@ -7,24 +7,32 @@ flowchart TD
     end
 
     subgraph Step1["BƯỚC 1: GLOBAL SEARCH"]
-        S1["Search E₁ → Qdrant top 200"]
-        S2["Search E₂ → Qdrant top 200"]
-        S3["Search Eₙ → Qdrant top 200"]
-        G1["Gom theo video_id"]
+        S1["Search E₁ → Qdrant top 300"]
+        S2["Search E₂ → Qdrant top 300"]
+        S3["Search Eₙ → Qdrant top 300"]
+        VEC["Store vectors + metadata in-memory"]
     end
 
-    subgraph Step2["BƯỚC 2: BUILD CHAINS"]
-        V["Với mỗi video có trong E₁"]
-        E1["Duyệt E₁ candidates (top 20 theo score)"]
-        W["Cửa sổ 300s"]
-        F2["Lọc E₂: cùng video + ts ∈ [t₁, t₁+300]"]
-        F3["Lọc E₃: cùng video + ts ∈ [t₂, t₂+300]"]
-        Fn["Lọc Eₙ ..."]
-        CK{"Có đủ N events?"}
-        SC["Tính Final Score"]
+    subgraph Step2["BƯỚC 2: BIDIRECTIONAL PAIR JOIN"]
+        direction LR
+        subgraph Pair_AB["Pair (E₁, E₂)"]
+            PAB_F["Forward: E₁→E₂<br/>cosine sim in-memory<br/>+5min window<br/>top 30 per candidate"]
+            PAB_B["Backward: E₂←E₁<br/>cosine sim in-memory<br/>-5min window<br/>top 30 per candidate"]
+            PAB_M["Merge + dedup<br/>top 300 pairs"]
+        end
+        subgraph Pair_BC["Pair (E₂, E₃)"]
+            PBC_F["Forward: E₂→E₃<br/>cosine sim in-memory<br/>+5min window<br/>top 30 per candidate"]
+            PBC_B["Backward: E₃←E₂<br/>cosine sim in-memory<br/>-5min window<br/>top 30 per candidate"]
+            PBC_M["Merge + dedup<br/>top 300 pairs"]
+        end
     end
 
-    subgraph Step3["BƯỚC 3: SORT & OUTPUT"]
+    subgraph Step3["BƯỚC 3: JOIN & SCORE"]
+        JOIN["Join pairs on common frame_id<br/>E₂ must match across both pairs"]
+        SC["Chain Score = mean(sim)"]
+    end
+
+    subgraph Step4["BƯỚC 4: SORT & OUTPUT"]
         SORT["Sort chains theo score giảm dần"]
         OUT["Return JSON cho UI"]
     end
@@ -32,18 +40,21 @@ flowchart TD
     E --> S1
     E --> S2
     E --> S3
-    S1 --> G1
-    S2 --> G1
-    S3 --> G1
-    G1 --> V
-    V --> E1
-    E1 --> W
-    W --> F2
-    F2 --> F3
-    F3 --> Fn
-    Fn --> CK
-    CK -- "Yes" --> SC
-    CK -- "No → discard chain" --> E1
+    S1 --> VEC
+    S2 --> VEC
+    S3 --> VEC
+    VEC --> PAB_F
+    VEC --> PAB_B
+    VEC --> PBC_F
+    VEC --> PBC_B
+    PAB_F --> PAB_M
+    PAB_B --> PAB_M
+    PBC_F --> PBC_B
+    PBC_F --> PBC_M
+    PBC_B --> PBC_M
+    PAB_M --> JOIN
+    PBC_M --> JOIN
+    JOIN --> SC
     SC --> SORT
     SORT --> OUT
 ```
@@ -52,34 +63,47 @@ flowchart TD
 
 | Parameter | Value | Ý nghĩa |
 |-----------|-------|---------|
-| `top_k` | 200 | Số frame lấy mỗi event |
-| `WINDOW_SIZE` | 300s (5 phút) | Cửa sổ thời gian giữa 2 events |
-| `λ` (lambda) | 0.5 | Hệ số phạt temporal |
-| Max E₁ candidates | 20 | Số E₁ frame thử mỗi video |
+| `top_k` | 300 | Số frame lấy mỗi event từ Qdrant |
+| `WINDOW_SIZE` | 300s (5 phút) | Cửa sổ thời gian cho pair matching |
+| Window search top-K | 30 | Số best match giữ lại mỗi candidate |
+| Max pairs per adjacent pair | 300 | Số cặp giữ lại sau merge mỗi cặp |
 
 ## Scoring
 
+### Pair Score (cho mỗi cặp frame trong forward/backward)
+
 ```
-Final_Score = (1/N × Σ Sim(Qᵢ, Fᵢ)) × exp(-0.5 × (tₙ - t₁) / 300)
+Pair_Score = Sim(fᵢ, eᵢ) + Sim(fᵢ₊₁, eᵢ₊₁)
 ```
 
-- **Sim(Qᵢ, Fᵢ)** = vector similarity (Qdrant score) giữa event text và frame
-- **exp(-0.5 × duration / 300)** = temporal penalty factor
-- Events xảy ra càng sát nhau → factor càng gần 1 → score càng cao
+- **Sim(fᵢ, eᵢ)** = vector similarity (Qdrant score) giữa event text eᵢ và frame fᵢ
+- Không temporal penalty — score thuần semantic
 
-## So sánh OLD vs NEW
+### Chain Score (cho chain hoàn chỉnh)
 
-| | OLD (Independent + Intersection) | NEW (Sequential Windowed) |
+```
+Chain_Score = mean(Sim(f₁, e₁), Sim(f₂, e₂), ..., Sim(fₙ, eₙ))
+```
+
+- **mean(sim)** = trung bình similarity scores của tất cả frame
+- Không temporal penalty — chỉ dựa trên độ khớp semantic
+
+## So sánh OLD vs BPJ
+
+| | OLD (Sequential Windowed) | NEW (Bidirectional Pair Join) |
 |---|---|---|
-| Filter | Hard: video phải có trong ALL events | Soft: mỗi bước lọc theo window |
-| Temporal | Boolean (OK / not OK) × 2.0 | Continuous penalty exp(-λ×d/W) |
-| Scoring | Σ e^(-0.02×rank) | Mean_similarity × temporal_factor |
-| Retriever | Build N lần (1/event) | Build 1 lần, reuse |
+| Strategy | Greedy-forward từ E₁ | Bidirectional, mỗi cặp độc lập |
+| E₂ matching | Qdrant score (global) | In-memory cosine similarity với query E₂ |
+| Search chiều | 1 chiều (forward) | 2 chiều (forward + backward) |
+| Dedup | Tránh trùng frame_id trong chain | Dedup pairs theo (frame_idᵢ, frame_idᵢ₊₁) |
+| Temporal penalty | Có (tuyến tính) | Không |
+| Nhạy cảm với E₁ bad frame | Rất — nếu E₁ sai, chain hỏng | Ít — backward pass có thể cứu |
 
 ## Lưu ý
 
-- **3 events → 3 lần search Qdrant × 200 = 600 frames** (không search lại trong vòng lặp)
-- **Không có intersection cứng** — video chỉ cần có E₁ trong top 200 là được xét
-- **Nếu E₂ không có frame nào trong window 300s → discard chain đó**
-- **Không trùng frame_id giữa các events trong cùng chain** — mỗi candidate bị loại nếu `frame_id` đã có trong chain trước đó.
-- **Timestamp strict** (`<` thay vì `<=`) — Eᵢ₊₁ phải có timestamp **lớn hơn hẳn** Eᵢ, không được bằng.
+- **N events → N lần search Qdrant × 300 frames**
+- **Forward + Backward cho mỗi adjacent pair → 2(N-1) passes in-memory**
+- **In-memory cosine similarity** dùng preloaded frame embeddings và query vector — không search lại Qdrant
+- **Window search top-30** mỗi candidate → ≤9000 pairs mỗi chiều → merge → top 300
+- **Join pairs** bằng cách matching frame_id của event ở giữa
+- **Không temporal penalty** — score chỉ dựa trên độ khớp semantic thuần
