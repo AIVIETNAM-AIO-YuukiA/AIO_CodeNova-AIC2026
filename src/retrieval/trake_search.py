@@ -1,11 +1,11 @@
 """TRAKE search — Bidirectional Pair Join (BPJ) algorithm.
 
-Mỗi cặp event liền kề (eᵢ, eᵢ₊₁) được xử lý độc lập:
-  - Forward: từ candidate eᵢ → tìm eᵢ₊₁ trong +5p (in-memory cosine)
-  - Backward: từ candidate eᵢ₊₁ → tìm eᵢ trong -5p (in-memory cosine)
+Each adjacent pair (eᵢ, eᵢ₊₁) is processed independently:
+  - Forward: from candidate eᵢ → find eᵢ₊₁ inside +5min (in-memory cosine)
+  - Backward: from candidate eᵢ₊₁ → find eᵢ inside -5min (in-memory cosine)
   - Merge → top-300 pairs
 
-Sau đó join các cặp qua frame_id chung → chain N events.
+Chains are formed by joining pairs on common frame_id.
 
 Pair score:    sim(fᵢ, eᵢ) + sim(fᵢ₊₁, eᵢ₊₁)
 Chain score:   mean(sim_i, sim_j, ...)
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 from bisect import bisect_left, bisect_right
+from collections import Counter
 
 import numpy as np
 
@@ -27,7 +28,7 @@ from retrieval.temporal_search import load_temporal_data
 LOGGER = logging.getLogger(__name__)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
+# ── helpers ────────────────────────────────────────────────────────────
 
 
 def _build_video_index(
@@ -35,7 +36,7 @@ def _build_video_index(
 ) -> dict[str, tuple[list[float], list[int]]]:
     """Build in-memory index: video_id → (sorted_timestamps, embedding_indices).
 
-    Cho phép binary search frame theo timestamp trong 1 video cụ thể.
+    Enables binary search over frames by timestamp within a single video.
     """
     raw: dict[str, list[tuple[float, int]]] = {}
     for i, rec in enumerate(frame_records):
@@ -56,10 +57,14 @@ def _search_event(
     event_index: int,
     top_k: int,
 ) -> list[dict]:
-    """Search one event globally via Qdrant, return enriched frame dicts."""
+    """Search one event globally via Qdrant, return enriched frame dicts (distinct frame_id)."""
     results = retriever.search(query=event_text, top_k=top_k)
     out: list[dict] = []
+    seen_fids: set[str] = set()
     for rank, r in enumerate(results, start=1):
+        if r.frame_id in seen_fids:
+            continue
+        seen_fids.add(r.frame_id)
         out.append(
             {
                 "event_index": event_index,
@@ -98,9 +103,9 @@ def _window_search_fwd(
     frame_records: list[dict],
     hydrator: ResultHydrator,
 ) -> list[tuple[dict, float]]:
-    """In-memory cosine search trong (t_start, t_start + window].
+    """In-memory cosine search in (t_start, t_start + window].
 
-    Returns list of (frame_info, cosine_score) sorted desc, tối đa 30 frames.
+    Returns list of (frame_info, cosine_score) sorted desc, up to 30 distinct frames.
     """
     if vid not in video_index:
         return []
@@ -118,11 +123,15 @@ def _window_search_fwd(
     top_pos = np.argpartition(sims, -top_n)[-top_n:]
     top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
+    seen_fids: set[str] = set()
     for pos in top_pos:
         score = float(sims[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
+            if frame_id in seen_fids:
+                continue
+            seen_fids.add(frame_id)
             sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
             info = {
                 "frame_id": sr.frame_id,
@@ -133,6 +142,7 @@ def _window_search_fwd(
                 "shot_id": sr.shot_id,
                 "frame_index": sr.frame_index,
                 "score": sr.score,
+                "rank": len(results) + 1,
             }
         else:
             info = {
@@ -144,8 +154,11 @@ def _window_search_fwd(
                 "shot_id": None,
                 "frame_index": None,
                 "score": score,
+                "rank": len(results) + 1,
             }
         results.append((info, score))
+        if len(seen_fids) >= 30:
+            break
     return results
 
 
@@ -159,9 +172,9 @@ def _window_search_bwd(
     frame_records: list[dict],
     hydrator: ResultHydrator,
 ) -> list[tuple[dict, float]]:
-    """In-memory cosine search trong [t_end - window, t_end).
+    """In-memory cosine search in [t_end - window, t_end).
 
-    Returns list of (frame_info, cosine_score) sorted desc, tối đa 30 frames.
+    Returns list of (frame_info, cosine_score) sorted desc, up to 30 distinct frames.
     """
     if vid not in video_index:
         return []
@@ -179,11 +192,15 @@ def _window_search_bwd(
     top_pos = np.argpartition(sims, -top_n)[-top_n:]
     top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
+    seen_fids: set[str] = set()
     for pos in top_pos:
         score = float(sims[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
+            if frame_id in seen_fids:
+                continue
+            seen_fids.add(frame_id)
             sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
             info = {
                 "frame_id": sr.frame_id,
@@ -194,6 +211,7 @@ def _window_search_bwd(
                 "shot_id": sr.shot_id,
                 "frame_index": sr.frame_index,
                 "score": sr.score,
+                "rank": len(results) + 1,
             }
         else:
             info = {
@@ -205,12 +223,15 @@ def _window_search_bwd(
                 "shot_id": None,
                 "frame_index": None,
                 "score": score,
+                "rank": len(results) + 1,
             }
         results.append((info, score))
+        if len(seen_fids) >= 30:
+            break
     return results
 
 
-# ── bidirectional pair search (một cặp adjacent events) ──────────
+# ── bidirectional pair search (one adjacent pair) ──────────
 
 
 def bidirectional_pair_search(
@@ -225,14 +246,14 @@ def bidirectional_pair_search(
     top_k: int = 300,
     window: int = 300,
 ) -> list[tuple[dict, dict, float, float, float]]:
-    """Bidirectional search cho một cặp (eᵢ, eᵢ₊₁).
+    """Bidirectional search for one adjacent pair (eᵢ, eᵢ₊₁).
 
-    Returns top-K pairs, mỗi pair = (f_i_info, f_j_info, pair_score, sim_i, sim_j).
+    Returns top-K pairs, each pair = (f_i_info, f_j_info, pair_score, sim_i, sim_j).
     """
     embed_i = _embed_event(retriever, event_text_i)
     embed_j = _embed_event(retriever, event_text_j)
 
-    # 1. Forward: candidate eᵢ → tìm eᵢ₊₁ trong +window (top-30)
+    # 1. Forward: candidate eᵢ → find eᵢ₊₁ in +window (top-30 distinct)
     candidates_i = _search_event(retriever, event_text_i, event_index_i, top_k)
     forward: list[tuple[dict, dict, float, float, float]] = []
     for f_i in candidates_i:
@@ -254,7 +275,7 @@ def bidirectional_pair_search(
             pair_score = sim_i + sim_j
             forward.append((f_i, f_j_info, pair_score, sim_i, sim_j))
 
-    # 2. Backward: candidate eᵢ₊₁ → tìm eᵢ trong -window (top-30)
+    # 2. Backward: candidate eᵢ₊₁ → find eᵢ in -window (top-30 distinct)
     candidates_j = _search_event(retriever, event_text_j, event_index_i + 1, top_k)
     backward: list[tuple[dict, dict, float, float, float]] = []
     for f_j in candidates_j:
@@ -276,7 +297,7 @@ def bidirectional_pair_search(
             pair_score = sim_i + sim_j
             backward.append((f_i_info, f_j, pair_score, sim_i, sim_j))
 
-    # 3. Merge, dedup (keep higher score), filter, rank
+    # 3. Merge forward + backward, dedup by (f_i_id, f_j_id), keep higher score, filter, rank
     best: dict[tuple[str, str], tuple[dict, dict, float, float, float]] = {}
     for item in forward + backward:
         f_i, f_j, ps, si, sj = item
@@ -304,18 +325,18 @@ def bidirectional_pair_search(
     return merged[:top_k]
 
 
-# ── chain join ─────────────────────────────────────────────────────
+# ── chain join ────────────────────────────────────────────────────────
 
 
 def chain_join(
     pair_lists: list[list[tuple[dict, dict, float, float, float]]],
     window: int = 300,
 ) -> list[tuple[list[dict], float]]:
-    """Join N-1 independent pair lists thành chain N events.
+    """Join N-1 independent pair lists into chains of N events.
 
     Args:
-        pair_lists: list[pairs] cho từng cặp, pairs[i] = top-K (eᵢ, eᵢ₊₁)
-        window: temporal window (giây) để filter timestamp
+        pair_lists: list of pair lists, pair_lists[i] = top-K pairs for (eᵢ, eᵢ₊₁)
+        window: temporal window (seconds) for timestamp filtering
 
     Returns:
         [(chain_frames, chain_score), ...] sorted descending by score
@@ -323,12 +344,12 @@ def chain_join(
     if not pair_lists:
         return []
 
-    # Khởi tạo chains từ cặp đầu tiên
+    # Initialize chains from the first pair list
     chains: list[tuple[list[dict], list[float]]] = [
         ([f_i, f_j], [si, sj]) for f_i, f_j, _, si, sj in pair_lists[0]
     ]
 
-    # Join với các cặp tiếp theo — set-join: mỗi chain chọn 1 match tốt nhất
+    # Set-join with subsequent pair lists: each chain picks the best match
     for pairs_k in pair_lists[1:]:
         new_chains: list[tuple[list[dict], list[float]]] = []
         for chain_frames, chain_scores in chains:
@@ -351,7 +372,7 @@ def chain_join(
         if not chains:
             break
 
-    # Tính score cho mỗi chain
+    # Score each chain
     scored: list[tuple[list[dict], float]] = []
     seen_chains: set[tuple[str, ...]] = set()
     for chain_frames, chain_scores in chains:
@@ -372,7 +393,7 @@ def chain_join(
     return scored
 
 
-# ── main entry point ────────────────────────────────────────────────
+# ── main entry point ──────────────────────────────────────────────────
 
 
 def trake_search(
@@ -384,14 +405,14 @@ def trake_search(
     """TRAKE pipeline — Bidirectional Pair Join (BPJ).
 
     Args:
-        experiment: Experiment instance (cấu hình + run_dir).
-        events: Danh sách event text, ít nhất 2.
-        top_k: Số candidate frame mỗi event (và số pair mỗi adjacent pair).
-        window: Cửa sổ thời gian (giây), mặc định 300 (5 phút).
+        experiment: Experiment instance (config + run_dir).
+        events: List of event texts, at least 2.
+        top_k: Number of candidate frames per event (and pairs per adjacent pair).
+        window: Temporal window (seconds), default 300 (5 minutes).
 
     Returns:
-        Dict với "videos" (list chain) và "total_candidates".
-        Format tương thích với server.py.
+        Dict with "videos" (list of chains) and "total_candidates".
+        Compatible with server.py response format.
     """
     if len(events) < 2:
         return {"error": "At least 2 events are required.", "videos": []}
@@ -412,7 +433,7 @@ def trake_search(
     # 2b. Build in-memory video timestamp index
     video_index = _build_video_index(frame_records)
 
-    # 3. Process each adjacent pair — hoàn toàn độc lập
+    # 3. Process each adjacent pair — fully independent
     n = len(clean)
     pair_lists: list[list[tuple[dict, dict, float, float, float]]] = []
     for i in range(n - 1):
@@ -436,7 +457,7 @@ def trake_search(
     # 4. Join into chains
     chains = chain_join(pair_lists, window)
 
-    # 5. Dedup chains final (safety) & filter invalid
+    # 5. Final chain dedup (safety) & filter invalid chains
     seen: set[tuple[str, ...]] = set()
     unique: list[tuple[list[dict], float]] = []
     for c_frames, c_score in chains:
@@ -448,71 +469,68 @@ def trake_search(
         seen.add(fids)
         unique.append((c_frames, c_score))
 
-    # Debug: thống kê video_ids trong unique chains
-    from collections import Counter
-
-    pre_vids = Counter()
-    for cf, _ in unique[:top_k]:
-        v = {f.get("video_id") for f in cf if f.get("video_id")}
-        if len(v) == 1:
-            pre_vids.update(v)
-    LOGGER.info(
-        "TRAKE DEBUG: unique[:%d] → %d distinct video_ids, distribution: %s",
-        min(top_k, len(unique)),
-        len(pre_vids),
-        dict(pre_vids.most_common(10)),
-    )
-
-    # 6. Format output — giữ 1 chain tốt nhất mỗi video_id
-    best_per_video: dict[str, tuple[list[dict], float, str]] = {}
+    # 6. Format output — output ALL valid chains sorted by score
+    out_videos: list[dict] = []
+    out_vid_counter: Counter = Counter()
     for chain_frames, chain_score in unique[:top_k]:
         vids = {f.get("video_id") for f in chain_frames if f.get("video_id")}
         if len(vids) != 1:
             continue
         vid = next(iter(vids))
-        # Chỉ ghi đè nếu score cao hơn (unique đã sort giảm dần, item đầu là tốt nhất)
-        if vid not in best_per_video:
-            vname = chain_frames[0].get("video_name", vid)
-            events_out = []
-            for idx, f_info in enumerate(chain_frames):
-                events_out.append(
-                    {
-                        "event_index": idx,
-                        "rank": f_info.get("rank", 0),
-                        "frame_id": f_info.get("frame_id"),
-                        "frame_path": f_info.get("frame_path"),
-                        "video_id": f_info.get("video_id"),
-                        "video_name": f_info.get("video_name", f_info.get("video_id")),
-                        "timestamp_sec": f_info.get("timestamp_sec"),
-                        "score": f_info.get("score", 0.0),
-                        "shot_id": f_info.get("shot_id"),
-                        "frame_index": f_info.get("frame_index"),
-                    }
-                )
-            best_per_video[vid] = (vname, events_out, round(chain_score, 4))
+        vname = chain_frames[0].get("video_name", vid)
+        events_out = []
+        for idx, f_info in enumerate(chain_frames):
+            events_out.append(
+                {
+                    "event_index": idx,
+                    "rank": f_info.get("rank", 0),
+                    "frame_id": f_info.get("frame_id"),
+                    "frame_path": f_info.get("frame_path"),
+                    "video_id": f_info.get("video_id"),
+                    "video_name": f_info.get("video_name", f_info.get("video_id")),
+                    "timestamp_sec": f_info.get("timestamp_sec"),
+                    "score": f_info.get("score", 0.0),
+                    "shot_id": f_info.get("shot_id"),
+                    "frame_index": f_info.get("frame_index"),
+                }
+            )
+        out_videos.append(
+            {
+                "video_id": vid,
+                "video_name": vname,
+                "score": round(chain_score, 4),
+                "temporal_order_valid": True,
+                "events": events_out,
+            }
+        )
+        out_vid_counter[vid] += 1
 
-    # Chuyển dict thành list, sort theo score giảm dần
-    out_videos = [
-        {
-            "video_id": vid,
-            "video_name": vname,
-            "score": score,
-            "temporal_order_valid": True,
-            "events": events,
-        }
-        for vid, (vname, events, score) in best_per_video.items()
-    ]
     out_videos.sort(key=lambda x: -x["score"])
-
-    out_vids = [v["video_id"] for v in out_videos]
-    LOGGER.info("TRAKE DEBUG: best_per_video → %d videos: %s", len(out_videos), out_vids)
-
     LOGGER.info(
-        "TRAKE: %d chains → %d unique → %d output",
+        "TRAKE: %d chains → %d unique → %d output from %d videos, top_vids: %s",
         len(chains),
         len(unique),
         len(out_videos),
+        len(out_vid_counter),
+        dict(out_vid_counter.most_common(10)),
     )
+
+    # Print all output chains for inspection
+    LOGGER.info("── TRAKE OUTPUT ──────────────────────────────────")
+    for i, v in enumerate(out_videos):
+        fids = [e["frame_id"] for e in v["events"]]
+        timestamps = [e["timestamp_sec"] for e in v["events"]]
+        scores = [round(e["score"], 4) for e in v["events"]]
+        LOGGER.info(
+            "  [%d] video=%s score=%.4f ts=%s scores=%s frames=%s",
+            i,
+            v["video_id"],
+            v["score"],
+            timestamps,
+            scores,
+            fids,
+        )
+    LOGGER.info("──────────────────────────────────────────────────")
 
     return {
         "videos": out_videos,

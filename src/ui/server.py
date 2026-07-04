@@ -521,8 +521,9 @@ INDEX_HTML = r"""<!doctype html>
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || "Search failed");
       if (track === "trake") {
-        const n = (data.videos||[]).length;
-        STATUS.innerHTML = `<strong>${n}</strong> video(s) match all events <span class="pill">TRAKE</span>`;
+        const chains = data.videos || [];
+        const uniqueVideos = new Set(chains.map(v => v.video_id)).size;
+        STATUS.innerHTML = `<strong>${chains.length}</strong> chain(s) from <strong>${uniqueVideos}</strong> video(s) match all events <span class="pill">TRAKE</span>`;
         renderTrake(data);
       } else if (track === "vqa" && data.answer) {
         STATUS.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
@@ -575,11 +576,11 @@ INDEX_HTML = r"""<!doctype html>
   }
 
   // ─── TRAKE render ─────────────────────────────────────────────────────────────
-  // Per-card thumbnail state: key = "videoId::eventIdx"
-  // Value: { originalUrl, currentUrl, originalFrameId }
+  // Per-card thumbnail state: key = "videoId::chainIdx::eventIdx"
+  // Value: { originalUrl, currentUrl, originalFrameId, chainIdx, eventIdx }
   const thumbState = {};
 
-  function trakeKey(videoId, eventIdx) { return videoId + "::" + eventIdx; }
+  function trakeKey(videoId, chainIdx, eventIdx) { return videoId + "::" + chainIdx + "::" + eventIdx; }
 
   function renderTrake(data) {
     const videos = data.videos || [];
@@ -590,8 +591,7 @@ INDEX_HTML = r"""<!doctype html>
     RESULTS.innerHTML = videos.map((video, vi) => {
       const cols = Math.min(video.events.length, 5);
       const evHtml = (video.events||[]).map((ev, ei) => {
-        const key = trakeKey(video.video_id, ei);
-        // Init state if first render
+        const key = trakeKey(video.video_id, vi, ei);
         if (!thumbState[key]) {
           thumbState[key] = {
             originalUrl: ev.image_url||"", originalFrameId: ev.frame_id||"",
@@ -600,21 +600,22 @@ INDEX_HTML = r"""<!doctype html>
             currentFrameId: ev.frame_id||"",
             rank: ev.rank,
             videoId: video.video_id,
+            chainIdx: vi,
             eventIdx: ei,
           };
         }
         const st = thumbState[key];
         const url = st.currentUrl;
         const isCustom = url !== st.originalUrl;
-        const safeKey = key.replace("::","__");
+        const safeKey = key.replaceAll("::","__");
         return `
           <div class="ev-card${isCustom?" has-custom":""}" id="evcard-${safeKey}">
             <img src="${esc(url)}" alt="Event ${ei+1}" loading="lazy"
               id="evimg-${safeKey}"
               onclick="openModalFromCard('${safeKey}')">
-            <button class="revert-badge" onclick="revertCard('${esc(video.video_id)}',${ei})">&#x21a9; Revert</button>
+            <button class="revert-badge" onclick="revertCard('${esc(video.video_id)}',${vi},${ei})">&#x21a9; Revert</button>
             <div class="ev-info">
-              <span id="evinfo-text-${esc(key.replace("::","__"))}"><strong>Event ${ei+1}</strong> &middot; rank ${st.rank} &middot; ${fmtTime(st.currentTimestamp)}</span>
+              <span id="evinfo-text-${esc(key.replaceAll("::","__"))}"><strong>Event ${ei+1}</strong> &middot; rank ${st.rank} &middot; ${fmtTime(st.currentTimestamp)}</span>
               ${isCustom?`<span class="pill" style="font-size:10px">CUSTOM</span>`:""}
             </div>
           </div>`;
@@ -630,34 +631,34 @@ INDEX_HTML = r"""<!doctype html>
     }).join("");
   }
 
-  function revertCard(videoId, eventIdx) {
-    const key = trakeKey(videoId, eventIdx);
+  function revertCard(videoId, chainIdx, eventIdx) {
+    const key = trakeKey(videoId, chainIdx, eventIdx);
     const st = thumbState[key];
     if (!st) return;
     st.currentUrl = st.originalUrl;
     st.currentTimestamp = st.originalTimestamp;
     st.currentFrameId = st.originalFrameId;
-    refreshCard(videoId, eventIdx);
+    refreshCard(videoId, chainIdx, eventIdx);
     STATUS.innerHTML = `<strong>Reverted</strong> Event ${eventIdx+1} to original <span class="pill">ORIGINAL</span>`;
     // sync modal if it's open on this card
-    if (modal.open && modal.videoId===videoId && modal.eventIdx===eventIdx) {
+    if (modal.open && modal.videoId===videoId && modal.chainIdx===chainIdx && modal.eventIdx===eventIdx) {
       eid("btn-revert-modal").style.display = "none";
       eid("btn-setthumb").textContent = "Làm thumbnail";
     }
   }
 
-  function refreshCard(videoId, eventIdx) {
-    const key = trakeKey(videoId, eventIdx);
+  function refreshCard(videoId, chainIdx, eventIdx) {
+    const key = trakeKey(videoId, chainIdx, eventIdx);
     const st = thumbState[key];
     if (!st) return;
-    const cardId = "evcard-" + key.replace("::","__");
+    const cardId = "evcard-" + key.replaceAll("::","__");
     const card = eid(cardId);
     if (!card) return;
     const isCustom = st.currentUrl !== st.originalUrl;
     const img = card.querySelector("img");
     if (img) img.src = st.currentUrl;
     // Update the info text (timestamp changes when thumbnail changes)
-    const textSpan = eid("evinfo-text-" + key.replace("::","__"));
+    const textSpan = eid("evinfo-text-" + key.replaceAll("::","__"));
     if (textSpan) {
       textSpan.innerHTML = `<strong>Event ${eventIdx+1}</strong> &middot; rank ${st.rank} &middot; ${fmtTime(st.currentTimestamp)}`;
     }
@@ -683,22 +684,24 @@ INDEX_HTML = r"""<!doctype html>
     shotIdx: 0,
     frameIdx: 0,
     videoId: "",
+    chainIdx: null,   // null for non-trake cards
     eventIdx: null,   // null for non-trake cards
   };
 
   // ─── Open modal from card (reads live thumbState, not stale render values) ───
   function openModalFromCard(safeKey) {
-    const key = safeKey.replace('__','::');
+    const key = safeKey.replaceAll('__','::');
     const st = thumbState[key];
     if (!st) return;
-    openModal(st.currentUrl, st.videoId, st.currentFrameId, st.eventIdx);
+    openModal(st.currentUrl, st.videoId, st.currentFrameId, st.eventIdx, null, st.chainIdx);
   }
 
   // ─── Modal open ───────────────────────────────────────────────────────────────
-  function openModal(imgSrc, videoId, frameId, eventIdx, _unused) {
+  function openModal(imgSrc, videoId, frameId, eventIdx, _unused, chainIdx) {
     // Show modal immediately with the clicked image
     modal.open = true;
     modal.videoId = videoId;
+    modal.chainIdx = chainIdx != null ? chainIdx : null;
     modal.eventIdx = eventIdx;
     modal.shots = [];
     modal.shotIdx = 0;
@@ -778,7 +781,7 @@ INDEX_HTML = r"""<!doctype html>
 
     // Thumbnail buttons (only for TRAKE)
     if (modal.eventIdx !== null && modal.eventIdx !== undefined) {
-      const key = trakeKey(modal.videoId, modal.eventIdx);
+      const key = trakeKey(modal.videoId, modal.chainIdx, modal.eventIdx);
       const st = thumbState[key];
       const isCustom = st && st.currentUrl !== st.originalUrl;
       eid("btn-setthumb").textContent = isCustom ? "Cập nhật thumbnail" : "Làm thumbnail";
@@ -807,12 +810,12 @@ INDEX_HTML = r"""<!doctype html>
   eid("btn-setthumb").addEventListener("click", () => {
     if (!modal.shots.length || modal.eventIdx === null) return;
     const frame = modal.shots[modal.shotIdx].frames[modal.frameIdx];
-    const key = trakeKey(modal.videoId, modal.eventIdx);
+    const key = trakeKey(modal.videoId, modal.chainIdx, modal.eventIdx);
     if (!thumbState[key]) return;
     thumbState[key].currentUrl = frame.image_url;
     thumbState[key].currentTimestamp = frame.timestamp_sec;
     thumbState[key].currentFrameId = frame.frame_id;
-    refreshCard(modal.videoId, modal.eventIdx);
+    refreshCard(modal.videoId, modal.chainIdx, modal.eventIdx);
     renderModal(); // update button text + revert visibility
     STATUS.innerHTML = `<strong>Thumbnail updated</strong> — Event ${modal.eventIdx+1} <span class="pill">CUSTOM</span>`;
   });
@@ -820,7 +823,7 @@ INDEX_HTML = r"""<!doctype html>
   // ─── Revert from modal ───────────────────────────────────────────────────────
   eid("btn-revert-modal").addEventListener("click", () => {
     if (modal.eventIdx === null) return;
-    revertCard(modal.videoId, modal.eventIdx);
+    revertCard(modal.videoId, modal.chainIdx, modal.eventIdx);
     renderModal();
   });
 
