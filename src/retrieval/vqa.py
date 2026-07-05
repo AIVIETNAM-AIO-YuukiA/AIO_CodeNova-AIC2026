@@ -165,6 +165,7 @@ def vqa_search(
     top_k: int = 20,
     reranker=None,
     reranker_top_k: int = 10,
+    vqa_backend: str = "gemini",
 ) -> dict:
     """VQA pipeline: CLIP search → (rerank) → temporal → shot validation → agent answer.
 
@@ -230,9 +231,9 @@ def vqa_search(
     }
 
     # Agent
-    pipeline_stages["agent"] = {"max_steps": 5}
+    pipeline_stages["agent"] = {"max_steps": 5, "backend": vqa_backend}
     try:
-        agent = create_agent()
+        agent = create_agent(backend=vqa_backend)
         answer = agent.answer(shot=best_shot, question=question or query)
     except Exception as exc:
         LOGGER.exception("Agent failed")

@@ -150,18 +150,30 @@ def _load_dotenv() -> None:
                     break
 
 
-def create_agent() -> Agent:
-    """Create an Agent.
+def create_agent(backend: str = "gemini") -> Agent:
+    """Create an Agent with the specified backend.
 
-    Priority:
-      1. Gemini API key available → VlmBrain + cloud tools
-      2. Ollama running → LocalBrain + local tools
-      3. Otherwise → VlmBrain (will error gracefully at runtime)
+    Args:
+        backend: One of 'gemini', 'internvl', 'ollama' (default: 'gemini').
+                 Falls back gracefully if the requested backend is unavailable.
     """
     import os
 
     _load_dotenv()
-    if os.environ.get("GEMINI_API_KEY"):
+    
+    if backend == "internvl" or os.environ.get("INTERNVL_MODEL"):
+        model_name = os.environ.get("INTERNVL_MODEL", "OpenGVLab/InternVL2_5-2B")
+        LOGGER.info("Using InternVL backend (model: %s)", model_name)
+        try:
+            from agent.internvl import InternVLBrain, internvl_default_tools
+            brain = InternVLBrain(model_name=model_name)
+            tools = internvl_default_tools(model_name=model_name)
+            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
+        except ImportError as exc:
+            LOGGER.error("Failed to load InternVL backend: %s. Falling back to Gemini.", exc)
+            # Fall through to Gemini
+
+    if (backend == "gemini" or backend == "internvl") and os.environ.get("GEMINI_API_KEY"):
         LOGGER.info("GEMINI_API_KEY found — using cloud brain and tools")
         brain = VlmBrain()
         tools = default_tools()

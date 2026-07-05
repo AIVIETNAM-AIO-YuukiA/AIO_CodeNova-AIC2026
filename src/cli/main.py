@@ -90,6 +90,15 @@ def build_parser() -> ArgumentParser:
         type=int,
         help="Number of results to keep after reranking (default: 10).",
     )
+    ui_parser.add_argument(
+        "--internvl-model",
+        default=None,
+        help=(
+            "InternVL model name or HuggingFace ID. "
+            "e.g. 'OpenGVLab/InternVL2_5-2B'. "
+            "If provided, enables InternVL backend."
+        ),
+    )
 
     validate_parser = subparsers.add_parser("validate-experiment-name", help="Validate a run name")
     validate_parser.add_argument("name", help="Experiment name to validate")
@@ -243,6 +252,10 @@ def handle_serve_ui(args: Namespace) -> int:
         )
     else:
         LOGGER.info("Reranker: disabled (no --reranker-model supplied)")
+        
+    if getattr(args, "internvl_model", None):
+        os.environ["INTERNVL_MODEL"] = args.internvl_model
+        LOGGER.info("InternVL backend enabled via CLI: %s", args.internvl_model)
 
     print(f"Serving retrieval UI at http://{args.host}:{args.port}")
     serve_ui(

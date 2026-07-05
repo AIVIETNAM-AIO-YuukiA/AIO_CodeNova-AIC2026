@@ -105,6 +105,7 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
                     top_k = int(payload.get("top_k") or default_top_k)
                     req_reranker_top_k = payload.get("reranker_top_k")
                     req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+                    vqa_backend = payload.get("vqa_backend", "gemini")
 
                     result = vqa_search(
                         experiment=experiment,
@@ -114,6 +115,7 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
                         top_k=top_k,
                         reranker=reranker if req_reranker_top_k else None,
                         reranker_top_k=req_reranker_top_k or reranker_top_k,
+                        vqa_backend=vqa_backend,
                     )
                     # Hydrate frame paths for image serving
                     for r in result.get("results", []):
@@ -413,6 +415,15 @@ INDEX_HTML = r"""<!doctype html>
           <option value="trake">TRAKE</option>
         </select>
 
+        <div id="vqa-settings" style="display: none;">
+          <label for="vqa-backend">VQA Backend</label>
+          <select id="vqa-backend" name="vqa_backend">
+            <option value="internvl">InternVL (Local GPU)</option>
+            <option value="gemini">Gemini (Cloud API)</option>
+            <option value="ollama">Ollama (Local CPU/GPU)</option>
+          </select>
+        </div>
+
         <label for="query">Query</label>
         <textarea id="query" name="query">a person riding a motorbike</textarea>
 
@@ -478,6 +489,10 @@ INDEX_HTML = r"""<!doctype html>
         question: form.question.value,
         top_k: Number(form.top_k.value || 20)
       };
+      
+      if (track === "vqa") {
+          payload.vqa_backend = form.vqa_backend.value;
+      }
       if (form.reranker_top_k.value) {
         payload.reranker_top_k = Number(form.reranker_top_k.value);
       }
@@ -625,6 +640,15 @@ INDEX_HTML = r"""<!doctype html>
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+    }
+    
+    // Toggle VQA settings visibility
+    form.track.addEventListener('change', (e) => {
+      document.getElementById('vqa-settings').style.display = e.target.value === 'vqa' ? 'block' : 'none';
+    });
+    // Trigger initially
+    if (form.track.value === 'vqa') {
+        document.getElementById('vqa-settings').style.display = 'block';
     }
   </script>
 </body>
