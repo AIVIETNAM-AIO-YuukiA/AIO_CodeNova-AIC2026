@@ -131,6 +131,10 @@ def get_internvl_model_and_tokenizer(model_name: str):
             device_map="auto"
         ).eval()
 
+    # Patch for transformers >= 4.45 compatibility
+    if not hasattr(_INTERNVL_MODEL, "all_tied_weights_keys"):
+        _INTERNVL_MODEL.all_tied_weights_keys = {}
+        
     _INTERNVL_TOKENIZER = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=False)
     LOGGER.info("InternVL loaded successfully.")
     
