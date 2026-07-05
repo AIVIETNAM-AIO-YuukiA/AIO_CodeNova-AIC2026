@@ -509,7 +509,10 @@ INDEX_HTML = r"""<!doctype html>
       try {
         const response = await fetch(endpoint, {
           method: "POST",
-          headers: {"Content-Type": "application/json"},
+          headers: {
+            "Content-Type": "application/json",
+            "Bypass-Tunnel-Reminder": "true"
+          },
           body: JSON.stringify(payload)
         });
         const data = await response.json();
