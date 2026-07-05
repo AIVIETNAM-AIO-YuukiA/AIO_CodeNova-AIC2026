@@ -188,7 +188,8 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
             self.wfile.write(encoded)
 
         def _send_frame(self, raw_path: str) -> None:
-            frame_path = Path(unquote(raw_path)).resolve()
+            raw_path = unquote(raw_path).replace("\\", "/")
+            frame_path = Path(raw_path).resolve()
             frames_root = (experiment.run_dir / "frames").resolve()
             if not frame_path.is_file() or not frame_path.is_relative_to(frames_root):
                 self.send_error(HTTPStatus.NOT_FOUND, "Frame not found")
