@@ -17,6 +17,8 @@ dependencies = [
     "google-genai>=2.8.0",
     "ollama>=0.6.2",
     "imageio-ffmpeg>=0.6.0",
+    "accelerate>=1.14.0",
+    "einops>=0.8.0",
 ]
 
 [project.optional-dependencies]
@@ -63,6 +65,7 @@ packages = [
     "src/stores",
     "src/ui",
     "src/video",
+    "src/agent",
 ]
 
 [tool.pytest.ini_options]
