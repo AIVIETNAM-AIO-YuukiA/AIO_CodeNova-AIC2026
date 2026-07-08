@@ -15,6 +15,7 @@ from core.types import SearchResult
 from retrieval.vqa import vqa_search, trake_search
 from retrieval import build_retriever
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
+from ui.agent_tab import AGENT_TAB_HTML, AGENT_TAB_SCRIPT, AGENT_TAB_STYLE, AgentSessionState, build_agent_payload
 
 LOGGER = get_logger(__name__)
 
@@ -40,6 +41,8 @@ def serve_ui(
 
 def build_handler(experiment: Experiment, retriever, default_top_k: int):
     """Create a request handler bound to one experiment and its retriever."""
+
+    agent_sessions: dict[str, AgentSessionState] = {}
 
     class RetrievalUiHandler(BaseHTTPRequestHandler):
         server_version = "CodeNovaRetrievalUI/0.1"
@@ -107,6 +110,22 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                     self._send_json(result)
                 except Exception as exc:
                     LOGGER.exception("VQA search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            if parsed.path == "/api/agent-chat":
+                try:
+                    payload = self._read_json()
+                    result = build_agent_payload(
+                        experiment=experiment,
+                        retriever=retriever,
+                        payload=payload,
+                        sessions=agent_sessions,
+                        default_top_k=default_top_k,
+                    )
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("Agent chat failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -269,6 +288,7 @@ INDEX_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CodeNova Retrieval UI</title>
   <style>
+    __AGENT_TAB_STYLE__
     :root {
       --bg: #f7f7f4; --panel: #ffffff; --text: #1c1f24;
       --muted: #667085; --line: #d9dde3;
@@ -370,6 +390,11 @@ INDEX_HTML = r"""<!doctype html>
 <header><h1>CodeNova Retrieval UI</h1></header>
 <main>
   <aside>
+    <div class="mode-tabs">
+      <button type="button" class="mode-tab active" data-ui-mode="manual">Manual</button>
+      <button type="button" class="mode-tab" data-ui-mode="agent">Agent</button>
+    </div>
+    <div id="manual-panel">
     <form id="search-form">
       <label for="track">Retrieval Track</label>
       <select id="track" name="track">
@@ -404,6 +429,8 @@ INDEX_HTML = r"""<!doctype html>
     </form>
     <p class="hint">VQA: 3-stage pipeline (CLIP → Temporal → Agent). TRAKE: multi-event temporal search. Textual/Video KIS: CLIP only.</p>
     <div id="status" class="status">Ready.</div>
+    </div>
+    __AGENT_TAB_HTML__
   </aside>
   <section>
     <div id="answer-box"></div>
@@ -437,6 +464,7 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 </main>
+__AGENT_TAB_SCRIPT__
 <script>
   // ─── Helpers ─────────────────────────────────────────────────────────────────
   const eid = id => document.getElementById(id);
@@ -462,6 +490,22 @@ INDEX_HTML = r"""<!doctype html>
   const SIDEBAR_TEXT  = eid("sidebar-answer-text");
   const EVENTS_SEC    = eid("events-section");
   const EVENTS_LIST   = eid("events-list");
+  const MANUAL_PANEL   = eid("manual-panel");
+  const AGENT_PANEL    = eid("agent-panel");
+  const TAB_MANUAL     = document.querySelector('[data-ui-mode="manual"]');
+  const TAB_AGENT      = document.querySelector('[data-ui-mode="agent"]');
+
+  function setMode(mode) {
+    const manual = mode === "manual";
+    document.body.dataset.uiMode = mode;
+    if (MANUAL_PANEL) MANUAL_PANEL.style.display = manual ? "block" : "none";
+    if (AGENT_PANEL) AGENT_PANEL.style.display = manual ? "none" : "block";
+    if (TAB_MANUAL) TAB_MANUAL.classList.toggle("active", manual);
+    if (TAB_AGENT) TAB_AGENT.classList.toggle("active", !manual);
+  }
+  if (TAB_MANUAL) TAB_MANUAL.addEventListener("click", () => setMode("manual"));
+  if (TAB_AGENT) TAB_AGENT.addEventListener("click", () => setMode("agent"));
+  setMode("manual");
 
   // ─── TRAKE event inputs ───────────────────────────────────────────────────────
   function eventCount() { return EVENTS_LIST.children.length; }
@@ -499,6 +543,7 @@ INDEX_HTML = r"""<!doctype html>
   // ─── Search submit ────────────────────────────────────────────────────────────
   FORM.addEventListener("submit", async e => {
     e.preventDefault();
+    if (document.body.dataset.uiMode === "agent") return;
     SUBMIT.disabled = true;
     STATUS.className = "status"; STATUS.textContent = "Searching...";
     RESULTS.innerHTML = ""; ANSWER_BOX.innerHTML = ""; PIPELINE_BOX.innerHTML = "";
@@ -574,6 +619,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </article>`).join("");
   }
+  window.renderCards = renderCards;
 
   // ─── TRAKE render ─────────────────────────────────────────────────────────────
   // Per-card thumbnail state: key = "videoId::chainIdx::eventIdx"
@@ -630,6 +676,8 @@ INDEX_HTML = r"""<!doctype html>
         </div>`;
     }).join("");
   }
+  window.renderTrake = renderTrake;
+  window.clearResults = () => { RESULTS.innerHTML = ""; };
 
   function revertCard(videoId, chainIdx, eventIdx) {
     const key = trakeKey(videoId, chainIdx, eventIdx);
@@ -857,3 +905,7 @@ INDEX_HTML = r"""<!doctype html>
 </body>
 </html>
 """
+
+INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_STYLE__", AGENT_TAB_STYLE)
+INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_HTML__", AGENT_TAB_HTML)
+INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_SCRIPT__", AGENT_TAB_SCRIPT)
