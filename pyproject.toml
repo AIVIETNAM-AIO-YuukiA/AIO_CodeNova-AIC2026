@@ -19,6 +19,9 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0",
     "accelerate>=1.14.0",
     "einops>=0.8.0",
+    "timm>=1.0.0",
+    "sentencepiece>=0.2.0",
+    "bitsandbytes>=0.46.1",
 ]
 
 [project.optional-dependencies]
