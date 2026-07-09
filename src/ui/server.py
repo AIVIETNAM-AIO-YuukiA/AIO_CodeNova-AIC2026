@@ -560,14 +560,14 @@ INDEX_HTML = r"""<!doctype html>
       const hasAgent = pipeline.agent;
       const stages = hasAgent ? [
         { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
-        { key: "temporal_search", label: "Temporal Search", desc: `Best segment: ${JSON.stringify(pipeline.temporal_search?.top_k_results || "N/A")}` },
-        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.frame_count || 0} frames in shot` },
+        { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
+        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.shots_count || 0} valid shots gathered` },
         { key: "shot_validation", label: "Shot Validation", desc: `Score: ${(pipeline.shot_validation?.validation_score || 0).toFixed(4)}` },
         { key: "agent", label: "Agent (Gemini)", desc: `Answer: ${(pipeline.agent?.answer || "N/A").substring(0, 100)}` },
       ] : [
         { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
-        { key: "temporal_search", label: "Temporal Search", desc: `Best segment: ${JSON.stringify(pipeline.temporal_search?.top_k_results || "N/A")}` },
-        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.frame_count || 0} frames in shot` },
+        { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
+        { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.shots_count || 0} valid shots gathered` },
       ];
       pipelineBox.innerHTML = `
         <button class="pipeline-toggle" onclick="togglePipeline()">Show Pipeline Details</button>

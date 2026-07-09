@@ -161,8 +161,8 @@ def create_agent(backend: str = "gemini") -> Agent:
 
     _load_dotenv()
     
-    if backend == "internvl" or os.environ.get("INTERNVL_MODEL"):
-        model_name = os.environ.get("INTERNVL_MODEL", "OpenGVLab/InternVL2_5-2B")
+    if backend == "internvl":
+        model_name = os.environ.get("INTERNVL_MODEL", "OpenGVLab/InternVL3-2B-hf")
         LOGGER.info("Using InternVL backend (model: %s)", model_name)
         try:
             from agent.internvl import InternVLBrain, internvl_default_tools
