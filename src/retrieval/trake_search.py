@@ -56,11 +56,90 @@ def _search_event(
     event_text: str,
     event_index: int,
     top_k: int,
+    *,
+    frame_embeddings: np.ndarray | None = None,
+    frame_records: list[dict] | None = None,
+    sub_details: list[str] | None = None,
+    embedder: object | None = None,
+    hydrator: object | None = None,
 ) -> list[dict]:
-    """Search one event globally via Qdrant, return enriched frame dicts (distinct frame_id)."""
+    """Search one event globally, return enriched frame dicts (distinct frame_id).
+
+    When *sub_details* is provided (non-empty), uses in-memory sum fusion
+    (KIS Detail pipeline) instead of Qdrant. Falls back to Qdrant otherwise.
+    """
+    # ── NEW: sub-detail sum fusion ────────────────────────────────────
+    if (
+        sub_details
+        and frame_embeddings is not None
+        and frame_records is not None
+        and embedder is not None
+    ):
+        sub_vectors = np.stack(
+            [np.asarray(embedder.embed_text(sd), dtype="float32").flatten() for sd in sub_details]
+        )
+        for i in range(sub_vectors.shape[0]):
+            norm = np.linalg.norm(sub_vectors[i])
+            if norm > 1e-12:
+                sub_vectors[i] /= norm
+
+        scores = frame_embeddings @ sub_vectors.T  # [N, K]
+        final_scores = scores.sum(axis=1)  # [N]
+
+        n = min(top_k, len(final_scores))
+        if n == 0:
+            return []
+        top_indices = np.argpartition(final_scores, -n)[-n:]
+        top_indices = top_indices[np.argsort(final_scores[top_indices])[::-1]]
+
+        out: list[dict] = []
+        seen_fids: set[str] = set()
+        for rank, idx in enumerate(top_indices, start=1):
+            rec = frame_records[idx]
+            frame_id = rec.get("frame_id")
+            if not frame_id or frame_id in seen_fids:
+                continue
+            seen_fids.add(frame_id)
+
+            if hydrator is not None:
+                from stores.vector.base import frame_result
+
+                sr = hydrator.hydrate([frame_result(frame_id, float(final_scores[idx]))])[0]
+                out.append(
+                    {
+                        "event_index": event_index,
+                        "rank": rank,
+                        "score": round(float(final_scores[idx]), 4),
+                        "frame_id": sr.frame_id,
+                        "video_id": sr.video_id,
+                        "video_name": sr.video_name or sr.video_id,
+                        "frame_path": sr.frame_path,
+                        "timestamp_sec": sr.timestamp_sec,
+                        "shot_id": sr.shot_id,
+                        "frame_index": sr.frame_index,
+                    }
+                )
+            else:
+                out.append(
+                    {
+                        "event_index": event_index,
+                        "rank": rank,
+                        "score": round(float(final_scores[idx]), 4),
+                        "frame_id": rec.get("frame_id"),
+                        "video_id": rec.get("video_id"),
+                        "video_name": rec.get("video_id", ""),
+                        "frame_path": rec.get("frame_path"),
+                        "timestamp_sec": rec.get("timestamp_sec"),
+                        "shot_id": rec.get("shot_id"),
+                        "frame_index": rec.get("frame_index"),
+                    }
+                )
+        return out
+
+    # ── ORIGINAL: Qdrant search (hoàn toàn không sửa) ────────────────
     results = retriever.search(query=event_text, top_k=top_k)
-    out: list[dict] = []
-    seen_fids: set[str] = set()
+    out = []
+    seen_fids = set()
     for rank, r in enumerate(results, start=1):
         if r.frame_id in seen_fids:
             continue
@@ -245,6 +324,9 @@ def bidirectional_pair_search(
     hydrator: ResultHydrator,
     top_k: int = 300,
     window: int = 300,
+    *,
+    sub_details_i: list[str] | None = None,
+    sub_details_j: list[str] | None = None,
 ) -> list[tuple[dict, dict, float, float, float]]:
     """Bidirectional search for one adjacent pair (eᵢ, eᵢ₊₁).
 
@@ -254,7 +336,17 @@ def bidirectional_pair_search(
     embed_j = _embed_event(retriever, event_text_j)
 
     # 1. Forward: candidate eᵢ → find eᵢ₊₁ in +window (top-30 distinct)
-    candidates_i = _search_event(retriever, event_text_i, event_index_i, top_k)
+    candidates_i = _search_event(
+        retriever,
+        event_text_i,
+        event_index_i,
+        top_k,
+        frame_embeddings=frame_embeddings,
+        frame_records=frame_records,
+        sub_details=sub_details_i,
+        embedder=retriever.embedder,
+        hydrator=hydrator,
+    )
     forward: list[tuple[dict, dict, float, float, float]] = []
     for f_i in candidates_i:
         ts = f_i.get("timestamp_sec")
@@ -276,7 +368,17 @@ def bidirectional_pair_search(
             forward.append((f_i, f_j_info, pair_score, sim_i, sim_j))
 
     # 2. Backward: candidate eᵢ₊₁ → find eᵢ in -window (top-30 distinct)
-    candidates_j = _search_event(retriever, event_text_j, event_index_i + 1, top_k)
+    candidates_j = _search_event(
+        retriever,
+        event_text_j,
+        event_index_i + 1,
+        top_k,
+        frame_embeddings=frame_embeddings,
+        frame_records=frame_records,
+        sub_details=sub_details_j,
+        embedder=retriever.embedder,
+        hydrator=hydrator,
+    )
     backward: list[tuple[dict, dict, float, float, float]] = []
     for f_j in candidates_j:
         ts = f_j.get("timestamp_sec")
@@ -398,15 +500,15 @@ def chain_join(
 
 def trake_search(
     experiment: Experiment,
-    events: list[str],
+    events: list[str] | list[dict],
     top_k: int = 300,
-    window: int = 300,
+    window: int = 15,
 ) -> dict:
     """TRAKE pipeline — Bidirectional Pair Join (BPJ).
 
     Args:
         experiment: Experiment instance (config + run_dir).
-        events: List of event texts, at least 2.
+        events: List of event texts (str) or event objects ``{"text": ..., "sub_details": [...]}``, at least 2.
         top_k: Number of candidate frames per event (and pairs per adjacent pair).
         window: Temporal window (seconds), default 300 (5 minutes).
 
@@ -414,12 +516,25 @@ def trake_search(
         Dict with "videos" (list of chains) and "total_candidates".
         Compatible with server.py response format.
     """
-    if len(events) < 2:
-        return {"error": "At least 2 events are required.", "videos": []}
-
-    clean = [e.strip() for e in events if e.strip()]
-    if len(clean) < 2:
+    # Normalise events: always list of dicts
+    parsed_events: list[dict] = []
+    for e in events:
+        if isinstance(e, str):
+            text = e.strip()
+            parsed_events.append({"text": text, "sub_details": []} if text else None)
+        elif isinstance(e, dict):
+            text = e.get("text", "").strip()
+            parsed_events.append(
+                {"text": text, "sub_details": e.get("sub_details", [])} if text else None
+            )
+        else:
+            parsed_events.append(None)
+    parsed_events = [p for p in parsed_events if p is not None]
+    if len(parsed_events) < 2:
         return {"error": "At least 2 non-empty events are required.", "videos": []}
+
+    clean = [p["text"] for p in parsed_events]
+    sub_details_list = [p.get("sub_details", []) for p in parsed_events]
 
     # 1. Build retriever (embedder + Qdrant)
     retriever = build_retriever(experiment)
@@ -434,7 +549,7 @@ def trake_search(
     video_index = _build_video_index(frame_records)
 
     # 3. Process each adjacent pair — fully independent
-    n = len(clean)
+    n = len(parsed_events)
     pair_lists: list[list[tuple[dict, dict, float, float, float]]] = []
     for i in range(n - 1):
         pairs = bidirectional_pair_search(
@@ -448,6 +563,8 @@ def trake_search(
             frame_records=frame_records,
             top_k=top_k,
             window=window,
+            sub_details_i=sub_details_list[i],
+            sub_details_j=sub_details_list[i + 1],
         )
         pair_lists.append(pairs)
 

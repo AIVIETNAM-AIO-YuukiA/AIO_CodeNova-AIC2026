@@ -224,7 +224,7 @@ def trake_search(
     experiment: Experiment,
     events: list[str],
     top_k: int = 300,
-    window: int = 300,
+    window: int = 15,
 ) -> dict:
     """TRAKE pipeline: Bidirectional Pair Join (BPJ).
 
