@@ -18,7 +18,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 .PHONY: help sync install-hooks lint format check test pre-commit \
         qdrant-up qdrant-down qdrant-health \
         ingest detect-shots extract-frames embed-frames build-index pipeline \
-        search serve-ui clean-runs clean
+        search serve-ui serve-mock clean-runs clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -83,6 +83,9 @@ search: ## Search by text (EXP, QUERY, TOPK)
 
 serve-ui: ## Serve the retrieval UI (EXP; HOST/PORT override .env)
 	uv run codenova serve-ui --experiment-name $(EXP) $(if $(HOST),--host $(HOST)) $(if $(PORT),--port $(PORT))
+
+serve-mock: ## Serve the retrieval UI in mock mode without real pipeline weights/DB
+	uv run codenova serve-ui --experiment-name $(EXP) --mock $(if $(HOST),--host $(HOST)) $(if $(PORT),--port $(PORT))
 
 ## --- Housekeeping ---
 clean-runs: ## Remove a run directory (EXP)

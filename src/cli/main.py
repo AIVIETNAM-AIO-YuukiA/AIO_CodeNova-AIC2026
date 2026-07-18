@@ -74,6 +74,7 @@ def build_parser() -> ArgumentParser:
     ui_parser.add_argument(
         "--port", default=int(os.environ.get("CODENOVA_UI_PORT", "7860")), type=int
     )
+    ui_parser.add_argument("--mock", action="store_true", help="Run UI in mock mode without real pipeline weights/DB")
 
     validate_parser = subparsers.add_parser("validate-experiment-name", help="Validate a run name")
     validate_parser.add_argument("name", help="Experiment name to validate")
@@ -219,6 +220,7 @@ def handle_serve_ui(args: Namespace) -> int:
         host=args.host,
         port=args.port,
         default_top_k=args.top_k,
+        mock=args.mock,
     )
     return 0
 

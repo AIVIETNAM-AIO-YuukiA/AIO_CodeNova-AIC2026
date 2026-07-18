@@ -25,12 +25,21 @@ def serve_ui(
     host: str = "127.0.0.1",
     port: int = 7860,
     default_top_k: int = 20,
+    mock: bool = False,
 ) -> None:
     """Serve the local retrieval UI until interrupted."""
-    retriever = build_retriever(experiment)
-    handler = build_handler(experiment=experiment, retriever=retriever, default_top_k=default_top_k)
+    retriever = None
+    if not mock:
+        try:
+            retriever = build_retriever(experiment)
+            LOGGER.info("Successfully connected to Vector database retriever.")
+        except Exception as exc:
+            LOGGER.warning("Could not initialize real retriever (%s). Falling back to MOCK MODE.", exc)
+            mock = True
+
+    handler = build_handler(experiment=experiment, retriever=retriever, default_top_k=default_top_k, mock=mock)
     server = ThreadingHTTPServer((host, port), handler)
-    LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
+    LOGGER.info("Serving retrieval UI at http://%s:%s %s", host, port, "(MOCK MODE)" if mock else "")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -39,10 +48,11 @@ def serve_ui(
         server.server_close()
 
 
-def build_handler(experiment: Experiment, retriever, default_top_k: int):
+def build_handler(experiment: Experiment, retriever, default_top_k: int, mock: bool = False):
     """Create a request handler bound to one experiment and its retriever."""
 
     agent_sessions: dict[str, AgentSessionState] = {}
+    task_agent_sessions: dict[str, list[dict[str, str]]] = {}
 
     class RetrievalUiHandler(BaseHTTPRequestHandler):
         server_version = "CodeNovaRetrievalUI/0.1"
@@ -56,24 +66,84 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                 self._send_json({"ok": True, "experiment": experiment.name})
                 return
             if parsed.path == "/frame":
-                self._send_frame(parse_qs(parsed.query).get("path", [""])[0])
+                path = parse_qs(parsed.query).get("path", [""])[0]
+                if mock or path.startswith("mock_"):
+                    # Use a stable seed from path hash to get the same image for the same mock path
+                    import hashlib
+                    seed = hashlib.md5(path.encode()).hexdigest()[:6]
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", f"https://picsum.photos/seed/{seed}/800/450")
+                    self.end_headers()
+                    return
+                self._send_frame(path)
                 return
             if parsed.path == "/api/video-shots":
                 self._send_video_shots(parse_qs(parsed.query))
+                return
+            if parsed.path == "/api/task-agent/status":
+                self._send_json({"status": "idle", "progress": 0, "logs": ""})
                 return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
 
+            if parsed.path == "/api/task-agent":
+                try:
+                    payload = self._read_json()
+                    session_id = payload.get("session_id", "default")
+                    message = payload.get("message", "").strip()
+                    if not message:
+                        self._send_json({"error": "Message is empty"}, status=HTTPStatus.BAD_REQUEST)
+                        return
+                    
+                    history = task_agent_sessions.setdefault(session_id, [])
+                    from agent.task_agent import TaskAgent
+                    agent = TaskAgent(mock=mock)
+                    result = agent.run_turn(message, history=history)
+                    
+                    history.append({"role": "user", "text": message})
+                    history.append({"role": "model", "text": result.get("answer", "")})
+                    if len(history) > 20:
+                        task_agent_sessions[session_id] = history[-20:]
+                        
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("Task Agent chat failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
             # TRAKE: multi-event → per-event search → intersection → scoring
             if parsed.path == "/api/trake-search":
                 try:
                     payload = self._read_json()
-                    events_raw = payload.get("events")
+                    events_raw = payload.get("events") or []
                     if not isinstance(events_raw, list) or len(events_raw) < 2:
                         raise ValueError("At least 2 events are required.")
                     events: list[str] = [str(e).strip() for e in events_raw if str(e).strip()]
+                    
+                    if mock:
+                        # Return mock trake results
+                        videos = []
+                        for i in range(1, 4):
+                            video_events = []
+                            for idx, ev in enumerate(events):
+                                video_events.append({
+                                    "frame_id": f"f_trake_{i}_{idx}",
+                                    "frame_index": idx * 120 + 20,
+                                    "timestamp_sec": float(idx * 6.0 + 1.2),
+                                    "frame_path": f"mock_trake_{i}_{idx}.jpg",
+                                    "image_url": f"/frame?path={quote(f'mock_trake_{i}_{idx}.jpg')}"
+                                })
+                            videos.append({
+                                "video_id": f"v_trake_{i:03d}",
+                                "video_name": f"mock_trake_video_{i}.mp4",
+                                "score": 0.88 - (i * 0.05),
+                                "events": video_events
+                            })
+                        self._send_json({"videos": videos})
+                        return
+
                     # Fixed to 300 frames for TRAKE (hard-coded, user cannot override)
                     top_k = 300
                     result = trake_search(
@@ -95,12 +165,39 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
             if parsed.path == "/api/vqa-search":
                 try:
                     payload = self._read_json()
+                    query = str(payload.get("query", ""))
+                    question = str(payload.get("question", ""))
+                    context = str(payload.get("context", ""))
                     top_k = int(payload.get("top_k") or default_top_k)
+                    
+                    if mock:
+                        # Return mock VQA results
+                        results = []
+                        for i in range(1, 4):
+                            results.append({
+                                "video_id": f"v_vqa_{i:03d}",
+                                "video_name": f"mock_vqa_video_{i}.mp4",
+                                "frame_index": 30 + i * 20,
+                                "timestamp_sec": float(10.0 + i * 5.0),
+                                "score": 0.92 - (i * 0.04),
+                                "frame_path": f"mock_vqa_{i}.jpg",
+                                "image_url": f"/frame?path={quote(f'mock_vqa_{i}.jpg')}"
+                            })
+                        self._send_json({
+                            "answer": f"Đây là câu trả lời giả lập cho câu hỏi: '{question}'. Theo phân tích video mock, đối tượng xuất hiện ở giây thứ 15.",
+                            "results": results,
+                            "pipeline": {
+                                "retrieved_shots": 3,
+                                "vqa_runs": 1
+                            }
+                        })
+                        return
+
                     result = vqa_search(
                         experiment=experiment,
-                        query=str(payload.get("query", "")),
-                        question=str(payload.get("question", "")),
-                        context=str(payload.get("context", "")),
+                        query=query,
+                        question=question,
+                        context=context,
                         top_k=top_k,
                     )
                     # Hydrate frame paths for image serving
@@ -143,6 +240,30 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                 )
                 top_k = int(payload.get("top_k") or default_top_k)
                 retrieval_text = build_retrieval_text(request)
+                
+                if mock:
+                    # Return mock results
+                    results = []
+                    for i in range(1, top_k + 1):
+                        results.append({
+                            "video_id": f"v_{i % 3 + 1:03d}",
+                            "video_name": f"mock_video_{i % 3 + 1}.mp4",
+                            "frame_index": i * 15,
+                            "timestamp_sec": float(i * 1.5),
+                            "score": 0.85 - (i * 0.015),
+                            "frame_path": f"mock_frame_search_{i}.jpg",
+                            "image_url": f"/frame?path={quote(f'mock_frame_search_{i}.jpg')}"
+                        })
+                    self._send_json(
+                        {
+                            "track": request.track,
+                            "track_label": SUPPORTED_TRACKS.get(request.track, request.track),
+                            "retrieval_text": retrieval_text,
+                            "results": results,
+                        }
+                    )
+                    return
+
                 results = retriever.search(query=retrieval_text, top_k=top_k)
                 self._send_json(
                     {
@@ -207,6 +328,36 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
 
             shots_path = experiment.run_dir / "manifests" / "shots.jsonl"
             frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
+
+            if mock or not shots_path.exists() or not frames_path.exists():
+                shot_list = []
+                for i in range(1, 11):
+                    shot_id = f"shot_{video_id}_{i}"
+                    picked = [
+                        {"frame_id": f"f_{video_id}_{i}_1", "frame_index": (i-1)*100 + 1, "timestamp_sec": float((i-1)*5 + 0.1), "frame_path": f"mock_frame_{video_id}_{i}_1.jpg"},
+                        {"frame_id": f"f_{video_id}_{i}_2", "frame_index": (i-1)*100 + 50, "timestamp_sec": float((i-1)*5 + 2.5), "frame_path": f"mock_frame_{video_id}_{i}_2.jpg"},
+                        {"frame_id": f"f_{video_id}_{i}_3", "frame_index": (i-1)*100 + 99, "timestamp_sec": float((i-1)*5 + 4.9), "frame_path": f"mock_frame_{video_id}_{i}_3.jpg"}
+                    ]
+                    shot_data = {
+                        "shot_id": shot_id,
+                        "start_frame": (i-1)*100,
+                        "end_frame": i*100 - 1,
+                        "start_time_sec": float((i-1)*5),
+                        "end_time_sec": float(i*5),
+                        "frames": [
+                            {
+                                "frame_id": f["frame_id"],
+                                "frame_index": f["frame_index"],
+                                "timestamp_sec": f["timestamp_sec"],
+                                "frame_path": f["frame_path"],
+                                "image_url": f"/frame?path={quote(f['frame_path'])}",
+                            }
+                            for f in picked
+                        ]
+                    }
+                    shot_list.append(shot_data)
+                self._send_json({"video_id": video_id, "shots": shot_list})
+                return
 
             try:
                 # Parse shots for this video
@@ -296,9 +447,21 @@ INDEX_HTML = r"""<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: var(--text); background: var(--bg); }
-    header { padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
-    h1 { margin: 0; font-size: 20px; }
-    main { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; min-height: calc(100vh - 61px); }
+    header { padding: 12px 24px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; justify-content: space-between; align-items: center; }
+    h1 { margin: 0; font-size: 18px; }
+    
+    /* Top Navigation Tabs */
+    .nav-tabs { display: flex; gap: 6px; }
+    .nav-tab {
+      background: none; border: none; border-bottom: 2px solid transparent;
+      color: var(--muted); padding: 6px 16px; font-size: 14px; font-weight: 655;
+      cursor: pointer; width: auto; margin-top: 0; border-radius: 0;
+    }
+    .nav-tab:hover { color: var(--text); background: rgba(0,0,0,0.03); }
+    .nav-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    /* Manual Search Layout */
+    .manual-main { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; min-height: calc(100vh - 61px); }
     aside { padding: 18px; border-right: 1px solid var(--line); background: var(--panel); }
     section { padding: 18px; }
     label { display: block; margin: 14px 0 6px; color: var(--muted); font-size: 13px; font-weight: 650; }
@@ -313,12 +476,14 @@ INDEX_HTML = r"""<!doctype html>
     .status strong { color: var(--text); }
     .status.warn { color: var(--warn); }
     .pill { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #e6f5f3; color: var(--accent-strong); font-size: 12px; font-weight: 700; }
+    
     /* Results grid */
     .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
     .card { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
     .card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #e5e7eb; cursor: zoom-in; }
     .meta { padding: 10px 11px 12px; font-size: 13px; line-height: 1.45; }
     .meta code { display: block; overflow-wrap: anywhere; margin-top: 4px; color: var(--muted); font-size: 12px; }
+    
     /* Answer / pipeline */
     .answer-box { margin-bottom: 18px; padding: 18px 20px; border: 2px solid var(--accent); border-radius: 10px; background: #f0fdf8; }
     .answer-box .label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
@@ -328,16 +493,17 @@ INDEX_HTML = r"""<!doctype html>
     .pipeline-detail { display: none; margin-top: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 13px; line-height: 1.5; }
     .pipeline-detail.open { display: block; }
     .pipeline-detail code { display: block; white-space: pre-wrap; font-size: 12px; color: var(--muted); }
+    
     /* TRAKE event card */
     .video-block { margin-bottom: 20px; padding: 14px 16px; border: 2px solid var(--accent); border-radius: 10px; background: var(--panel); }
     .video-block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
     .event-grid { display: grid; gap: 10px; }
-    /* Each event card */
     .ev-card { position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: #f0fdf8; }
     .ev-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #e5e7eb; cursor: zoom-in; transition: opacity .15s; }
     .ev-card img:hover { opacity: .88; }
     .ev-card .ev-info { padding: 5px 8px 6px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 6px; }
-    /* Revert badge — shown only when thumbnail has been changed */
+    
+    /* Revert badge */
     .ev-card .revert-badge {
       display: none; position: absolute; top: 5px; right: 5px;
       background: rgba(0,0,0,.65); color: #fff; border: none;
@@ -347,6 +513,7 @@ INDEX_HTML = r"""<!doctype html>
     .ev-card .revert-badge:hover { background: rgba(0,0,0,.85); }
     .ev-card.has-custom .revert-badge { display: block; }
     .ev-card.has-custom { border-color: var(--accent); }
+    
     /* Modal */
     #frame-modal {
       display: none; position: fixed; inset: 0; z-index: 999;
@@ -383,18 +550,19 @@ INDEX_HTML = r"""<!doctype html>
     .btn-revert-modal:hover { background: #777; }
     .btn-close-modal { background: #333; color: #ccc; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-top: 0; width: auto; }
     .btn-close-modal:hover { background: #444; }
-    @media (max-width: 860px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
+    @media (max-width: 860px) { .manual-main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
   </style>
 </head>
 <body>
-<header><h1>CodeNova Retrieval UI</h1></header>
-<main>
+<header>
+  <h1>CodeNova Retrieval UI</h1>
+  <div class="nav-tabs">
+    <button class="nav-tab active" id="btn-tab-manual">🔍 Manual Search</button>
+    <button class="nav-tab" id="btn-tab-copilot">🤖 AI Co-Pilot</button>
+  </div>
+</header>
+<main id="manual-main" class="manual-main">
   <aside>
-    <div class="mode-tabs">
-      <button type="button" class="mode-tab active" data-ui-mode="manual">Manual</button>
-      <button type="button" class="mode-tab" data-ui-mode="agent">Agent</button>
-    </div>
-    <div id="manual-panel">
     <form id="search-form">
       <label for="track">Retrieval Track</label>
       <select id="track" name="track">
@@ -429,8 +597,6 @@ INDEX_HTML = r"""<!doctype html>
     </form>
     <p class="hint">VQA: 3-stage pipeline (CLIP → Temporal → Agent). TRAKE: multi-event temporal search. Textual/Video KIS: CLIP only.</p>
     <div id="status" class="status">Ready.</div>
-    </div>
-    __AGENT_TAB_HTML__
   </aside>
   <section>
     <div id="answer-box"></div>
@@ -464,6 +630,8 @@ INDEX_HTML = r"""<!doctype html>
     </div>
   </section>
 </main>
+
+__AGENT_TAB_HTML__
 __AGENT_TAB_SCRIPT__
 <script>
   // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -490,22 +658,7 @@ __AGENT_TAB_SCRIPT__
   const SIDEBAR_TEXT  = eid("sidebar-answer-text");
   const EVENTS_SEC    = eid("events-section");
   const EVENTS_LIST   = eid("events-list");
-  const MANUAL_PANEL   = eid("manual-panel");
-  const AGENT_PANEL    = eid("agent-panel");
-  const TAB_MANUAL     = document.querySelector('[data-ui-mode="manual"]');
-  const TAB_AGENT      = document.querySelector('[data-ui-mode="agent"]');
-
-  function setMode(mode) {
-    const manual = mode === "manual";
-    document.body.dataset.uiMode = mode;
-    if (MANUAL_PANEL) MANUAL_PANEL.style.display = manual ? "block" : "none";
-    if (AGENT_PANEL) AGENT_PANEL.style.display = manual ? "none" : "block";
-    if (TAB_MANUAL) TAB_MANUAL.classList.toggle("active", manual);
-    if (TAB_AGENT) TAB_AGENT.classList.toggle("active", !manual);
-  }
-  if (TAB_MANUAL) TAB_MANUAL.addEventListener("click", () => setMode("manual"));
-  if (TAB_AGENT) TAB_AGENT.addEventListener("click", () => setMode("agent"));
-  setMode("manual");
+  // No mode switching in manual sidebar anymore
 
   // ─── TRAKE event inputs ───────────────────────────────────────────────────────
   function eventCount() { return EVENTS_LIST.children.length; }
@@ -543,7 +696,6 @@ __AGENT_TAB_SCRIPT__
   // ─── Search submit ────────────────────────────────────────────────────────────
   FORM.addEventListener("submit", async e => {
     e.preventDefault();
-    if (document.body.dataset.uiMode === "agent") return;
     SUBMIT.disabled = true;
     STATUS.className = "status"; STATUS.textContent = "Searching...";
     RESULTS.innerHTML = ""; ANSWER_BOX.innerHTML = ""; PIPELINE_BOX.innerHTML = "";
@@ -901,6 +1053,7 @@ __AGENT_TAB_SCRIPT__
       if (modal.frameIdx < maxFi) { modal.frameIdx++; renderModal(); }
     }
   });
+
 </script>
 </body>
 </html>
@@ -909,3 +1062,30 @@ __AGENT_TAB_SCRIPT__
 INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_STYLE__", AGENT_TAB_STYLE)
 INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_HTML__", AGENT_TAB_HTML)
 INDEX_HTML = INDEX_HTML.replace("__AGENT_TAB_SCRIPT__", AGENT_TAB_SCRIPT)
+
+
+if __name__ == "__main__":
+    import argparse
+    from config.settings import Experiment, PipelineConfig
+    from core.logging import configure_logging
+    
+    parser = argparse.ArgumentParser(description="Run UI server directly")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", default=7860, type=int)
+    parser.add_argument("--mock", action="store_true", default=True)
+    parser.add_argument("--experiment-name", default="demo")
+    args = parser.parse_args()
+    
+    config = PipelineConfig()
+    try:
+        experiment = Experiment.open(config=config, name=args.experiment_name)
+    except Exception:
+        experiment = Experiment.create(config=config, name=args.experiment_name, resume=True)
+        
+    configure_logging(experiment.run_dir / "logs", verbose=True)
+    serve_ui(
+        experiment=experiment,
+        host=args.host,
+        port=args.port,
+        mock=args.mock
+    )
