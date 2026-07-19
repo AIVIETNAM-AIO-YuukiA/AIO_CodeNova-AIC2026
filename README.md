@@ -1,105 +1,178 @@
-# AIO_CodeNova-AIC2026
+# Video Retrieval Pipeline
 
-## Yêu cầu
+Resumable video retrieval pipeline using shot decomposition and CLIP-style semantic search.
 
-- Python >= 3.13
-- [uv](https://docs.astral.sh/uv/) — quản lý môi trường và package
+Videos are split into shots, sampled into keyframes, embedded with CLIP, and indexed
+in Qdrant. Text queries are embedded and matched against keyframes for known-item
+search (KIS).
 
----
+> 🇻🇳 Tài liệu tiếng Việt: [docs/vi/README.md](docs/vi/README.md)
 
-## Cài đặt lần đầu
+## Pipeline
+
+```
+OFFLINE (indexing)
+  ingest → detect-shots → extract-frames → embed-frames → build-index
+
+ONLINE (retrieval)
+  text query → CLIP embed → Qdrant search → hydrate metadata → results
+```
+
+## Project layout
+
+```
+src/
+  cli/            # command-line interface
+  config/         # settings, experiment naming, .env loading
+  core/           # logging, errors, typed records
+  video/          # video discovery, shot detection, frame extraction (OpenCV/TransNetV2)
+  indexing/       # offline pipeline stages + manifests + SQLite job state
+  retrieval/      # online search: Retriever, metadata hydration, contest tracks
+  modules/        # AI models: embedding (CLIP) + stubs (asr/ocr/captioning/detection/reranker)
+  stores/
+    vector/       # Qdrant vector index (interface + backend + factory)
+    text/         # Elasticsearch full-text index (interface + backend, not yet wired in)
+  repository/     # data access over run manifests
+  prompts/        # LLM/VLM prompt templates (stub)
+  ui/             # local browser UI
+tests/unit/       # unit tests
+docs/             # documentation (English) + docs/vi (Vietnamese)
+```
+
+## Requirements
+
+- Python ≥ 3.13, managed with [uv](https://docs.astral.sh/uv/)
+- NVIDIA GPU + CUDA (CLIP and TransNetV2 require CUDA when `--device auto`)
+- Docker (for Qdrant)
+- TransNetV2 PyTorch weights (see [docs/transnetv2.md](docs/transnetv2.md))
+
+## Setup
 
 ```bash
-# 1. Clone repo
-git clone <repo-url>
-cd AIO_CodeNova-AIC2026
-
-# 2. Cài uv (nếu chưa có)
-# Windows
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-# 3. Tạo môi trường và cài dependencies
-uv sync
-
-# 4. Cài pre-commit hooks
-uv run pre-commit install
+uv sync                       # install dependencies
+cp .env.example .env          # configure Qdrant / API keys
+make qdrant-up                # start Qdrant (docker compose)
+make qdrant-health            # -> healthz check passed
 ```
 
----
-
-## Quản lý dependencies với uv
+Verify CUDA:
 
 ```bash
-# Thêm package mới
-uv add <package-name>
-
-# Thêm package chỉ dùng khi dev (lint, test,...)
-uv add --dev <package-name>
-
-# Xóa package
-uv remove <package-name>
-
-# Đồng bộ môi trường theo uv.lock (dùng khi pull code mới về)
-uv sync
-
-# Chạy script/lệnh trong môi trường
-uv run python main.py
+uv run python - <<'PY'
+import torch
+print("cuda available:", torch.cuda.is_available())
+print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
+PY
 ```
 
-> Sau khi `uv add` / `uv remove`, nhớ commit cả `pyproject.toml` và `uv.lock`.
+## Running the pipeline
 
----
-
-## Git Workflow
-
-### Quy tắc đặt tên branch
-
-```
-feature/<tên-tính-năng>     # thêm tính năng mới
-fix/<tên-lỗi>               # sửa bug
-chore/<công-việc>           # cập nhật config, docs,...
-```
-
-Ví dụ: `feature/data-preprocessing`, `fix/model-output-error`
-
-### Các bước làm việc
+Every step runs through `uv`. The `Makefile` wraps the common commands — run `make help`
+to list them. `EXP` selects the experiment (run) name.
 
 ```bash
-# 1. Luôn cập nhật branch main trước
-git checkout main
-git pull origin main
+# Full offline pipeline (ingest → ... → build-index)
+make pipeline EXP=demo INPUT=data/raw_videos
 
-# 2. Tạo branch mới từ main
-git checkout -b feature/<tên-tính-năng>
+# Or step by step
+make ingest         EXP=demo INPUT=data/raw_videos
+make detect-shots   EXP=demo
+make extract-frames EXP=demo
+make embed-frames   EXP=demo
+make build-index    EXP=demo      # needs Qdrant running
 
-# 3. Làm việc, sau đó commit
-git add .
-git commit -m "feat: mô tả ngắn thay đổi"
-
-# 4. Push branch lên remote
-git push origin feature/<tên-tính-năng>
-
-# 5. Tạo Pull Request trên GitHub để merge vào main
+# Search / UI
+make search   EXP=demo QUERY="a person riding a motorbike"
+make serve-ui EXP=demo            # http://127.0.0.1:7860
 ```
 
-### Quy tắc commit message
+Each stage records progress in `runs/<EXP>/jobs.sqlite` and the manifests, so re-running a
+stage skips completed work. Pass `--force` (on the raw CLI) to redo a stage.
 
-| Prefix | Dùng khi |
-|--------|----------|
-| `feat:` | Thêm tính năng mới |
-| `fix:` | Sửa bug |
-| `docs:` | Cập nhật tài liệu |
-| `chore:` | Thay đổi config, dependencies |
-| `refactor:` | Refactor code |
+## Configuration
 
----
+Config splits in two:
 
-## Makefile shortcuts
+- **`.env`** — infrastructure: service endpoints, ports, credentials. Per-machine, loaded
+  automatically (see `.env.example`).
+- **CLI flags** — per-experiment settings (model, keyframes, top-k). Recorded in
+  `runs/<exp>/config.json` so each run is reproducible. These are intentionally *not* in `.env`.
+
+`.env` (loaded automatically):
 
 ```bash
-make install      # uv sync — cài/đồng bộ dependencies
-make lint         # kiểm tra lỗi code
-make format       # tự động format code
-make pre-commit   # chạy tất cả pre-commit hooks
-make test         # chạy tests
+# Vector DB (Qdrant)
+QDRANT_URL=http://localhost:6333
+QDRANT_COLLECTION=codenova_frames
+QDRANT_API_KEY=                    # empty for local; set for Qdrant Cloud
+
+# Full-text index (Elasticsearch — for OCR/ASR, not yet wired in)
+ELASTIC_URL=http://localhost:9200
+ELASTIC_INDEX=codenova_text
+ELASTIC_API_KEY=
+
+# Retrieval UI defaults
+CODENOVA_UI_HOST=127.0.0.1
+CODENOVA_UI_PORT=7860
 ```
+
+Key pipeline options (CLI flags, defaults shown):
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--clip-model` | `clip-vit-b-32` | CLIP model for embeddings |
+| `--frame-sampling` | `shot-percentile` | Keyframe sampling strategy |
+| `--keyframe-percentiles` | `0.15,0.5,0.85` | Where in each shot to sample keyframes |
+| `--index-backend` | `qdrant` | Vector index backend |
+| `--top-k` | `20` | Number of results |
+| `--device` | `auto` | Torch device (`auto` requires CUDA) |
+
+### Keyframe sampling
+
+Each shot is sampled at the configured percentiles: frame index `= start + round(span * p)`
+for each percentile `p`. The default `0.15, 0.5, 0.85` yields three keyframes per shot
+(near-start, middle, near-end). Duplicate indices for very short shots collapse to a single
+keyframe.
+
+## Storage backends
+
+Storage lives under `stores`, each backend behind an interface so new ones can be
+added without touching the pipeline:
+
+- **`stores/vector`** — Qdrant. Embeddings are L2-normalized so cosine distance ranks like
+  inner product. Each experiment uses its own collection: `{QDRANT_COLLECTION}__{experiment}`.
+  Vector + `frame_id` are stored; metadata is hydrated from manifests at query time.
+- **`stores/text`** — Elasticsearch (BM25) for OCR/ASR text. Interface + backend exist but
+  are **not yet wired into the pipeline** (no OCR/ASR text is produced yet). Install with
+  the `text` extra: `uv pip install -e '.[text]'`.
+
+## Development
+
+```bash
+make lint        # ruff check
+make format      # ruff format
+make check       # lint + format-check
+make test        # pytest
+make precommit   # all pre-commit hooks
+```
+
+## Run artifacts
+
+```
+runs/<experiment>/
+  config.json
+  jobs.sqlite
+  logs/{pipeline.log, errors.log}
+  manifests/{videos,shots,frames,embeddings}.jsonl
+  frames/<video_id>/*.jpg
+  embeddings/{frames.npz, frame_ids.json}
+```
+
+The vector index is not on disk — it lives in Qdrant (`qdrant_storage/`).
+`runs/`, `data/`, `external/`, `qdrant_storage/`, and `.env` are git-ignored.
+
+## Documentation
+
+- [docs/qdrant.md](docs/qdrant.md) — Qdrant usage
+- [docs/transnetv2.md](docs/transnetv2.md) — preparing TransNetV2 weights
+- [docs/vi/](docs/vi/) — Vietnamese documentation

@@ -11,4 +11,5 @@ repos:
     rev: v0.4.0
     hooks:
       - id: ruff
+        args: [--fix, --unsafe-fixes]
       - id: ruff-format
