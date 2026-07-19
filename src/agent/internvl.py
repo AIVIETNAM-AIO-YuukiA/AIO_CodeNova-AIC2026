@@ -183,13 +183,29 @@ Example of Answering:
 # ---------------------------------------------------------------------------
 
 class InternVLBrain:
-    """ReAct brain powered by InternVL3-2B-hf (text-only reasoning step)."""
+    """ReAct brain powered by InternVL3-2B-hf.
+
+    Because InternVL-2B is a small model, it cannot reliably follow a
+    multi-step ReAct JSON format via text-only reasoning.  Instead, this
+    brain performs **direct visual reasoning**: it looks at the best
+    available frame and answers the question in a single forward pass.
+    If no frames are available it falls back to text-only inference.
+    """
 
     def __init__(self, model_name: str = "OpenGVLab/InternVL3-2B-hf") -> None:
         self.model_name = model_name
+        # Paths are set externally by the Agent before each step.
+        self._frame_paths: list[str] = []
 
     def reset(self) -> None:
-        pass  # Stateless per-step; context is re-built each call.
+        self._frame_paths = []
+
+    def set_frame_paths(self, paths: list[str]) -> None:
+        """Allow Agent to inject available frame paths before reasoning."""
+        # Do NOT filter with Path.is_file() here — paths may be relative to the
+        # server's working directory. Let Image.open() handle missing files.
+        self._frame_paths = [p for p in paths if p]
+
 
     def reason(
         self,
@@ -198,32 +214,109 @@ class InternVLBrain:
         frame_count: int,
         tool_results: list[dict] | None = None,
     ) -> BrainResponse:
+        """Answer the question by directly looking at the best available frame.
+
+        On the first call (no tool_results) we perform a visual inference on
+        the centre frame of the shot.  We return finished=True immediately —
+        skipping the full ReAct tool loop — because InternVL-2B is too small
+        to reliably produce well-formed ReAct JSON.
+        """
         model, processor = get_internvl_model_and_processor(self.model_name)
 
-        context = f"Question: {question}\nShot info: {shot_info}\nFrames available: {frame_count}\n"
+        # If a previous tool already produced a result, synthesise the answer
+        # from that observation using text-only inference (no image needed).
         if tool_results:
-            obs = "\n".join(
-                f"Tool {r.get('tool', '?')} returned: {r.get('result', '')}"
+            obs_text = "\n".join(
+                f"{r.get('tool', '?')}: {r.get('result', '')}"
                 for r in tool_results
             )
-            context += f"\nPrevious observations:\n{obs}"
+            synthesis_prompt = (
+                f"Based on the following observations about the video frame:\n"
+                f"{obs_text}\n\n"
+                f"Answer this question concisely: {question}\n"
+                f"Answer in the same language as the question."
+            )
+            try:
+                answer = _run_text_inference(model, processor, synthesis_prompt)
+                return BrainResponse(answer=answer.strip(), finished=True)
+            except Exception as exc:
+                LOGGER.exception("InternVLBrain synthesis failed")
+                return BrainResponse(answer=f"Reasoning error: {exc}", finished=True)
 
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n{context}\n\n"
-            "Please generate a valid JSON object to act or answer."
+        # No prior tool results — answer directly from the image.
+        # Pick the centre frame for best temporal representativeness.
+        frame_path = ""
+        if self._frame_paths:
+            frame_path = self._frame_paths[len(self._frame_paths) // 2]
+
+        if frame_path:
+            from core.paths import resolve_frame_path
+            try:
+                resolved_path = resolve_frame_path(frame_path)
+                image = Image.open(resolved_path).convert("RGB")
+                prompt = (
+                    f"Answer the following question about this video frame in the same "
+                    f"language as the question. Be concise and direct.\n"
+                    f"Question: {question}"
+                )
+                answer = _run_image_inference(model, processor, image, prompt)
+                LOGGER.info("InternVLBrain answered from image frame: %s", frame_path)
+                return BrainResponse(answer=answer.strip(), finished=True)
+            except FileNotFoundError:
+                LOGGER.warning("InternVLBrain: frame not found at '%s', trying other frames.", frame_path)
+                # Try other frames in the shot
+                for fp in self._frame_paths:
+                    if fp == frame_path:
+                        continue
+                    try:
+                        resolved_fp = resolve_frame_path(fp)
+                        image = Image.open(resolved_fp).convert("RGB")
+                        prompt = (
+                            f"Answer the following question about this video frame in the same "
+                            f"language as the question. Be concise and direct.\n"
+                            f"Question: {question}"
+                        )
+                        answer = _run_image_inference(model, processor, image, prompt)
+                        LOGGER.info("InternVLBrain answered from fallback frame: %s", fp)
+                        return BrainResponse(answer=answer.strip(), finished=True)
+                    except FileNotFoundError:
+                        continue
+                    except Exception as exc:
+                        LOGGER.exception("InternVLBrain visual inference failed on fallback frame")
+                        return BrainResponse(answer=f"Reasoning error: {exc}", finished=True)
+            except Exception as exc:
+                LOGGER.exception("InternVLBrain visual inference failed")
+                return BrainResponse(answer=f"Reasoning error: {exc}", finished=True)
+
+        # Last resort: no frames available at all.
+        # NOTE: Do NOT include frame_count in the prompt — small models confuse
+        # it with the actual question answer (e.g. "Frames: 6" → "6 people").
+        LOGGER.warning("InternVLBrain: no frame paths available, falling back to text-only.")
+        
+        debug_path = frame_path if frame_path else (self._frame_paths[0] if self._frame_paths else "EMPTY")
+        if debug_path != "EMPTY":
+            try:
+                from core.paths import resolve_frame_path
+                debug_path = str(resolve_frame_path(debug_path))
+            except Exception:
+                pass
+                
+        text_prompt = (
+            f"Context: {shot_info}\n"
+            f"Question: {question}\n"
+            f"Note: No image is available. Please reply exactly with: '[DEBUG] Cannot load image. Path attempted: {debug_path}'"
         )
-
         try:
-            response = _run_text_inference(model, processor, prompt)
-            return self._parse_response(response)
+            answer = _run_text_inference(model, processor, text_prompt)
+            return BrainResponse(answer=answer.strip(), finished=True)
         except Exception as exc:
-            LOGGER.exception("InternVLBrain reason failed")
+            LOGGER.exception("InternVLBrain text inference failed")
             return BrainResponse(answer=f"Reasoning error: {exc}", finished=True)
 
     def _parse_response(self, text: str) -> BrainResponse:
+        """(Legacy) Parse JSON ReAct response — kept for reference but no longer called."""
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
-            LOGGER.warning("No JSON in InternVL response: %s", text[:200])
             return BrainResponse(answer=text.strip(), finished=True)
         try:
             data = json.loads(match.group())
@@ -239,8 +332,7 @@ class InternVLBrain:
                 action_input=data.get("action_input", {}),
                 finished=False,
             )
-        except json.JSONDecodeError as exc:
-            LOGGER.warning("Failed to parse InternVL JSON: %s", exc)
+        except json.JSONDecodeError:
             return BrainResponse(answer=text.strip(), finished=True)
 
 
@@ -271,8 +363,9 @@ class InternVLCaptionTool(Tool):
             )
 
         try:
+            from core.paths import resolve_frame_path
             model, processor = get_internvl_model_and_processor(self.model_name)
-            image = Image.open(image_path).convert("RGB")
+            image = Image.open(resolve_frame_path(image_path)).convert("RGB")
             return _run_image_inference(model, processor, image, prompt)
         except Exception as exc:
             LOGGER.exception("InternVLCaptionTool failed")
@@ -300,8 +393,9 @@ class InternVLOCRTool(Tool):
         )
 
         try:
+            from core.paths import resolve_frame_path
             model, processor = get_internvl_model_and_processor(self.model_name)
-            image = Image.open(image_path).convert("RGB")
+            image = Image.open(resolve_frame_path(image_path)).convert("RGB")
             return _run_image_inference(
                 model, processor, image, prompt, do_sample=False
             )

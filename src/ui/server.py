@@ -19,6 +19,45 @@ from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 LOGGER = get_logger(__name__)
 
 
+def _warmup_models(reranker, experiment: Experiment) -> None:
+    """Pre-load heavy models in background so the first request doesn't block.
+
+    Called in a daemon thread right after the server starts listening.
+    The lazy-loaded models (BLIP-2 reranker, SigLIP embedder) can take
+    3-4 minutes to download/load on Colab T4. By triggering loading here,
+    models are ready before the user makes their first request.
+    """
+    import threading
+
+    def _load():
+        LOGGER.info("[warmup] Starting background model pre-loading...")
+        try:
+            # Pre-load the reranker (BLIP-2) if one is configured.
+            if reranker is not None and hasattr(reranker, "_load"):
+                LOGGER.info("[warmup] Loading BLIP-2 reranker...")
+                reranker._load()
+                LOGGER.info("[warmup] BLIP-2 reranker ready.")
+        except Exception as exc:
+            LOGGER.warning("[warmup] Reranker pre-load failed (non-fatal): %s", exc)
+
+        try:
+            # Pre-load the embedder (SigLIP) — also used by the retriever.
+            from modules.embedding import build_embedder
+            embedder = build_embedder(
+                model_name=experiment.config.embedding_model,
+                device=experiment.config.device,
+            )
+            embedder.embed_text("warmup query")
+            LOGGER.info("[warmup] Embedder ready.")
+        except Exception as exc:
+            LOGGER.warning("[warmup] Embedder pre-load failed (non-fatal): %s", exc)
+
+        LOGGER.info("[warmup] All models pre-loaded and ready.")
+
+    t = threading.Thread(target=_load, daemon=True, name="model-warmup")
+    t.start()
+
+
 def serve_ui(
     experiment: Experiment,
     host: str = "127.0.0.1",
@@ -28,6 +67,12 @@ def serve_ui(
     reranker_top_k: int = 10,
 ) -> None:
     """Serve the local retrieval UI until interrupted."""
+    from core.paths import set_project_root
+    
+    # experiment.run_dir is typically runs/<experiment_name>
+    # so its parent is the runs/ directory, and its parent is the project root
+    set_project_root(experiment.run_dir.parent.parent)
+
     retriever = build_retriever(experiment)
     handler = build_handler(
         experiment=experiment,
@@ -38,6 +83,9 @@ def serve_ui(
     )
     server = ThreadingHTTPServer((host, port), handler)
     LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
+    # Kick off background model loading immediately so the first user request
+    # doesn't have to wait 3-4 minutes for BLIP-2 / SigLIP to load.
+    _warmup_models(reranker, experiment)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -506,18 +554,104 @@ INDEX_HTML = r"""<!doctype html>
         endpoint = "/api/search";
       }
 
+      const TIMEOUT_MS = 300_000;  // 5 min — models pre-warm in background but may still need time
+      const MAX_RETRIES = 1;       // No auto-retry: models are pre-warmed at startup, not on first request
+      let countdownTimer = null;
+
+      function startCountdown(totalMs, attempt, maxAttempts) {
+        let remaining = Math.ceil(totalMs / 1000);
+        const attemptLabel = maxAttempts > 1 ? ` (attempt ${attempt}/${maxAttempts})` : "";
+        statusEl.className = "status";
+        statusEl.textContent = `Searching\u2026${attemptLabel} — timeout in ${remaining}s. First run loads models and may take several minutes.`;
+        countdownTimer = setInterval(() => {
+          remaining -= 1;
+          if (remaining <= 0) {
+            clearInterval(countdownTimer);
+          } else {
+            statusEl.textContent = `Searching\u2026${attemptLabel} — timeout in ${remaining}s.`;
+          }
+        }, 1000);
+      }
+
+      function stopCountdown() {
+        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+      }
+
+      async function fetchWithRetry(endpoint, payload, maxRetries) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+          startCountdown(TIMEOUT_MS, attempt, maxRetries);
+
+          try {
+            const response = await fetch(endpoint, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Bypass-Tunnel-Reminder": "true"
+              },
+              body: JSON.stringify(payload),
+              signal: controller.signal
+            });
+            clearTimeout(timeoutId);
+            stopCountdown();
+            
+            const text = await response.text();
+            let data;
+            try {
+              data = JSON.parse(text);
+            } catch (parseError) {
+              // If it's not JSON (like "Bad Gateway" HTML), treat it as a server error
+              if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${text.substring(0, 100).replace(/<[^>]*>?/gm, '')}`);
+              }
+              throw parseError;
+            }
+            
+            // Treat 502/503/504 as retryable server errors (e.g. ngrok/colab gateway timeouts)
+            if ([502, 503, 504].includes(response.status)) {
+               throw new Error(`Gateway Error ${response.status}`);
+            }
+            
+            return { response, data };
+          } catch (err) {
+            clearTimeout(timeoutId);
+            stopCountdown();
+            const isRetryable = err.name === "AbortError" || 
+                                err.name === "TypeError" || 
+                                err.message.includes("HTTP 502") ||
+                                err.message.includes("HTTP 503") ||
+                                err.message.includes("HTTP 504") ||
+                                err.message.includes("Gateway Error");
+            
+            if (isRetryable && attempt < maxRetries) {
+              statusEl.className = "status warn";
+              statusEl.textContent = `Attempt ${attempt} failed (${err.message.substring(0, 40)}). Retrying automatically (${attempt}/${maxRetries})\u2026`;
+              await new Promise(r => setTimeout(r, 2000)); // 2s pause before retry
+              continue;
+            }
+            throw err; // final attempt or non-retryable error
+          }
+        }
+      }
+
       try {
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Bypass-Tunnel-Reminder": "true"
-          },
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
+        const { response, data } = await fetchWithRetry(endpoint, payload, MAX_RETRIES);
         if (!response.ok || data.error) {
           throw new Error(data.error || "Search failed");
+        }
+
+        // Agent error: show dedicated error banner (separate from HTTP errors)
+        if (track === "vqa" && data.agent_error) {
+          statusEl.className = "status warn";
+          statusEl.textContent = "Agent failed (see error below)";
+          answerBox.innerHTML = `<div class="answer-box" style="border-color:#e55;background:#fff5f5">
+            <div class="label" style="color:#c00">Agent Error</div>
+            <div class="answer-text" style="color:#c00;font-size:13px;font-family:monospace">${escapeHtml(data.agent_error)}</div>
+          </div>`;
+          renderPipeline(data);
+          renderResults(data.results || []);
+          return;
         }
 
         if (track === "vqa" && data.answer) {
@@ -539,8 +673,11 @@ INDEX_HTML = r"""<!doctype html>
           renderResults(data.results);
         }
       } catch (error) {
+        stopCountdown();
         statusEl.className = "status warn";
-        statusEl.textContent = error.message;
+        statusEl.textContent = (error.name === "AbortError" || error.name === "TypeError")
+          ? `All ${MAX_RETRIES} attempts timed out. The server is still loading models — please wait a minute and try again.`
+          : error.message;
       } finally {
         submitEl.disabled = false;
       }

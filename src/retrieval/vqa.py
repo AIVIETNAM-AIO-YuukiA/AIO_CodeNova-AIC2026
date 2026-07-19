@@ -232,21 +232,26 @@ def vqa_search(
 
     # Agent
     pipeline_stages["agent"] = {"max_steps": 5, "backend": vqa_backend}
+    agent_error = None
     try:
         agent = create_agent(backend=vqa_backend)
         answer = agent.answer(shot=best_shot, question=question or query)
     except Exception as exc:
         LOGGER.exception("Agent failed")
-        answer = f"[Agent error: {exc}]"
+        agent_error = str(exc)
+        answer = ""
 
-    pipeline_stages["agent"]["answer"] = answer[:300]
+    pipeline_stages["agent"]["answer"] = answer[:300] if answer else ""
 
-    return {
+    result: dict = {
         "answer": answer,
         "results": [r.to_dict() for r in clip_results[:10]],
         "pipeline": pipeline_stages,
         "reasoning": "VQA pipeline: CLIP → Temporal → Validation → Agent",
     }
+    if agent_error:
+        result["agent_error"] = agent_error
+    return result
 
 
 def trake_search(
