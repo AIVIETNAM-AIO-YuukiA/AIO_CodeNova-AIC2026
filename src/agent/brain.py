@@ -51,8 +51,8 @@ Bạn có các công cụ sau:
 class VlmBrain:
     """VLM brain that powers the Agent's reasoning via Gemini API."""
 
-    def __init__(self, model_name: str = "gemini-2.5-flash-lite") -> None:
-        self.model_name = model_name
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
         self._client = None
         self._messages: list[dict] = []
 
@@ -123,7 +123,7 @@ class VlmBrain:
                 contents=[full_prompt],
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.3,
+                    temperature=0.0,
                 ),
             )
 

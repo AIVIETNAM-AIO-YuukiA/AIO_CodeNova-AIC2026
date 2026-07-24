@@ -25,6 +25,10 @@ class EmbeddingError(CodeNovaError):
     """Raised when embedding generation fails."""
 
 
+class CaptioningError(CodeNovaError):
+    """Raised when VLM caption generation fails."""
+
+
 class IndexBuildError(CodeNovaError):
     """Raised when index creation or loading fails."""
 

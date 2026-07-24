@@ -6,22 +6,26 @@ from pathlib import Path
 
 from config.settings import Experiment
 from core.types import SearchResult
-from repository import FrameRepository, VideoRepository
+from repository import CaptionRepository, FrameRepository, VideoRepository
 
 
 class ResultHydrator:
     """Attach frame/video metadata to index search results.
 
-    Frame and video lookups are loaded once on construction and reused across
-    queries, so serving many searches does not re-read the manifests each time.
+    Frame, video, and caption lookups are loaded once on construction and
+    reused across queries, so serving many searches does not re-read the
+    manifests each time. Captions are optional — ``by_id()`` is an empty dict
+    when the experiment didn't configure the Vietnamese embedding model, so
+    ``result.caption`` is simply ``None`` in that case.
     """
 
     def __init__(self, experiment: Experiment) -> None:
         self._frames = FrameRepository(experiment).by_id()
         self._videos = VideoRepository(experiment).by_id()
+        self._captions = CaptionRepository(experiment).by_id()
 
     def hydrate(self, results: list[SearchResult]) -> list[SearchResult]:
-        """Return results enriched with frame paths, timestamps, and video names."""
+        """Return results enriched with frame paths, timestamps, video names, and captions."""
         return [self._hydrate_one(result) for result in results]
 
     def _hydrate_one(self, result: SearchResult) -> SearchResult:
@@ -39,4 +43,5 @@ class ResultHydrator:
             shot_id=frame.shot_id,
             frame_index=frame.frame_index,
             timestamp_sec=frame.timestamp_sec,
+            caption=self._captions.get(result.frame_id),
         )

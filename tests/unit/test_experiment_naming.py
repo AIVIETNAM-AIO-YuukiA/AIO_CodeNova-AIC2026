@@ -8,7 +8,7 @@ from core.errors import ExperimentNameError
 
 def test_default_experiment_name_is_valid_and_stable() -> None:
     config = PipelineConfig(
-        embedding_model="SigLIP2 Large",
+        embedding_models=("SigLIP2 Large",),
         frame_sampling="Shot Midpoint",
         index_backend="Qdrant",
     )

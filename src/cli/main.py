@@ -15,6 +15,7 @@ from core.errors import CodeNovaError
 from core.logging import configure_logging, get_logger
 from indexing.build_index import build_index
 from indexing.embeddings import embed_frames
+from indexing.extract_text import extract_asr, extract_ocr
 from indexing.frames import extract_frames
 from indexing.ingest import ingest_videos
 from indexing.shots import detect_shots
@@ -56,7 +57,9 @@ def build_parser() -> ArgumentParser:
     add_run_args(frames_parser)
     frames_parser.add_argument("--force", action="store_true")
 
-    embed_parser = subparsers.add_parser("embed-frames", help="Embed keyframes with CLIP")
+    embed_parser = subparsers.add_parser(
+        "embed-frames", help="Embed keyframes (SigLIP2/BEiT-3/Vietnamese caption embedding)"
+    )
     add_run_args(embed_parser)
     embed_parser.add_argument("--batch-size", default=32, type=int)
     embed_parser.add_argument("--force", action="store_true")
@@ -64,6 +67,14 @@ def build_parser() -> ArgumentParser:
     index_parser = subparsers.add_parser("build-index", help="Build the Qdrant vector index")
     add_run_args(index_parser)
     index_parser.add_argument("--force", action="store_true")
+
+    text_parser = subparsers.add_parser(
+        "extract-text", help="Run OCR + ASR and index text into Elasticsearch"
+    )
+    add_run_args(text_parser)
+    text_parser.add_argument("--force", action="store_true")
+    text_parser.add_argument("--skip-ocr", action="store_true", help="Skip the OCR sub-stage")
+    text_parser.add_argument("--skip-asr", action="store_true", help="Skip the ASR sub-stage")
 
     search_parser = subparsers.add_parser("search", help="Search videos by text query")
     add_run_args(search_parser)
@@ -110,7 +121,14 @@ def add_config_args(parser: ArgumentParser) -> None:
     """Attach shared pipeline config arguments."""
     parser.add_argument("--data-dir", default=Path("data"), type=Path)
     parser.add_argument("--runs-dir", default=Path("runs"), type=Path)
-    parser.add_argument("--embedding-model", default="siglip2-large")
+    parser.add_argument(
+        "--embedding-models",
+        default=os.environ.get("EMBEDDING_MODELS", "siglip2-large,beit3-base,vietnamese-embedding"),
+        help=(
+            "Comma-separated embedding models. All three run by default "
+            "(SRRF fusion + rerank). Defaults to $EMBEDDING_MODELS."
+        ),
+    )
     parser.add_argument("--frame-sampling", default="shot-percentile")
     parser.add_argument("--index-backend", default="qdrant")
     parser.add_argument(
@@ -133,12 +151,17 @@ def parse_percentiles(raw: str) -> tuple[float, ...]:
     return tuple(float(part) for part in raw.split(",") if part.strip())
 
 
+def parse_embedding_models(raw: str) -> tuple[str, ...]:
+    """Parse a comma-separated embedding model list."""
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def config_from_args(args: Namespace) -> PipelineConfig:
     """Create a pipeline config from parsed CLI args."""
     return PipelineConfig(
         data_dir=args.data_dir,
         runs_dir=args.runs_dir,
-        embedding_model=args.embedding_model,
+        embedding_models=parse_embedding_models(args.embedding_models),
         frame_sampling=args.frame_sampling,
         index_backend=args.index_backend,
         keyframe_percentiles=parse_percentiles(args.keyframe_percentiles),
@@ -211,7 +234,7 @@ def handle_extract_frames(args: Namespace) -> int:
 
 
 def handle_embed_frames(args: Namespace) -> int:
-    """Run CLIP image embedding."""
+    """Run keyframe embedding for every configured model."""
     experiment = load_experiment(args)
     count = embed_frames(experiment=experiment, batch_size=args.batch_size, force=args.force)
     print(json.dumps({"experiment": experiment.name, "embeddings": count}))
@@ -223,6 +246,19 @@ def handle_build_index(args: Namespace) -> int:
     experiment = load_experiment(args)
     count = build_index(experiment=experiment, force=args.force)
     print(json.dumps({"experiment": experiment.name, "indexed": count}))
+    return 0
+
+
+def handle_extract_text(args: Namespace) -> int:
+    """Run OCR + ASR and index text into Elasticsearch."""
+    experiment = load_experiment(args)
+    ocr_count = 0 if args.skip_ocr else extract_ocr(experiment=experiment, force=args.force)
+    asr_count = 0 if args.skip_asr else extract_asr(experiment=experiment, force=args.force)
+    print(
+        json.dumps(
+            {"experiment": experiment.name, "ocr_indexed": ocr_count, "asr_indexed": asr_count}
+        )
+    )
     return 0
 
 
@@ -252,7 +288,7 @@ def handle_serve_ui(args: Namespace) -> int:
         )
     else:
         LOGGER.info("Reranker: disabled (no --reranker-model supplied)")
-        
+
     if getattr(args, "internvl_model", None):
         os.environ["INTERNVL_MODEL"] = args.internvl_model
         LOGGER.info("InternVL backend enabled via CLI: %s", args.internvl_model)
@@ -290,6 +326,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_embed_frames(args)
         if args.command == "build-index":
             return handle_build_index(args)
+        if args.command == "extract-text":
+            return handle_extract_text(args)
         if args.command == "search":
             return handle_search(args)
         if args.command == "serve-ui":

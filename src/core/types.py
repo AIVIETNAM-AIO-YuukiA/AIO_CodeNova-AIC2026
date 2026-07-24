@@ -98,6 +98,7 @@ class SearchResult:
     shot_id: str | None = None
     frame_index: int | None = None
     timestamp_sec: float | None = None
+    caption: str | None = None
 
     def to_dict(self) -> dict[str, str | int | float | None]:
         """Serialize the result."""

@@ -1,8 +1,6 @@
 """Unit tests for InternVL agent integration."""
 
-import json
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,18 +16,30 @@ from agent.internvl import (
 
 # --- Mocks ---
 
+
 class MockTokenizer:
     """Mock tokenizer."""
+
     pass
+
 
 class MockModel:
     """Mock InternVL model."""
+
     device = torch.device("cpu")
 
     def __init__(self):
         self.device = torch.device("cpu")
 
-    def chat(self, tokenizer, pixel_values, question, generation_config=None, history=None, return_history=False):
+    def chat(
+        self,
+        tokenizer,
+        pixel_values,
+        question,
+        generation_config=None,
+        history=None,
+        return_history=False,
+    ):
         """Simulate model chat response based on input prompts."""
         if "Describe this image" in question:
             response = "A detailed description of the mock image."
@@ -40,7 +50,9 @@ class MockModel:
             if "mock_action" in question:
                 response = '{"thought": "I need to check", "action": "ocr", "action_input": {"image_path": "mock.jpg"}}'
             else:
-                response = '{"thought": "I know the answer", "answer": "Mock answer", "finished": true}'
+                response = (
+                    '{"thought": "I know the answer", "answer": "Mock answer", "finished": true}'
+                )
         else:
             response = "Mock fallback response"
 
@@ -59,11 +71,12 @@ def mock_internvl_loader():
         mock_loader.return_value = (MockModel(), MockTokenizer())
         yield mock_loader
 
+
 @pytest.fixture
 def mock_image_path(tmp_path):
     """Create a temporary dummy image for testing."""
     from PIL import Image
-    
+
     img_path = tmp_path / "test_image.jpg"
     img = Image.new("RGB", (800, 600), color="red")
     img.save(img_path)
@@ -72,6 +85,7 @@ def mock_image_path(tmp_path):
 
 # --- Tests ---
 
+
 class TestInternVLPreprocessing:
     def test_build_transform(self):
         transform = build_transform(input_size=448)
@@ -79,10 +93,12 @@ class TestInternVLPreprocessing:
 
     def test_dynamic_preprocess(self, tmp_path):
         from PIL import Image
-        
+
         img = Image.new("RGB", (1920, 1080), color="blue")
-        processed = dynamic_preprocess(img, min_num=1, max_num=6, image_size=448, use_thumbnail=True)
-        
+        processed = dynamic_preprocess(
+            img, min_num=1, max_num=6, image_size=448, use_thumbnail=True
+        )
+
         # Should return a list of cropped blocks + 1 thumbnail
         assert isinstance(processed, list)
         assert len(processed) > 1
@@ -93,10 +109,7 @@ class TestInternVLBrain:
     def test_reason_answer(self, mock_internvl_loader):
         brain = InternVLBrain()
         response = brain.reason(
-            question="What is this?",
-            shot_info="Mock shot",
-            frame_count=1,
-            tool_results=[]
+            question="What is this?", shot_info="Mock shot", frame_count=1, tool_results=[]
         )
         assert response.finished is True
         assert response.answer == "Mock answer"
@@ -105,15 +118,12 @@ class TestInternVLBrain:
         brain = InternVLBrain()
         # The mock model returns an action JSON when "mock_action" is in the prompt
         response = brain.reason(
-            question="mock_action",
-            shot_info="Mock shot",
-            frame_count=1,
-            tool_results=[]
+            question="mock_action", shot_info="Mock shot", frame_count=1, tool_results=[]
         )
         assert response.finished is False
         assert response.action == "ocr"
         assert response.action_input == {"image_path": "mock.jpg"}
-        
+
     def test_parse_response_no_json(self):
         brain = InternVLBrain()
         response = brain._parse_response("This is not JSON.")
@@ -131,7 +141,7 @@ class TestInternVLTools:
         tool = InternVLCaptionTool()
         result = tool.run(image_path="nonexistent.jpg")
         assert "Error: file not found" in result
-        
+
     def test_caption_tool_no_path(self):
         tool = InternVLCaptionTool()
         result = tool.run(image_path="")

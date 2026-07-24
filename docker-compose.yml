@@ -8,3 +8,116 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
+
+  # Two vLLM services, same port (8881) — only run one at a time (same GPU).
+  #   make vllm-retrieval   -> Qwen3.5-9B, for online agent/retrieval tasks
+  #   make vllm-index       -> Qwen3.6-35B-A3B, for offline captioning/OCR
+  # Both use profiles so a bare `docker compose up -d` starts neither.
+
+  # Tuning notes (vLLM on DGX Spark GB10 / unified LPDDR5x memory, ~273GB/s
+  # bandwidth-bound, not compute-bound — see vllm.ai/blog/2026-06-01-vllm-dgx-spark
+  # and rikkarth.com's Qwen3.6-35B-A3B-on-GB10 benchmark):
+  #   - --performance-mode (vLLM >=0.17) picks a curated config per workload
+  #     shape: "throughput" for batch jobs, "interactivity" for chat/agent.
+  #   - Do NOT set --kv-cache-dtype fp8 here — vLLM's own DGX Spark guidance
+  #     says it can hurt predictability/perf on this unified-memory hardware,
+  #     unlike on H100-class discrete GPUs where it's usually a win.
+  #   - Real benchmark for Qwen3.6-35B-A3B on GB10 scales near-linearly up to
+  #     c=32 (155.6 tok/s aggregate), so throughput mode benefits from a
+  #     higher --max-num-seqs, not a lower one, for this batch-captioning use case.
+  #   - gpu-memory-utilization is NOT proportional to active params (Qwen3.6-35B-A3B
+  #     has only 3B active/token, but all 256 experts must still be resident in
+  #     VRAM for the router to pick from) — measured on this machine, the AWQ
+  #     checkpoint alone loads at 22.87 GiB. 0.25 crashed with
+  #     "No available memory for the cache blocks" (KV-cache budget went
+  #     negative, -1.96 GiB) before any request could even run. 0.35 was the
+  #     first safe value found; bumped to 0.7 once real usage (~13/122 GiB
+  #     resident under load) showed most of the 121.7 GiB unified pool was
+  #     idle headroom, unlocking more KV cache for max-num-seqs=24. Don't
+  #     lower this without re-checking the container doesn't crash-loop.
+
+  vllm-retrieval:
+    image: ghcr.io/timothystewart6/vllm-gb10:latest
+    container_name: codenova-vllm-retrieval
+    profiles: ["retrieval"]
+    command: >
+      vllm serve cyankiwi/Qwen3.5-9B-AWQ-4bit
+      --host 0.0.0.0
+      --port 8881
+      --dtype float16
+      --max-model-len 4096
+      --performance-mode interactivity
+      --max-num-seqs 4
+      --gpu-memory-utilization 0.25
+      --enable-prefix-caching
+      --reasoning-parser qwen3
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+    ports:
+      - "8881:8881"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  vllm-index:
+    image: ghcr.io/timothystewart6/vllm-gb10:latest
+    container_name: codenova-vllm-index
+    profiles: ["index"]
+    command: >
+      vllm serve cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
+      --host 0.0.0.0
+      --port 8881
+      --dtype float16
+      --max-model-len 8192
+      --performance-mode throughput
+      --max-num-seqs 24
+      --max-num-batched-tokens 32768
+      --gpu-memory-utilization 0.7
+      --enable-prefix-caching
+      --reasoning-parser qwen3
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+    ports:
+      - "8881:8881"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Full-text index for OCR/ASR search (BM25).
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    container_name: codenova-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+    ports:
+      - "8882:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+
+  # Web UI for Elasticsearch (ES itself has no built-in UI, only a REST API).
+  elasticvue:
+    image: cars10/elasticvue:latest
+    container_name: codenova-elasticvue
+    ports:
+      - "8883:8080"
+    restart: unless-stopped
+
+volumes:
+  elasticsearch_data:

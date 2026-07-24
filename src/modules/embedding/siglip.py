@@ -9,25 +9,40 @@ backend class is picked per checkpoint.
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 from core.errors import EmbeddingError
 from core.types import FrameRecord
-from modules.embedding.base import Embedder, projected_features, resolve_torch_device
+from modules.embedding.base import (
+    BatchCallback,
+    BatchProgressLogger,
+    Embedder,
+    projected_features,
+    resolve_torch_device,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SiglipEmbedder(Embedder):
     """SigLIP 2 image/text embeddings backed by Hugging Face Transformers."""
 
-    def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32) -> None:
-        self.model_name = normalize_siglip_model_name(model_name)
+    def __init__(
+        self, model_name: str | None = None, device: str = "auto", batch_size: int = 32
+    ) -> None:
+        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2-large")
+        self.model_name = normalize_siglip_model_name(resolved)
         self.device = device
         self.batch_size = batch_size
         self._model = None
         self._processor = None
         self._torch = None
 
-    def embed_images(self, frames: list[FrameRecord]) -> list[list[float]]:
+    def embed_images(
+        self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
+    ) -> list[list[float]]:
         """Embed frames with SigLIP image features."""
         if not frames:
             return []
@@ -38,6 +53,7 @@ class SiglipEmbedder(Embedder):
 
         model, processor, torch, device = self._load()
         vectors: list[list[float]] = []
+        progress = BatchProgressLogger(LOGGER, self.model_name, len(frames))
         for start in range(0, len(frames), self.batch_size):
             batch = frames[start : start + self.batch_size]
             images = [Image.open(Path(frame.frame_path)).convert("RGB") for frame in batch]
@@ -46,10 +62,14 @@ class SiglipEmbedder(Embedder):
                 with torch.no_grad():
                     features = projected_features(model.get_image_features(**inputs))
                     features = torch.nn.functional.normalize(features, p=2, dim=-1)
-                vectors.extend(features.detach().cpu().numpy().astype("float32").tolist())
+                batch_vectors = features.detach().cpu().numpy().astype("float32").tolist()
+                vectors.extend(batch_vectors)
             finally:
                 for image in images:
                     image.close()
+            progress.advance(len(batch))
+            if on_batch is not None:
+                on_batch(batch, batch_vectors)
         return vectors
 
     def embed_text(self, query: str) -> list[float]:

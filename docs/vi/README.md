@@ -1,7 +1,8 @@
 # CodeNova (Tiếng Việt)
 
-CodeNova là pipeline truy hồi video: tách video thành shot, lấy keyframe, embed bằng CLIP
-và index vào Qdrant; truy vấn bằng text để tìm đúng khoảnh khắc (known-item search, KIS).
+CodeNova là pipeline truy hồi video: tách video thành shot, lấy keyframe, embed bằng
+SigLIP2/BEiT-3 và index vào Qdrant; truy vấn bằng text để tìm đúng khoảnh khắc
+(known-item search, KIS).
 
 Pipeline chạy tiếp được sau khi gián đoạn: mỗi bước ghi tiến độ (vào `jobs.sqlite` và các
 manifest), nên khi chạy lại sẽ bỏ qua phần đã hoàn tất thay vì làm lại từ đầu.
@@ -15,7 +16,7 @@ OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
 
 ONLINE (retrieval)
-  text query → CLIP embed → Qdrant search → hydrate metadata → kết quả
+  text query → embed (SigLIP2/BEiT-3) → Qdrant search → hydrate metadata → kết quả
 ```
 
 ## Cấu trúc thư mục
@@ -28,7 +29,8 @@ src/
   video/          # quét video, phát hiện shot, trích keyframe (OpenCV/TransNetV2)
   indexing/       # các stage offline + manifest + trạng thái job (SQLite)
   retrieval/      # search online: Retriever, hydrate metadata, contest tracks
-  modules/        # model AI: embedding (CLIP) + stub (asr/ocr/captioning/detection/reranker)
+  modules/        # model AI: embedding (SigLIP2, BEiT-3), reranker (BLIP-2 ITM),
+                  #   stub (asr/ocr/captioning/detection)
   stores/
     vector/       # Qdrant vector index (interface + backend + factory)
     text/         # Elasticsearch full-text (interface + backend, chưa nối vào luồng)
@@ -42,7 +44,7 @@ docs/             # tài liệu tiếng Anh + docs/vi tiếng Việt
 ## Yêu cầu
 
 - Python ≥ 3.13, quản lý bằng [uv](https://docs.astral.sh/uv/)
-- GPU NVIDIA + CUDA (CLIP và TransNetV2 cần CUDA khi `--device auto`)
+- GPU NVIDIA + CUDA (SigLIP2, BEiT-3 và TransNetV2 cần CUDA khi `--device auto`)
 - Docker (cho Qdrant)
 - Weights TransNetV2 PyTorch (xem [transnetv2.md](transnetv2.md))
 
@@ -109,7 +111,7 @@ Các tùy chọn pipeline chính (cờ CLI, kèm mặc định):
 
 | Cờ | Mặc định | Ý nghĩa |
 |------|---------|---------|
-| `--clip-model` | `clip-vit-b-32` | Model CLIP để embed |
+| `--embedding-models` | `siglip2-large` | Model embedding, phân tách bằng dấu phẩy (`siglip2-large`, `beit3-*`); nhiều model sẽ bật SRRF fusion + rerank BLIP-2 |
 | `--frame-sampling` | `shot-percentile` | Chiến lược lấy keyframe |
 | `--keyframe-percentiles` | `0.15,0.5,0.85` | Vị trí trong shot để lấy keyframe |
 | `--index-backend` | `qdrant` | Backend vector index |

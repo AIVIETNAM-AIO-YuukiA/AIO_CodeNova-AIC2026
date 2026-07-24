@@ -122,4 +122,3 @@ def test_temporal_search_stops_at_different_video() -> None:
     # Backward search starting at 4 should stop at 2
     start = temporal_search_backward(4, emb, frame_records=records, tolerance_threshold=2)
     assert start == 2
-

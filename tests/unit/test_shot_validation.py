@@ -71,7 +71,7 @@ def test_shot_validator_good_shot() -> None:
         frame_count=5,
     )
 
-    validator = ShotValidator(min_frames=2, min_clip_score=0.1)
+    validator = ShotValidator(min_frames=2, min_sim_score=0.1)
     result = validator.validate(shot, query, all_embeddings, records)
 
     assert result.validated is True

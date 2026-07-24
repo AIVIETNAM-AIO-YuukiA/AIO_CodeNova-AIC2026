@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -21,6 +22,8 @@ from agent.brain import BrainResponse
 from agent.tools import Tool
 
 LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_MODEL = os.environ.get("INTERNVL_MODEL", "OpenGVLab/InternVL3-2B-hf")
 
 
 # ---------------------------------------------------------------------------
@@ -80,27 +83,26 @@ def get_internvl_model_and_processor(model_name: str):
 # Inference Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_text_inference(
     model,
     processor,
     prompt: str,
     max_new_tokens: int = 512,
-    do_sample: bool = True,
-    temperature: float = 0.3,
+    do_sample: bool = False,
+    temperature: float = 0.0,
 ) -> str:
     """Run text-only inference (no image)."""
     messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     text = processor.apply_chat_template(messages, add_generation_prompt=True)
     inputs = processor(text=[text], return_tensors="pt").to(model.device)
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-        )
+        generate_kwargs = {"max_new_tokens": max_new_tokens, "do_sample": do_sample}
+        if do_sample:
+            generate_kwargs["temperature"] = temperature
+        outputs = model.generate(**inputs, **generate_kwargs)
     return processor.decode(
-        outputs[0][inputs["input_ids"].shape[1]:],
+        outputs[0][inputs["input_ids"].shape[1] :],
         skip_special_tokens=True,
     ).strip()
 
@@ -111,8 +113,8 @@ def _run_image_inference(
     image: Image.Image,
     prompt: str,
     max_new_tokens: int = 128,
-    do_sample: bool = True,
-    temperature: float = 0.3,
+    do_sample: bool = False,
+    temperature: float = 0.0,
 ) -> str:
     """Run image + text inference."""
     # Resize image to prevent massive patch generation (and OOM)
@@ -139,14 +141,12 @@ def _run_image_inference(
     if "pixel_values" in inputs:
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
     with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-        )
+        generate_kwargs = {"max_new_tokens": max_new_tokens, "do_sample": do_sample}
+        if do_sample:
+            generate_kwargs["temperature"] = temperature
+        outputs = model.generate(**inputs, **generate_kwargs)
     return processor.decode(
-        outputs[0][inputs["input_ids"].shape[1]:],
+        outputs[0][inputs["input_ids"].shape[1] :],
         skip_special_tokens=True,
     ).strip()
 
@@ -182,10 +182,11 @@ Example of Answering:
 # Brain
 # ---------------------------------------------------------------------------
 
+
 class InternVLBrain:
     """ReAct brain powered by InternVL3-2B-hf (text-only reasoning step)."""
 
-    def __init__(self, model_name: str = "OpenGVLab/InternVL3-2B-hf") -> None:
+    def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
         self.model_name = model_name
 
     def reset(self) -> None:
@@ -203,8 +204,7 @@ class InternVLBrain:
         context = f"Question: {question}\nShot info: {shot_info}\nFrames available: {frame_count}\n"
         if tool_results:
             obs = "\n".join(
-                f"Tool {r.get('tool', '?')} returned: {r.get('result', '')}"
-                for r in tool_results
+                f"Tool {r.get('tool', '?')} returned: {r.get('result', '')}" for r in tool_results
             )
             context += f"\nPrevious observations:\n{obs}"
 
@@ -248,13 +248,14 @@ class InternVLBrain:
 # Tools
 # ---------------------------------------------------------------------------
 
+
 class InternVLCaptionTool(Tool):
     """Describe an image in detail using InternVL."""
 
     name = "caption"
     description = "Describe an image in detail. Input: image_path. Output: detailed description."
 
-    def __init__(self, model_name: str = "OpenGVLab/InternVL3-2B-hf") -> None:
+    def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
         self.model_name = model_name
 
     def run(self, image_path: str = "", prompt: str = "") -> str:
@@ -285,7 +286,7 @@ class InternVLOCRTool(Tool):
     name = "ocr"
     description = "Read all visible text from an image. Input: image_path. Output: extracted text."
 
-    def __init__(self, model_name: str = "OpenGVLab/InternVL3-2B-hf") -> None:
+    def __init__(self, model_name: str = _DEFAULT_MODEL) -> None:
         self.model_name = model_name
 
     def run(self, image_path: str = "") -> str:
@@ -302,9 +303,7 @@ class InternVLOCRTool(Tool):
         try:
             model, processor = get_internvl_model_and_processor(self.model_name)
             image = Image.open(image_path).convert("RGB")
-            return _run_image_inference(
-                model, processor, image, prompt, do_sample=False
-            )
+            return _run_image_inference(model, processor, image, prompt, do_sample=False)
         except Exception as exc:
             LOGGER.exception("InternVLOCRTool failed")
             return f"[OCR error: {exc}]"
@@ -314,7 +313,8 @@ class InternVLOCRTool(Tool):
 # Factory
 # ---------------------------------------------------------------------------
 
-def internvl_default_tools(model_name: str = "OpenGVLab/InternVL3-2B-hf") -> dict[str, Tool]:
+
+def internvl_default_tools(model_name: str = _DEFAULT_MODEL) -> dict[str, Tool]:
     """Return the default InternVL tool set."""
     return {
         "caption": InternVLCaptionTool(model_name=model_name),

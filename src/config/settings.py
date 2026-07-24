@@ -45,7 +45,7 @@ class PipelineConfig:
     data_dir: Path = Path("data")
     runs_dir: Path = Path("runs")
     pipeline: str = "retrieval"
-    embedding_model: str = "siglip2-large"
+    embedding_models: tuple[str, ...] = ("siglip2-large",)
     frame_sampling: str = "shot-percentile"
     index_backend: str = "qdrant"
     keyframe_percentiles: tuple[float, ...] = (0.15, 0.5, 0.85)
@@ -56,7 +56,7 @@ class PipelineConfig:
         """Return stable config values used for hashing and run metadata."""
         return {
             "pipeline": slugify(self.pipeline),
-            "embedding_model": slugify(self.embedding_model),
+            "embedding_models": ",".join(slugify(m) for m in self.embedding_models),
             "frame_sampling": slugify(self.frame_sampling),
             "index_backend": slugify(self.index_backend),
             "keyframe_percentiles": ",".join(str(p) for p in self.keyframe_percentiles),
@@ -75,7 +75,7 @@ class PipelineConfig:
         parts = [
             current.strftime("%Y%m%d"),
             slugify(self.pipeline),
-            slugify(self.embedding_model),
+            "-".join(slugify(m) for m in self.embedding_models),
             slugify(self.frame_sampling),
             slugify(self.index_backend),
             self.config_hash(),

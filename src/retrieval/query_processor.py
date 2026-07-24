@@ -50,6 +50,7 @@ class LlmQueryProcessor(QueryProcessor):
             return True
         try:
             from google import genai
+
             self._client = genai.Client(api_key=self.api_key)
             self._initialized = True
             return True
@@ -65,14 +66,14 @@ class LlmQueryProcessor(QueryProcessor):
         prompt = f"""
         You are an expert query processor for a video retrieval system.
         Your task is to analyze the user query (which might be in Vietnamese or English) and output a JSON object with the following fields:
-        
+
         1. "visual_prompt": If the query is in Vietnamese, translate it to English. Then rewrite it as a natural, easy-to-understand visual search prompt for SigLIP-based video retrieval. Stay as close as possible to the user's original query. Preserve all entities and intent exactly. Do not add, infer, or invent any actions, objects, people, locations, events, attributes, camera details, lighting, colors, or other visual elements that are not explicitly mentioned in the query. Only rephrase for clarity and naturalness. Keep the output concise (max 50 words).
         2. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
         3. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
         4. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor), or "action", if explicitly mentioned.
-        
+
         User Query: "{query}"
-        
+
         Output JSON format:
         {{
             "visual_prompt": "string",
@@ -85,12 +86,11 @@ class LlmQueryProcessor(QueryProcessor):
         """
         try:
             from google.genai import types
+
             response = self._client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                )
+                config=types.GenerateContentConfig(response_mime_type="application/json"),
             )
             data = json.loads(response.text.strip())
             return ProcessedQuery(
@@ -111,6 +111,6 @@ def get_query_processor() -> QueryProcessor:
     if not api_key:
         LOGGER.info("GEMINI_API_KEY environment variable not set. Using PassThroughQueryProcessor.")
         return PassThroughQueryProcessor()
-    
+
     LOGGER.info("GEMINI_API_KEY found. Using LlmQueryProcessor.")
     return LlmQueryProcessor(api_key=api_key)

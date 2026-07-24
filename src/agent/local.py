@@ -141,7 +141,7 @@ You have access to these tools:
 2. ocr(image_path): Extract all visible written text, words, numbers, and signs from the image.
 
 Rules:
-- Read the question carefully. 
+- Read the question carefully.
 - If the question asks for names, exact text, poetry, or numbers -> YOU MUST use the `ocr` tool.
 - If the question asks for visual descriptions, colors, or actions -> YOU MUST use the `caption` tool.
 - Input format for tools: {"image_path": "file.jpg"}

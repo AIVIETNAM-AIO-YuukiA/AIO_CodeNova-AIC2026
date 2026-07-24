@@ -22,6 +22,9 @@ dependencies = [
     "timm>=1.0.0",
     "sentencepiece>=0.2.0",
     "bitsandbytes>=0.46.1",
+    "fairscale>=0.4.13",
+    "vllm",
+    "sentence-transformers>=5.6.0",
 ]
 
 [project.optional-dependencies]
@@ -47,13 +50,22 @@ dev = [
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu128"
 
+[[tool.uv.index]]
+name = "vllm-nightly"
+url = "https://wheels.vllm.ai/nightly"
+explicit = true
+
+[tool.uv.sources]
+vllm = { index = "vllm-nightly" }
+
 [tool.uv]
 index-strategy = "unsafe-best-match"
+torch-backend = "auto"
 
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
-exclude = ["external"]
+exclude = ["external", "src/modules/embedding/_beit3_vendor"]
 
 [tool.hatch.build.targets.wheel]
 packages = [

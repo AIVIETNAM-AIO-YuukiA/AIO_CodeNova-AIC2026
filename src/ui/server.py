@@ -46,7 +46,9 @@ def serve_ui(
         server.server_close()
 
 
-def build_handler(experiment: Experiment, retriever, default_top_k: int, reranker=None, reranker_top_k: int = 10):
+def build_handler(
+    experiment: Experiment, retriever, default_top_k: int, reranker=None, reranker_top_k: int = 10
+):
     """Create a request handler bound to one experiment and its retriever."""
 
     class RetrievalUiHandler(BaseHTTPRequestHandler):
@@ -69,14 +71,14 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
 
-            # TRAKE track: CLIP → Rerank (optional) → Temporal → event segments
+            # TRAKE track: Embedding search → Rerank (optional) → Temporal → event segments
             if parsed.path == "/api/trake-search":
                 try:
                     payload = self._read_json()
                     top_k = int(payload.get("top_k") or default_top_k)
                     req_reranker_top_k = payload.get("reranker_top_k")
                     req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
-                    
+
                     result = trake_search(
                         experiment=experiment,
                         query=str(payload.get("query", "")),
@@ -98,7 +100,7 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
-            # VQA track uses full pipeline (CLIP → Temporal → Agent)
+            # VQA track uses full pipeline (Embedding search → Temporal → Agent)
             if parsed.path == "/api/vqa-search":
                 try:
                     payload = self._read_json()
@@ -145,9 +147,11 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int, reranke
 
                 retrieval_text = build_retrieval_text(request)
                 results = retriever.search(query=retrieval_text, top_k=top_k)
-                
+
                 if reranker and req_reranker_top_k:
-                    results = reranker.rerank(query=retrieval_text, results=results)[:req_reranker_top_k]
+                    results = reranker.rerank(query=retrieval_text, results=results)[
+                        :req_reranker_top_k
+                    ]
 
                 self._send_json(
                     {
@@ -449,7 +453,7 @@ INDEX_HTML = r"""<!doctype html>
           <div id="sidebar-answer-text" style="margin-top: 4px; font-size: 15px; font-weight: 700; color: var(--accent-strong); line-height: 1.4;"></div>
         </div>
       </form>
-      <p class="hint">VQA: 3-stage pipeline (CLIP → Temporal → Agent). TRAKE: temporal search + event grouping. Textual/Video KIS: CLIP search only.</p>
+      <p class="hint">VQA: 3-stage pipeline (Embedding search → Temporal → Agent). TRAKE: temporal search + event grouping. Textual/Video KIS: embedding search only.</p>
       <div id="status" class="status">Ready.</div>
     </aside>
     <section>
@@ -489,7 +493,7 @@ INDEX_HTML = r"""<!doctype html>
         question: form.question.value,
         top_k: Number(form.top_k.value || 20)
       };
-      
+
       if (track === "vqa") {
           payload.vqa_backend = form.vqa_backend.value;
       }
@@ -559,13 +563,13 @@ INDEX_HTML = r"""<!doctype html>
       const pipeline = data.pipeline || {};
       const hasAgent = pipeline.agent;
       const stages = hasAgent ? [
-        { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
+        { key: "embed_search", label: "Embedding Search", desc: `Top-${pipeline.embed_search?.top_k} frames retrieved` },
         { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
         { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.shots_count || 0} valid shots gathered` },
         { key: "shot_validation", label: "Shot Validation", desc: `Score: ${(pipeline.shot_validation?.validation_score || 0).toFixed(4)}` },
         { key: "agent", label: "Agent (Gemini)", desc: `Answer: ${(pipeline.agent?.answer || "N/A").substring(0, 100)}` },
       ] : [
-        { key: "clip_search", label: "CLIP Search", desc: `Top-${pipeline.clip_search?.top_k} frames retrieved` },
+        { key: "embed_search", label: "Embedding Search", desc: `Top-${pipeline.embed_search?.top_k} frames retrieved` },
         { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
         { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.shots_count || 0} valid shots gathered` },
       ];
@@ -644,7 +648,7 @@ INDEX_HTML = r"""<!doctype html>
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
     }
-    
+
     // Toggle VQA settings visibility
     form.track.addEventListener('change', (e) => {
       document.getElementById('vqa-settings').style.display = e.target.value === 'vqa' ? 'block' : 'none';

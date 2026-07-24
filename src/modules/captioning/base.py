@@ -1,7 +1,7 @@
 """Captioning interface.
 
-Stub only: defines the contract so an InternVL3 / Qwen2.5-VL backend can be
-added later without touching the indexing or retrieval layers.
+See ``modules/captioning/vllm.py`` for the concrete backend (self-hosted
+vLLM, OpenAI-compatible chat-completions API).
 """
 
 from __future__ import annotations

@@ -17,7 +17,9 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 
 .PHONY: help sync install-hooks lint format check test pre-commit \
         qdrant-up qdrant-down qdrant-health \
-        ingest detect-shots extract-frames embed-frames build-index pipeline \
+        elasticsearch-up elasticsearch-health \
+        vllm-retrieval vllm-index vllm-down vllm-health \
+        ingest detect-shots extract-frames embed-frames build-index extract-text pipeline \
         search serve-ui clean-runs clean
 
 help: ## Show this help
@@ -57,6 +59,27 @@ qdrant-down: ## Stop Qdrant
 qdrant-health: ## Check Qdrant health
 	curl -sf http://localhost:6333/healthz && echo
 
+## --- Elasticsearch (OCR/ASR full-text index) ---
+elasticsearch-up: ## Start Elasticsearch + Elasticvue via docker compose
+	docker compose up -d elasticsearch elasticvue
+
+elasticsearch-health: ## Check Elasticsearch health
+	curl -sf http://localhost:8882 && echo
+
+## --- vLLM (self-hosted VLM; same port, only run one at a time — same GPU) ---
+vllm-retrieval: ## Start Qwen3.5-9B for online agent/retrieval tasks
+	docker compose --profile retrieval up -d vllm-retrieval
+
+vllm-index: ## Start Qwen3.6-35B-A3B for offline captioning/OCR indexing
+	docker compose --profile index up -d vllm-index
+
+vllm-down: ## Stop whichever vLLM service is running (without touching other services)
+	docker compose stop vllm-retrieval vllm-index
+	docker compose rm -f vllm-retrieval vllm-index
+
+vllm-health: ## Check vLLM health (whichever model is running)
+	curl -sf http://localhost:8881/v1/models && echo
+
 ## --- Offline indexing pipeline ---
 ingest: ## Discover videos (INPUT, EXP; RESUME=1 to reuse an existing run)
 	uv run codenova ingest --input $(INPUT) --experiment-name $(EXP) $(if $(RESUME),--resume)
@@ -69,13 +92,16 @@ detect-shots: ## Detect shots with TransNetV2 (EXP)
 extract-frames: ## Extract keyframes (EXP)
 	uv run codenova extract-frames --experiment-name $(EXP)
 
-embed-frames: ## Embed keyframes with CLIP (EXP)
+embed-frames: ## Embed keyframes: SigLIP2/BEiT-3/Vietnamese caption embedding (EXP)
 	uv run codenova embed-frames --experiment-name $(EXP)
 
 build-index: ## Build the Qdrant index (EXP); needs Qdrant running
 	uv run codenova build-index --experiment-name $(EXP)
 
-pipeline: ingest detect-shots extract-frames embed-frames build-index ## Run the full offline pipeline
+extract-text: ## Run OCR + ASR, index into Elasticsearch (EXP); needs Elasticsearch + `make vllm-index` running
+	uv run codenova extract-text --experiment-name $(EXP)
+
+pipeline: ingest detect-shots extract-frames embed-frames build-index ## Run the full offline pipeline (vector index only; run extract-text separately for OCR/ASR)
 
 ## --- Online retrieval ---
 search: ## Search by text (EXP, QUERY, TOPK)

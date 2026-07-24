@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from core.types import SearchResult
@@ -9,6 +10,10 @@ from modules.reranker.base import Reranker
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "Salesforce/blip2-itm-vit-g"
+
+
+def _default_model_name() -> str:
+    return os.environ.get("BLIP2_RERANKER_MODEL", _DEFAULT_MODEL)
 
 
 class Blip2ItmReranker(Reranker):
@@ -21,11 +26,11 @@ class Blip2ItmReranker(Reranker):
 
     def __init__(
         self,
-        model_name: str = _DEFAULT_MODEL,
+        model_name: str | None = None,
         device: str = "auto",
         batch_size: int = 8,
     ) -> None:
-        self.model_name = model_name
+        self.model_name = model_name or _default_model_name()
         self.device = device
         self.batch_size = batch_size
         # Lazy-loaded on first call to rerank() to avoid startup cost.
@@ -55,7 +60,7 @@ class Blip2ItmReranker(Reranker):
                 normalized_path = r.frame_path.replace("\\", "/")
                 if Path(normalized_path).exists():
                     valid_results.append(r)
-        
+
         missing = len(results) - len(valid_results)
         if missing > 0:
             LOGGER.warning("Reranker: skipping %d results with missing frame_path.", missing)
@@ -153,12 +158,14 @@ class Blip2ItmReranker(Reranker):
                 "Install with: uv add transformers"
             ) from exc
 
-        resolved = "cuda" if (self.device == "auto" and torch.cuda.is_available()) else (
-            self.device if self.device != "auto" else "cpu"
+        resolved = (
+            "cuda"
+            if (self.device == "auto" and torch.cuda.is_available())
+            else (self.device if self.device != "auto" else "cpu")
         )
 
         processor = AutoProcessor.from_pretrained(self.model_name)
-        
+
         # Load model using accelerate's device_map to offload to RAM if VRAM is insufficient (e.g. RTX 2050 4GB)
         kwargs = {}
         if resolved == "cuda":
@@ -166,12 +173,9 @@ class Blip2ItmReranker(Reranker):
             kwargs["torch_dtype"] = torch.float16
         else:
             kwargs["torch_dtype"] = torch.float32
-            
-        model = Blip2ForImageTextRetrieval.from_pretrained(
-            self.model_name,
-            **kwargs
-        ).eval()
-        
+
+        model = Blip2ForImageTextRetrieval.from_pretrained(self.model_name, **kwargs).eval()
+
         if resolved != "cuda":
             model = model.to(resolved)
 

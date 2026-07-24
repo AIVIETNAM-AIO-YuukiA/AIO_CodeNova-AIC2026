@@ -41,13 +41,12 @@ def build_reranker(
     if model_name is None:
         return None
 
-    from modules.reranker.blip2_itm import Blip2ItmReranker
+    from modules.reranker.blip2_itm import Blip2ItmReranker, _default_model_name
 
-    # Map short aliases to canonical HuggingFace model IDs.
-    _ALIASES = {
-        "blip2-itm":       "Salesforce/blip2-itm-vit-g",
-        "blip2-itm-vit-g": "Salesforce/blip2-itm-vit-g",
-    }
-    resolved_name = _ALIASES.get(model_name.lower(), model_name)
+    # Short aliases resolve to BLIP2_RERANKER_MODEL (env, falling back to the
+    # canonical HF ID) rather than a hardcoded ID, so the env var is the
+    # single source of truth for which BLIP-2 checkpoint is used.
+    _ALIASES = {"blip2-itm", "blip2-itm-vit-g"}
+    resolved_name = _default_model_name() if model_name.lower() in _ALIASES else model_name
     LOGGER.info("Reranker: initializing '%s'", resolved_name)
     return Blip2ItmReranker(model_name=resolved_name, device=device, batch_size=batch_size)

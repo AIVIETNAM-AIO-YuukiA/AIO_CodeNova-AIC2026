@@ -1,7 +1,7 @@
 """OCR interface.
 
-Stub only: defines the contract so a PaddleOCR / Gemini-OCR backend can be
-added later without touching the indexing or retrieval layers.
+See ``modules/ocr/vllm.py`` for the concrete backend (self-hosted vLLM,
+same server as captioning but a dedicated text-only-extraction prompt).
 """
 
 from __future__ import annotations

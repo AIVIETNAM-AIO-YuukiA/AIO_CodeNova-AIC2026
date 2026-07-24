@@ -6,7 +6,7 @@ Dựa trên thuật toán Adaptive Temporal Search trong tài liệu training:
   - Khi tolerance == threshold → kết thúc segment
 
 Pipeline:
-  CLIP search → top-K frames → Temporal search (mỗi frame) → Segments →
+  Embedding search → top-K frames → Temporal search (mỗi frame) → Segments →
   Gather shot → Shot validation → Agent (VQA) / Events (TRAKE)
 """
 
@@ -33,7 +33,7 @@ class ShotInput:
     frame_count: int = 0
     start_timestamp: float | None = None
     end_timestamp: float | None = None
-    clip_score: float = 0.0
+    sim_score: float = 0.0
     temporal_score: float = 0.0
     validation_score: float = 0.0
     validated: bool = False
@@ -160,7 +160,9 @@ def find_segments(
 
     for idx in start_indices:
         end_pos = temporal_search_forward(idx, frame_embeddings, frame_records, tolerance_threshold)
-        start_pos = temporal_search_backward(idx, frame_embeddings, frame_records, tolerance_threshold)
+        start_pos = temporal_search_backward(
+            idx, frame_embeddings, frame_records, tolerance_threshold
+        )
         raw_segments.append((start_pos, end_pos, idx))
 
     if not raw_segments:
@@ -236,7 +238,7 @@ def gather_frame_s(
         frame_count=len(selected),
         start_timestamp=timestamps[0] if timestamps else None,
         end_timestamp=timestamps[-1] if timestamps else None,
-        clip_score=0.0,
+        sim_score=0.0,
     )
 
 
@@ -304,11 +306,11 @@ class ShotValidator:
     def __init__(
         self,
         min_frames: int = 2,
-        min_clip_score: float = 0.15,
+        min_sim_score: float = 0.15,
         temporal_weight: float = 0.3,
     ) -> None:
         self.min_frames = min_frames
-        self.min_clip_score = min_clip_score
+        self.min_sim_score = min_sim_score
         self.temporal_weight = temporal_weight
 
     def validate(
@@ -322,7 +324,7 @@ class ShotValidator:
 
         Args:
             shot: ShotInput cần validate.
-            query_embedding: CLIP text embedding của query.
+            query_embedding: text embedding của query (SigLIP hoặc BEiT-3).
             all_embeddings: Tất cả frame embeddings [N x D].
             all_records: Tất cả frame records (cùng thứ tự với embeddings).
 
@@ -349,11 +351,11 @@ class ShotValidator:
             shot.validated = False
             return shot
 
-        # 1. CLIP score trung bình của shot với query
+        # 1. Embedding score trung bình của shot với query
         shot_embs = all_embeddings[indices]
         shot_embs = shot_embs / (np.linalg.norm(shot_embs, axis=1, keepdims=True) + 1e-12)
-        clip_sims = shot_embs @ q
-        avg_clip = float(np.mean(clip_sims))
+        sim_scores = shot_embs @ q
+        avg_sim = float(np.mean(sim_scores))
 
         # 2. Temporal consistency
         timestamps = [
@@ -369,17 +371,17 @@ class ShotValidator:
         # 3. Composite score
         composite = (
             1 - self.temporal_weight
-        ) * avg_clip + self.temporal_weight * temporal_consistency
+        ) * avg_sim + self.temporal_weight * temporal_consistency
 
-        shot.clip_score = avg_clip
+        shot.sim_score = avg_sim
         shot.temporal_score = temporal_consistency
         shot.validation_score = composite
-        shot.validated = composite >= self.min_clip_score
+        shot.validated = composite >= self.min_sim_score
 
         LOGGER.info(
-            "Shot validation: frames=%d clip=%.4f temporal=%.4f composite=%.4f validated=%s",
+            "Shot validation: frames=%d sim=%.4f temporal=%.4f composite=%.4f validated=%s",
             shot.frame_count,
-            avg_clip,
+            avg_sim,
             temporal_consistency,
             composite,
             shot.validated,

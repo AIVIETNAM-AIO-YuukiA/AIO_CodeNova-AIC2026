@@ -1,10 +1,11 @@
 # Video Retrieval Pipeline
 
-Resumable video retrieval pipeline using shot decomposition and CLIP-style semantic search.
+Resumable video retrieval pipeline using shot decomposition and SigLIP2/BEiT-3
+semantic search.
 
-Videos are split into shots, sampled into keyframes, embedded with CLIP, and indexed
-in Qdrant. Text queries are embedded and matched against keyframes for known-item
-search (KIS).
+Videos are split into shots, sampled into keyframes, embedded with SigLIP2 and/or
+BEiT-3, and indexed in Qdrant. Text queries are embedded and matched against keyframes
+for known-item search (KIS).
 
 > 🇻🇳 Tài liệu tiếng Việt: [docs/vi/README.md](docs/vi/README.md)
 
@@ -15,7 +16,7 @@ OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
 
 ONLINE (retrieval)
-  text query → CLIP embed → Qdrant search → hydrate metadata → results
+  text query → embed (SigLIP2/BEiT-3) → Qdrant search → hydrate metadata → results
 ```
 
 ## Project layout
@@ -28,7 +29,8 @@ src/
   video/          # video discovery, shot detection, frame extraction (OpenCV/TransNetV2)
   indexing/       # offline pipeline stages + manifests + SQLite job state
   retrieval/      # online search: Retriever, metadata hydration, contest tracks
-  modules/        # AI models: embedding (CLIP) + stubs (asr/ocr/captioning/detection/reranker)
+  modules/        # AI models: embedding (SigLIP2, BEiT-3), reranker (BLIP-2 ITM),
+                  #   stubs (asr/ocr/captioning/detection)
   stores/
     vector/       # Qdrant vector index (interface + backend + factory)
     text/         # Elasticsearch full-text index (interface + backend, not yet wired in)
@@ -42,7 +44,7 @@ docs/             # documentation (English) + docs/vi (Vietnamese)
 ## Requirements
 
 - Python ≥ 3.13, managed with [uv](https://docs.astral.sh/uv/)
-- NVIDIA GPU + CUDA (CLIP and TransNetV2 require CUDA when `--device auto`)
+- NVIDIA GPU + CUDA (SigLIP2, BEiT-3, and TransNetV2 require CUDA when `--device auto`)
 - Docker (for Qdrant)
 - TransNetV2 PyTorch weights (see [docs/transnetv2.md](docs/transnetv2.md))
 
@@ -120,7 +122,7 @@ Key pipeline options (CLI flags, defaults shown):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--clip-model` | `clip-vit-b-32` | CLIP model for embeddings |
+| `--embedding-models` | `siglip2-large` | Comma-separated embedding model(s) (`siglip2-large`, `beit3-*`); multiple models enable SRRF fusion + BLIP-2 rerank |
 | `--frame-sampling` | `shot-percentile` | Keyframe sampling strategy |
 | `--keyframe-percentiles` | `0.15,0.5,0.85` | Where in each shot to sample keyframes |
 | `--index-backend` | `qdrant` | Vector index backend |

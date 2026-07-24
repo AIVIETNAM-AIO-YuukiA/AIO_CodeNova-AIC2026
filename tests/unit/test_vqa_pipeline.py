@@ -17,8 +17,7 @@ def mock_experiment(tmp_path: Path) -> Experiment:
     run_dir = tmp_path / "runs" / "test"
     run_dir.mkdir(parents=True)
     config = MagicMock()
-    config.clip_model = "ViT-B/32"
-    config.embedding_model = "ViT-B/32"
+    config.embedding_models = ("siglip2-large",)
     config.device = "cpu"
     config.data_dir = tmp_path / "data"
     return Experiment(name="test", run_dir=run_dir, config=config)
@@ -90,7 +89,7 @@ class TestVqaSearch:
                 frame_count=5,
                 start_timestamp=4.0,
                 end_timestamp=12.0,
-                clip_score=0.75,
+                sim_score=0.75,
             )
             mock_gather.return_value = mock_shot
 
@@ -111,7 +110,7 @@ class TestVqaSearch:
         assert "results" in result
         assert len(result["results"]) == 5
         assert "pipeline" in result
-        assert "clip_search" in result["pipeline"]
+        assert "embed_search" in result["pipeline"]
         assert "temporal_search" in result["pipeline"]
         assert "gather_shot" in result["pipeline"]
         assert "shot_validation" in result["pipeline"]
