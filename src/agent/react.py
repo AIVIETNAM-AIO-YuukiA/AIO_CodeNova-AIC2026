@@ -64,6 +64,15 @@ class Agent:
         tool_results: list[dict] = []
         first_frame_path = shot.frame_paths[len(shot.frame_paths) // 2] if shot.frame_paths else ""
 
+        # Inject frame paths into InternVLBrain so it can do direct visual inference.
+        if hasattr(self.brain, "set_frame_paths") and shot.frame_paths:
+            LOGGER.info(
+                "Agent: injecting %d frame paths into brain. sample=%s",
+                len(shot.frame_paths),
+                shot.frame_paths[len(shot.frame_paths) // 2] if shot.frame_paths else "N/A",
+            )
+            self.brain.set_frame_paths(list(shot.frame_paths))
+
         for step in range(1, self.max_steps + 1):
             LOGGER.info("Agent step %d/%d", step, self.max_steps)
 

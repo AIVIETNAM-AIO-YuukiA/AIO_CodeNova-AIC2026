@@ -91,9 +91,14 @@ def test_rerank_logic(mock_score_batch, mock_load, tmp_path):
     # Should only return the 2 valid results
     assert len(reranked) == 2
 
-    # Should be sorted by score descending (vid3 got 0.9, vid1 got 0.1)
+    # rerank() blends ITM score with normalized CLIP score (hybrid formula,
+    # itm_weight=0.6 default) rather than returning the raw ITM score — see
+    # Blip2ItmReranker's docstring. valid_results are [vid1 (clip=0.8), vid3
+    # (clip=0.7)], itm_scores are [0.1, 0.9] in that order, so:
+    #   vid3: clip_norm=0.0 (min of the pool) -> hybrid = 0.6*0.9 + 0.4*0 = 0.54
+    #   vid1: clip_norm=1.0 (max of the pool) -> hybrid = 0.6*0.1 + 0.4*1 = 0.46
     assert reranked[0].video_name == "vid3"
-    assert reranked[0].score == 0.9
+    assert reranked[0].score == 0.54
 
     assert reranked[1].video_name == "vid1"
-    assert reranked[1].score == 0.1
+    assert reranked[1].score == 0.46
