@@ -22,4 +22,9 @@ __all__ = [
     "DetectTool",
     "ASRTool",
     "default_tools",
+    "LocalBrain",
+    "LocalCaptionTool",
+    "LocalOCRTool",
+    "is_ollama_running",
+    "local_default_tools",
 ]

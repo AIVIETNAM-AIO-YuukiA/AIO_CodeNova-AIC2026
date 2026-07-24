@@ -13,8 +13,11 @@ import mimetypes
 from config.settings import Experiment
 from core.types import SearchResult
 from retrieval.vqa import vqa_search, trake_search
+from retrieval.kis_detail_search import kis_detail_search
 from retrieval import build_retriever
+from retrieval.temporal_search import load_temporal_data
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
+import numpy as np
 
 LOGGER = get_logger(__name__)
 
@@ -115,6 +118,9 @@ def build_handler(
             if parsed.path == "/frame":
                 self._send_frame(parse_qs(parsed.query).get("path", [""])[0])
                 return
+            if parsed.path == "/api/video-shots":
+                self._send_video_shots(parse_qs(parsed.query))
+                return
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
         def do_POST(self) -> None:
@@ -145,7 +151,7 @@ def build_handler(
                         ]
                     self._send_json(result)
                 except Exception as exc:
-                    LOGGER.exception("TRAKE search failed")
+                    LOGGER.exception("KIS Detail search failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -175,6 +181,63 @@ def build_handler(
                     self._send_json(result)
                 except Exception as exc:
                     LOGGER.exception("VQA search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # KIS Detail: in-memory multi-concept sum fusion (independent of TRAKE)
+            if parsed.path == "/api/kis-detail":
+                try:
+                    payload = self._read_json()
+                    subqueries_raw = payload.get("subqueries")
+                    if not isinstance(subqueries_raw, list) or len(subqueries_raw) < 1:
+                        raise ValueError("At least 1 subquery is required.")
+                    subqueries = [str(s).strip() for s in subqueries_raw if str(s).strip()]
+                    result = kis_detail_search(
+                        experiment=experiment,
+                        subqueries=subqueries,
+                        top_k=300,
+                    )
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("KIS Detail search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # Compute sub-detail score for a specific frame (live)
+            if parsed.path == "/api/compute-sub-score":
+                try:
+                    payload = self._read_json()
+                    frame_id = payload.get("frame_id")
+                    sub_text = payload.get("sub_text")
+                    if not frame_id or not sub_text:
+                        raise ValueError("frame_id and sub_text are required.")
+
+                    frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+                    idx = None
+                    for i, rec in enumerate(frame_records):
+                        if rec.get("frame_id") == frame_id:
+                            idx = i
+                            break
+                    if idx is None:
+                        self._send_json(
+                            {"error": "frame_id not found"}, status=HTTPStatus.NOT_FOUND
+                        )
+                        return
+
+                    frame_vec = frame_embeddings[idx]
+                    sub_vec = np.asarray(
+                        retriever.embedder.embed_text(sub_text), dtype="float32"
+                    ).flatten()
+                    nrm = np.linalg.norm(sub_vec)
+                    if nrm > 1e-12:
+                        sub_vec /= nrm
+                    score = float(frame_vec @ sub_vec)
+                    self._send_json({"score": round(score, 4)})
+                except Exception as exc:
+                    LOGGER.exception("compute-sub-score failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -258,6 +321,77 @@ def build_handler(
             self.end_headers()
             self.wfile.write(content)
 
+        def _send_video_shots(self, query: dict) -> None:
+            video_id = query.get("video_id", [""])[0]
+            if not video_id:
+                self._send_json({"error": "video_id required"}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            shots_path = experiment.run_dir / "manifests" / "shots.jsonl"
+            frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
+
+            try:
+                # Parse shots for this video
+                shots = []
+                with open(shots_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        shot = json.loads(line)
+                        if shot.get("video_id") == video_id:
+                            shots.append(shot)
+
+                # Parse frames for this video, grouped by shot_id
+                frames_by_shot: dict[str, list[dict]] = {}
+                with open(frames_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        frame = json.loads(line)
+                        if frame.get("video_id") == video_id:
+                            sid = frame.get("shot_id")
+                            if sid:
+                                frames_by_shot.setdefault(sid, []).append(frame)
+
+                shot_list = []
+                for shot in shots:
+                    sid = shot.get("shot_id")
+                    shot_frames = frames_by_shot.get(sid, [])
+                    shot_frames.sort(key=lambda x: x.get("frame_index", 0))
+
+                    # Pick 3 frames evenly distributed (or fewer if less available)
+                    if len(shot_frames) > 3:
+                        indices = [0, len(shot_frames) // 2, len(shot_frames) - 1]
+                        picked = [shot_frames[i] for i in indices]
+                    else:
+                        picked = shot_frames
+
+                    shot_data = {
+                        "shot_id": sid,
+                        "start_frame": shot.get("start_frame"),
+                        "end_frame": shot.get("end_frame"),
+                        "start_time_sec": shot.get("start_time_sec"),
+                        "end_time_sec": shot.get("end_time_sec"),
+                        "frames": [
+                            {
+                                "frame_id": f.get("frame_id"),
+                                "frame_index": f.get("frame_index"),
+                                "timestamp_sec": f.get("timestamp_sec"),
+                                "frame_path": f.get("frame_path"),
+                                "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
+                            }
+                            for f in picked
+                        ],
+                    }
+                    shot_list.append(shot_data)
+
+                self._send_json({"video_id": video_id, "shots": shot_list})
+            except Exception:
+                LOGGER.exception("Failed to load shots for video=%s", video_id)
+                self._send_json({"video_id": video_id, "shots": []})
+
     return RetrievalUiHandler
 
 
@@ -277,39 +411,16 @@ INDEX_HTML = r"""<!doctype html>
   <title>CodeNova Retrieval UI</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f7f7f4;
-      --panel: #ffffff;
-      --text: #1c1f24;
-      --muted: #667085;
-      --line: #d9dde3;
-      --accent: #0f766e;
-      --accent-strong: #115e59;
-      --warn: #a16207;
+      --bg: #f7f7f4; --panel: #ffffff; --text: #1c1f24;
+      --muted: #667085; --line: #d9dde3;
+      --accent: #0f766e; --accent-strong: #115e59; --warn: #a16207;
     }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      color: var(--text);
-      background: var(--bg);
-    }
-    header {
-      padding: 18px 24px 12px;
-      border-bottom: 1px solid var(--line);
-      background: var(--panel);
-    }
-    h1 { margin: 0; font-size: 20px; line-height: 1.2; }
-    main {
-      display: grid;
-      grid-template-columns: minmax(320px, 420px) 1fr;
-      min-height: calc(100vh - 61px);
-    }
-    aside {
-      padding: 18px;
-      border-right: 1px solid var(--line);
-      background: var(--panel);
-    }
+    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: var(--text); background: var(--bg); }
+    header { padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    h1 { margin: 0; font-size: 20px; }
+    main { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; min-height: calc(100vh - 61px); }
+    aside { padding: 18px; border-right: 1px solid var(--line); background: var(--panel); }
     section { padding: 18px; }
     label {
       display: block;
@@ -351,106 +462,81 @@ INDEX_HTML = r"""<!doctype html>
     }
     button:hover { background: var(--accent-strong); }
     button:disabled { opacity: .65; cursor: wait; }
-    .hint, .status {
-      margin-top: 12px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-    }
+    .hint, .status { margin-top: 12px; color: var(--muted); font-size: 13px; line-height: 1.45; }
     .status strong { color: var(--text); }
     .status.warn { color: var(--warn); }
-    .results {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-      gap: 14px;
-    }
-    .card {
-      overflow: hidden;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-    }
-    .card img {
-      width: 100%;
-      aspect-ratio: 16 / 9;
-      object-fit: cover;
-      display: block;
-      background: #e5e7eb;
-    }
-    .meta {
-      padding: 10px 11px 12px;
-      font-size: 13px;
-      line-height: 1.45;
-    }
-    .meta code {
-      display: block;
-      overflow-wrap: anywhere;
-      margin-top: 4px;
-      color: var(--muted);
-      font-size: 12px;
-    }
-    .pill {
-      display: inline-block;
-      padding: 2px 7px;
-      border-radius: 999px;
-      background: #e6f5f3;
-      color: var(--accent-strong);
-      font-size: 12px;
-      font-weight: 700;
-    }
-    .answer-box {
-      margin-bottom: 18px;
-      padding: 18px 20px;
-      border: 2px solid var(--accent);
-      border-radius: 10px;
-      background: #f0fdf8;
-    }
-    .answer-box .label {
-      font-size: 12px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: .05em;
-      color: var(--muted);
-    }
-    .answer-box .answer-text {
-      margin-top: 6px;
-      font-size: 18px;
-      font-weight: 700;
-      color: var(--accent-strong);
-      line-height: 1.45;
-    }
-    .pipeline-toggle {
-      margin-top: 10px;
-      background: none;
-      border: 1px solid var(--line);
-      padding: 6px 12px;
-      border-radius: 6px;
-      color: var(--muted);
-      cursor: pointer;
-      font-size: 12px;
-    }
+    .pill { display: inline-block; padding: 2px 7px; border-radius: 999px; background: #e6f5f3; color: var(--accent-strong); font-size: 12px; font-weight: 700; }
+    /* Results grid */
+    .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; }
+    .card { overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+    .card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #e5e7eb; cursor: zoom-in; }
+    .meta { padding: 10px 11px 12px; font-size: 13px; line-height: 1.45; }
+    .meta code { display: block; overflow-wrap: anywhere; margin-top: 4px; color: var(--muted); font-size: 12px; }
+    /* Answer / pipeline */
+    .answer-box { margin-bottom: 18px; padding: 18px 20px; border: 2px solid var(--accent); border-radius: 10px; background: #f0fdf8; }
+    .answer-box .label { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .answer-box .answer-text { margin-top: 6px; font-size: 18px; font-weight: 700; color: var(--accent-strong); line-height: 1.45; }
+    .pipeline-toggle { margin-top: 10px; background: none; border: 1px solid var(--line); padding: 6px 12px; border-radius: 6px; color: var(--muted); cursor: pointer; font-size: 12px; }
     .pipeline-toggle:hover { background: var(--panel); }
-    .pipeline-detail {
-      display: none;
-      margin-top: 10px;
-      padding: 14px 16px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      font-size: 13px;
-      line-height: 1.5;
-    }
+    .pipeline-detail { display: none; margin-top: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: 13px; line-height: 1.5; }
     .pipeline-detail.open { display: block; }
-    .pipeline-detail code {
-      display: block;
-      white-space: pre-wrap;
-      font-size: 12px;
-      color: var(--muted);
+    .pipeline-detail code { display: block; white-space: pre-wrap; font-size: 12px; color: var(--muted); }
+    /* TRAKE event card */
+    .video-block { margin-bottom: 20px; padding: 14px 16px; border: 2px solid var(--accent); border-radius: 10px; background: var(--panel); }
+    .video-block-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .event-grid { display: grid; gap: 10px; }
+    /* Each event card */
+    .ev-card { position: relative; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: #f0fdf8; }
+    .ev-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; background: #e5e7eb; cursor: zoom-in; transition: opacity .15s; }
+    .ev-card img:hover { opacity: .88; }
+    .ev-card .ev-info { padding: 5px 8px 6px; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+    /* Revert badge — shown only when thumbnail has been changed */
+    .ev-card .revert-badge {
+      display: none; position: absolute; top: 5px; right: 5px;
+      background: rgba(0,0,0,.65); color: #fff; border: none;
+      border-radius: 5px; padding: 3px 8px; font-size: 11px; font-weight: 600;
+      cursor: pointer; margin-top: 0; width: auto;
     }
-    @media (max-width: 860px) {
-      main { grid-template-columns: 1fr; }
-      aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    .ev-card .revert-badge:hover { background: rgba(0,0,0,.85); }
+    .ev-card.has-custom .revert-badge { display: block; }
+    .ev-card.has-custom { border-color: var(--accent); }
+    /* Modal */
+    #frame-modal {
+      display: none; position: fixed; inset: 0; z-index: 999;
+      background: rgba(0,0,0,.88); align-items: center; justify-content: center;
     }
+    #frame-modal.open { display: flex; }
+    .modal-box {
+      display: flex; flex-direction: column;
+      width: 95vw; height: 95vh; max-width: 1400px;
+      border-radius: 12px; overflow: hidden;
+      background: #1a1a1a; box-shadow: 0 8px 40px rgba(0,0,0,.6);
+    }
+    .modal-top {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px 14px; background: #222; color: #eee; font-size: 13px; flex-shrink: 0;
+    }
+    .modal-top .time-badge { color: #0f766e; font-weight: 600; }
+    .modal-top .close-x { background: none; border: none; color: #aaa; font-size: 22px; cursor: pointer; padding: 0 4px; margin-top: 0; width: auto; }
+    .modal-top .close-x:hover { color: #fff; background: none; }
+    .modal-mid { flex: 1; display: flex; align-items: stretch; padding: 6px; gap: 6px; min-height: 0; }
+    .modal-mid .img-area { flex: 1; display: flex; justify-content: center; align-items: center; min-height: 0; overflow: hidden; }
+    .modal-mid .img-area img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; display: block; }
+    .modal-nav { flex-shrink: 0; background: rgba(255,255,255,.1); border: 1px solid rgba(255,255,255,.2); color: #fff; font-size: 22px; cursor: pointer; padding: 0 14px; border-radius: 6px; display: flex; align-items: center; justify-content: center; margin-top: 0; width: auto; }
+    .modal-nav:hover { background: rgba(255,255,255,.25); }
+    .modal-nav:disabled { opacity: .25; cursor: default; }
+    .modal-strip { display: flex; justify-content: center; gap: 6px; padding: 6px 12px; background: #222; flex-wrap: wrap; flex-shrink: 0; }
+    .modal-strip img { width: 90px; height: 50px; object-fit: cover; border-radius: 4px; border: 2px solid transparent; cursor: pointer; flex-shrink: 0; }
+    .modal-strip img.active { border-color: #0f766e; }
+    .modal-bot { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; background: #222; color: #aaa; font-size: 12px; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+    .modal-bot .actions { display: flex; gap: 6px; }
+    .btn-setthumb { background: #0f766e; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; margin-top: 0; width: auto; }
+    .btn-setthumb:hover { background: #115e59; }
+    .btn-revert-modal { background: #555; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; font-weight: 600; cursor: pointer; margin-top: 0; width: auto; }
+    .btn-revert-modal:hover { background: #777; }
+    .btn-close-modal { background: #333; color: #ccc; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; margin-top: 0; width: auto; }
+    .btn-close-modal:hover { background: #444; }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid var(--line); } }
   </style>
 </head>
 <body>
@@ -534,14 +620,48 @@ INDEX_HTML = r"""<!doctype html>
       pipelineBox.innerHTML = "";
       sidebarAnswer.style.display = "none";
 
-      const track = form.track.value;
-      const payload = {
-        track: track,
-        query: form.query.value,
-        context: form.context.value,
-        question: form.question.value,
-        top_k: Number(form.top_k.value || 20)
-      };
+  // ─── TRAKE event inputs ───────────────────────────────────────────────────────
+  function eventCount() { return EVENTS_LIST.children.length; }
+  function addSubInput(btn) {
+    const wrapper = btn.closest(".event-wrapper");
+    if (!wrapper) return;
+    const container = wrapper.querySelector(".sub-inputs");
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:6px;margin:0 0 4px 28px;align-items:start;";
+    row.innerHTML = `
+      <textarea class="sub-detail-input" style="flex:1;min-height:36px;font-size:12px;" placeholder="Sub-detail..."></textarea>
+      <button type="button" style="width:auto;padding:2px 8px;margin-top:0;font-size:12px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.parentElement.remove()" title="Remove">✕</button>`;
+    container.appendChild(row);
+  }
+  function addEvent(value) {
+    const idx = eventCount() + 1;
+    const wrapper = document.createElement("div");
+    wrapper.className = "event-wrapper";
+    wrapper.style.cssText = "margin-bottom:8px;";
+    wrapper.innerHTML = `
+      <div style="display:flex;gap:6px;align-items:start;">
+        <textarea class="event-input" style="flex:1;min-height:56px;" placeholder="Event ${idx} description">${esc(value||"")}</textarea>
+        <button type="button" class="add-sub-btn" style="width:auto;padding:6px 10px;margin-top:0;font-size:16px;background:transparent;color:var(--accent);border-color:var(--accent);" onclick="addSubInput(this)" title="Add sub-detail">+</button>
+        <button type="button" style="width:auto;padding:6px 10px;margin-top:0;font-size:14px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.closest('.event-wrapper').remove()" title="Remove">✕</button>
+      </div>
+      <div class="sub-inputs"></div>`;
+    EVENTS_LIST.appendChild(wrapper);
+  }
+  eid("add-event-btn").addEventListener("click", () => addEvent(""));
+  eid("window-slider").addEventListener("input", () => {
+    eid("window-value").textContent = eid("window-slider").value;
+  });
+  function getEvents() {
+    return Array.from(EVENTS_LIST.querySelectorAll(".event-wrapper"))
+      .map(w => {
+        const textarea = w.querySelector(".event-input");
+        const text = textarea ? textarea.value.trim() : "";
+        if (!text) return null;
+        const subInputs = w.querySelectorAll(".sub-detail-input");
+        const sub_details = Array.from(subInputs).map(s => s.value.trim()).filter(Boolean);
+        return { text, sub_details };
+      }).filter(Boolean);
+  }
 
       if (track === "vqa") {
           payload.vqa_backend = form.vqa_backend.value;
@@ -556,8 +676,12 @@ INDEX_HTML = r"""<!doctype html>
       } else if (track === "trake") {
         endpoint = "/api/trake-search";
       } else {
-        endpoint = "/api/search";
+        STATUS.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${track==="textual_kis"?"KIS Basic":"Video KIS"}</span>`;
+        renderCards(data.results);
       }
+    } catch(err) { STATUS.className="status warn"; STATUS.textContent=err.message; }
+    finally { SUBMIT.disabled = false; }
+  });
 
       const TIMEOUT_MS = 300_000;  // 5 min — models pre-warm in background but may still need time
       const MAX_RETRIES = 1;       // No auto-retry: models are pre-warmed at startup, not on first request
@@ -694,8 +818,8 @@ INDEX_HTML = r"""<!doctype html>
           <div class="label">Answer</div>
           <div class="answer-text">${escapeHtml(answer)}</div>
         </div>
-      `;
-    }
+      </article>`).join("");
+  }
 
     function renderPipeline(data) {
       const pipeline = data.pipeline || {};
@@ -761,30 +885,166 @@ INDEX_HTML = r"""<!doctype html>
             <code>${escapeHtml(result.video_path || "")}</code>
             <code>${escapeHtml(result.frame_id || "")}</code>
           </div>
-        </article>
-      `).join("");
-    }
+          <div class="event-grid" style="grid-template-columns:repeat(${cols},1fr)">${evHtml}</div>
+        </div>`;
+    }).join("");
+  }
 
-    function formatTime(value) {
-      if (value === null || value === undefined) return "";
-      const seconds = Number(value);
-      const minutes = Math.floor(seconds / 60);
-      const rest = Math.round(seconds % 60);
-      return `${minutes}:${String(rest).padStart(2, "0")} (${seconds.toFixed(2)}s)`;
+  function revertCard(videoId, chainIdx, eventIdx) {
+    const key = trakeKey(videoId, chainIdx, eventIdx);
+    const st = thumbState[key];
+    if (!st) return;
+    st.currentUrl = st.originalUrl;
+    st.currentTimestamp = st.originalTimestamp;
+    st.currentFrameId = st.originalFrameId;
+    refreshCard(videoId, chainIdx, eventIdx);
+    STATUS.innerHTML = `<strong>Reverted</strong> Event ${eventIdx+1} to original <span class="pill">ORIGINAL</span>`;
+    // sync modal if it's open on this card
+    if (modal.open && modal.videoId===videoId && modal.chainIdx===chainIdx && modal.eventIdx===eventIdx) {
+      eid("btn-revert-modal").style.display = "none";
+      eid("btn-setthumb").textContent = "Làm thumbnail";
     }
+  }
 
-    function formatNumber(value) {
-      if (value === null || value === undefined) return "unknown";
-      return Number(value).toLocaleString();
+  function refreshCard(videoId, chainIdx, eventIdx) {
+    const key = trakeKey(videoId, chainIdx, eventIdx);
+    const st = thumbState[key];
+    if (!st) return;
+    const cardId = "evcard-" + key.replaceAll("::","__");
+    const card = eid(cardId);
+    if (!card) return;
+    const isCustom = st.currentUrl !== st.originalUrl;
+    const img = card.querySelector("img");
+    if (img) img.src = st.currentUrl;
+    // Update the info text (timestamp changes when thumbnail changes)
+    const textSpan = eid("evinfo-text-" + key.replaceAll("::","__"));
+    if (textSpan) {
+      textSpan.innerHTML = `<strong>Event ${eventIdx+1}</strong> &middot; rank ${st.rank} &middot; ${fmtTime(st.currentTimestamp)}`;
     }
+    const info = card.querySelector(".ev-info");
+    if (info) {
+      const existing = info.querySelector(".pill");
+      if (isCustom && !existing) {
+        const span = document.createElement("span");
+        span.className = "pill"; span.style.fontSize = "10px"; span.textContent = "CUSTOM";
+        info.appendChild(span);
+      } else if (!isCustom && existing) {
+        existing.remove();
+      }
+    }
+    if (isCustom) card.classList.add("has-custom");
+    else card.classList.remove("has-custom");
+  }
 
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
+  // ─── Modal state ──────────────────────────────────────────────────────────────
+  const modal = {
+    open: false,
+    shots: [],        // [{shot_id, frames:[{frame_id, frame_index, timestamp_sec, image_url}]}]
+    shotIdx: 0,
+    frameIdx: 0,
+    videoId: "",
+    chainIdx: null,   // null for non-trake cards
+    eventIdx: null,   // null for non-trake cards
+  };
+
+  // ─── Open modal from card (reads live thumbState, not stale render values) ───
+  function openModalFromCard(safeKey) {
+    const key = safeKey.replaceAll('__','::');
+    const st = thumbState[key];
+    if (!st) return;
+    openModal(st.currentUrl, st.videoId, st.currentFrameId, st.eventIdx, null, st.chainIdx);
+  }
+
+  // ─── Modal open ───────────────────────────────────────────────────────────────
+  function openModal(imgSrc, videoId, frameId, eventIdx, _unused, chainIdx) {
+    // Show modal immediately with the clicked image
+    modal.open = true;
+    modal.videoId = videoId;
+    modal.chainIdx = chainIdx != null ? chainIdx : null;
+    modal.eventIdx = eventIdx;
+    modal.shots = [];
+    modal.shotIdx = 0;
+    modal.frameIdx = 0;
+
+    const modalEl = eid("frame-modal");
+    modalEl.style.display = "flex";
+
+    const imgEl = eid("modal-img");
+    imgEl.src = imgSrc;
+
+    eid("modal-title").textContent = "Loading shots…";
+    eid("modal-time").textContent = "";
+    eid("modal-footer").textContent = "";
+    eid("modal-strip").innerHTML = "";
+    eid("modal-prev").disabled = true;
+    eid("modal-next").disabled = true;
+    // Only show thumbnail controls for TRAKE event cards (eventIdx is a number)
+    const isTrake = eventIdx !== null && eventIdx !== undefined;
+    eid("btn-setthumb").style.display = isTrake ? "inline-block" : "none";
+    eid("btn-revert-modal").style.display = "none";
+
+    if (!videoId) { eid("modal-title").textContent = "No video ID"; return; }
+
+    fetch("/api/video-shots?video_id=" + encodeURIComponent(videoId))
+      .then(r => r.json())
+      .then(data => {
+        const shots = data.shots || [];
+        if (!shots.length) { eid("modal-title").textContent = "No shots found"; return; }
+        modal.shots = shots;
+        // Find the shot + frame matching frameId
+        let foundSi = 0, foundFi = 0, found = false;
+        for (let si = 0; si < shots.length && !found; si++) {
+          const frames = shots[si].frames || [];
+          for (let fi = 0; fi < frames.length; fi++) {
+            if (frames[fi].frame_id === frameId) {
+              foundSi = si; foundFi = fi; found = true; break;
+            }
+          }
+        }
+        modal.shotIdx = foundSi;
+        modal.frameIdx = foundFi;
+        renderModal();
+      })
+      .catch(() => {
+        eid("modal-title").textContent = "Could not load shots";
+      });
+  }
+
+  // ─── Modal render (called after shots loaded, or after navigation) ────────────
+  function renderModal() {
+    if (!modal.shots.length) return;
+    const shot = modal.shots[modal.shotIdx];
+    const frame = shot.frames[modal.frameIdx];
+
+    // Set main image
+    eid("modal-img").src = frame.image_url;
+
+    // Header
+    eid("modal-title").textContent =
+      `Shot ${modal.shotIdx+1}/${modal.shots.length}  (${shot.shot_id})`;
+    eid("modal-time").textContent = fmtTime(frame.timestamp_sec);
+
+    // Footer
+    eid("modal-footer").textContent =
+      `Frame ${modal.frameIdx+1}/${shot.frames.length} · ${fmtTime(frame.timestamp_sec)} · idx ${frame.frame_index}`;
+
+    // Strip
+    eid("modal-strip").innerHTML = shot.frames.map((f, fi) =>
+      `<img src="${esc(f.image_url)}" class="${fi===modal.frameIdx?"active":""}"
+        onclick="selectStrip(event,${fi})" title="${fmtTime(f.timestamp_sec)}">`
+    ).join("");
+
+    // Nav buttons
+    eid("modal-prev").disabled = modal.shotIdx <= 0;
+    eid("modal-next").disabled = modal.shotIdx >= modal.shots.length - 1;
+
+    // Thumbnail buttons (only for TRAKE)
+    if (modal.eventIdx !== null && modal.eventIdx !== undefined) {
+      const key = trakeKey(modal.videoId, modal.chainIdx, modal.eventIdx);
+      const st = thumbState[key];
+      const isCustom = st && st.currentUrl !== st.originalUrl;
+      eid("btn-setthumb").textContent = isCustom ? "Cập nhật thumbnail" : "Làm thumbnail";
+      eid("btn-revert-modal").style.display = isCustom ? "inline-block" : "none";
     }
 
     // Toggle VQA settings visibility
