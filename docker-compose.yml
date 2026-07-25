@@ -66,6 +66,76 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
+  # Local-model fallback for the VQA/TRAKE agent when GEMINI_API_KEY isn't set
+  # (see agent/react.py::create_agent). Two engines, picked by hardware, never
+  # both running — same mutual-exclusion pattern as vllm-retrieval/vllm-index,
+  # just gated by GPU model instead of by profile alone:
+  #   atlas-agent     -> DGX Spark / GB10 only (nvidia-smi name == "NVIDIA GB10").
+  #                      Atlas is a from-scratch Rust/CUDA engine hand-tuned for
+  #                      GB10's SM121 kernels — cold start ~15s vs vLLM's
+  #                      torch.compile-driven ~10min, and its own benchmarks
+  #                      show ~3x vLLM's decode throughput on this hardware.
+  #                      It does NOT read GGUF or AWQ — only HF checkpoints in
+  #                      its own quant formats (NVFP4/FP8/BF16/Turbo), so the
+  #                      model here is a separate NVFP4 conversion, not the
+  #                      AWQ checkpoint vllm-retrieval uses.
+  #   llamacpp-agent  -> any other NVIDIA GPU (e.g. RTX 4090/5090). GGUF via
+  #                      llama.cpp/ggml — the portable fallback when Atlas's
+  #                      GB10-only kernels don't apply.
+  # agent/react.py picks which one to start based on nvidia-smi output; see
+  # AGENT_VRAM_THRESHOLD_GB in .env for the 9B vs 4B model size cutoff within
+  # each engine.
+  atlas-agent:
+    image: avarok/atlas-gb10:latest
+    container_name: codenova-atlas-agent
+    profiles: ["atlas-agent"]
+    command: >
+      serve ${ATLAS_MODEL:-AxionML/Qwen3.5-9B-NVFP4}
+      --bind 0.0.0.0
+      --port 8888
+      --max-seq-len 8192
+      --gpu-memory-utilization 0.6
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+    ports:
+      - "8888:8888"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  llamacpp-agent:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    container_name: codenova-llamacpp-agent
+    profiles: ["llamacpp-agent"]
+    command: >
+      --hf-repo ${LLAMACPP_MODEL:-unsloth/Qwen3.5-9B-GGUF:Q4_K_M}
+      --host 0.0.0.0
+      --port 8888
+      --ctx-size 8192
+      --n-gpu-layers 99
+      --chat-template-kwargs '{"enable_thinking":false}'
+    ports:
+      - "8888:8888"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - llamacpp_cache:/root/.cache/llama.cpp
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
   vllm-index:
     image: ghcr.io/timothystewart6/vllm-gb10:latest
     container_name: codenova-vllm-index
@@ -105,6 +175,13 @@ services:
       - discovery.type=single-node
       - xpack.security.enabled=false
       - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      # Elasticvue is a browser app calling the ES REST API from a different
+      # origin (port 8883 vs 8882) — CORS must be enabled or the browser
+      # blocks the request even though the server itself is reachable
+      # (curl/server-to-server calls aren't affected, only browser JS).
+      - http.cors.enabled=true
+      - http.cors.allow-origin=/https?:\/\/.*/
+      - http.cors.allow-headers=X-Requested-With,Content-Type,Content-Length,Authorization
     ports:
       - "8882:9200"
     volumes:
@@ -121,3 +198,4 @@ services:
 
 volumes:
   elasticsearch_data:
+  llamacpp_cache:

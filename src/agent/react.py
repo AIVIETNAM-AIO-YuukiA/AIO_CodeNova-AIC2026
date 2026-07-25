@@ -162,6 +162,11 @@ def _load_dotenv() -> None:
 def create_agent(backend: str = "gemini") -> Agent:
     """Create an Agent with the specified backend.
 
+    Fallback chain when GEMINI_API_KEY isn't set: Ollama (if running) ->
+    self-hosted local engine (Atlas on DGX Spark/GB10, else llama.cpp; 9B vs
+    4B model picked by free VRAM, see agent/hardware.py) -> Gemini client
+    with no key (will fail at call time, last resort).
+
     Args:
         backend: One of 'gemini', 'internvl', 'ollama' (default: 'gemini').
                  Falls back gracefully if the requested backend is unavailable.
@@ -199,6 +204,34 @@ def create_agent(backend: str = "gemini") -> Agent:
             return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
     except Exception as exc:
         LOGGER.debug("Ollama detection failed: %s", exc)
+
+    try:
+        from agent import hardware
+        from agent.local_engine import LocalEngineBrain, local_engine_default_tools
+
+        if hardware.gpu_name() is not None:
+            use_9b = hardware.has_enough_vram_for_9b()
+            if hardware.is_dgx_spark():
+                default_model = (
+                    "AxionML/Qwen3.5-9B-NVFP4" if use_9b else "AxionML/Qwen3-VL-4B-NVFP4"
+                )
+            else:
+                default_model = (
+                    "unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+                    if use_9b
+                    else "unsloth/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M"
+                )
+            model_name = os.environ.get("AGENT_LOCAL_ENGINE_MODEL", default_model)
+            LOGGER.info(
+                "No GEMINI_API_KEY/Ollama — using local engine (gpu=%s, model=%s)",
+                hardware.gpu_name(),
+                model_name,
+            )
+            brain = LocalEngineBrain(model_name=model_name)
+            tools = local_engine_default_tools(model_name=model_name)
+            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
+    except Exception as exc:
+        LOGGER.debug("Local-engine detection failed: %s", exc)
 
     brain = VlmBrain()
     tools = default_tools()
