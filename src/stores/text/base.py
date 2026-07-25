@@ -33,3 +33,7 @@ class TextIndex:
     def search(self, query: str, top_k: int) -> list[tuple[str, float]]:
         """Return ``(doc_id, score)`` pairs for a BM25 text query."""
         raise NotImplementedError
+
+    def export_all(self):
+        """Yield every indexed document as a dict, for local backup/inspection."""
+        raise NotImplementedError

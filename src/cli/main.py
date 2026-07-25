@@ -15,7 +15,7 @@ from core.errors import CodeNovaError
 from core.logging import configure_logging, get_logger
 from indexing.build_index import build_index
 from indexing.embeddings import embed_frames
-from indexing.extract_text import extract_asr, extract_ocr
+from indexing.extract_text import export_text, extract_asr, extract_ocr, import_text
 from indexing.frames import extract_frames
 from indexing.ingest import ingest_videos
 from indexing.shots import detect_shots
@@ -75,6 +75,16 @@ def build_parser() -> ArgumentParser:
     text_parser.add_argument("--force", action="store_true")
     text_parser.add_argument("--skip-ocr", action="store_true", help="Skip the OCR sub-stage")
     text_parser.add_argument("--skip-asr", action="store_true", help="Skip the ASR sub-stage")
+
+    export_text_parser = subparsers.add_parser(
+        "export-text", help="Dump OCR/ASR documents from Elasticsearch to manifests/text.jsonl"
+    )
+    add_run_args(export_text_parser)
+
+    import_text_parser = subparsers.add_parser(
+        "import-text", help="Load manifests/text.jsonl into Elasticsearch"
+    )
+    add_run_args(import_text_parser)
 
     search_parser = subparsers.add_parser("search", help="Search videos by text query")
     add_run_args(search_parser)
@@ -262,6 +272,22 @@ def handle_extract_text(args: Namespace) -> int:
     return 0
 
 
+def handle_export_text(args: Namespace) -> int:
+    """Dump OCR/ASR documents from Elasticsearch to a local JSONL file."""
+    experiment = load_experiment(args)
+    count = export_text(experiment=experiment)
+    print(json.dumps({"experiment": experiment.name, "exported": count}))
+    return 0
+
+
+def handle_import_text(args: Namespace) -> int:
+    """Load a local JSONL text export into Elasticsearch."""
+    experiment = load_experiment(args)
+    count = import_text(experiment=experiment)
+    print(json.dumps({"experiment": experiment.name, "imported": count}))
+    return 0
+
+
 def handle_search(args: Namespace) -> int:
     """Run text search."""
     experiment = load_experiment(args)
@@ -328,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
             return handle_build_index(args)
         if args.command == "extract-text":
             return handle_extract_text(args)
+        if args.command == "export-text":
+            return handle_export_text(args)
+        if args.command == "import-text":
+            return handle_import_text(args)
         if args.command == "search":
             return handle_search(args)
         if args.command == "serve-ui":

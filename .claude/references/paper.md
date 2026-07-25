@@ -90,25 +90,31 @@ Xem thêm bảng công thức multiplicative gating rerank (`S_final = s_i · λ
 
 ---
 
-## 3. ASR chunking + khử trùng lặp overlap
+## 3. ASR chunking: VAD segmentation + word-count regrouping
 
-**Quyết định trong code:** [`src/modules/asr/gipformer.py`](../../src/modules/asr/gipformer.py) —
-chunk audio dài thành cửa sổ cố định 30s, overlap 1s, khử trùng lặp bằng
-token-level LCS (longest common subsequence) ở ranh giới giữa 2 chunk liền kề.
+**Quyết định trong code:** [`src/modules/asr/vad.py`](../../src/modules/asr/vad.py) +
+[`src/modules/asr/gipformer.py`](../../src/modules/asr/gipformer.py) — audio dài
+được cắt tại ranh giới im lặng bằng Silero-VAD (`snakers4/silero-vad`) thay vì
+cửa sổ thời gian cố định, mỗi speech segment transcribe riêng, rồi các đoạn
+text được gộp lại thành chunk theo số từ mục tiêu (`ASR_TARGET_WORDS`, mặc
+định 150). Segment VAD dài quá `_MAX_SEGMENT_SECONDS` (30s) vẫn bị cắt cứng —
+gipformer là non-causal transducer, 1 segment không giới hạn (VD 2 phút nói
+liên tục) sẽ làm chậm/tốn RAM decode.
 
-**Vấn đề gốc:** checkpoint ONNX công bố của `g-group-ai-lab/gipformer-65M-rnnt`
-là offline (non-causal) transducer — xác nhận trực tiếp bằng cách thử load
-vào `sherpa_onnx.OnlineRecognizer` (thất bại, thiếu metadata streaming-only
-`encoder_dims`) — nên **không có streaming thật**. Audio dài (nguyên audio
-track 1 video, có thể 20+ phút) làm treo `OfflineRecognizer` nếu đẩy nguyên
-khối vào 1 lần (`accept_waveform` timeout > 60s trên input 21 phút, trong khi
-input 15s chạy tức thời) — cần chunk trước khi transcribe.
+**Vấn đề gốc (không đổi so với thiết kế cũ):** checkpoint ONNX công bố của
+`g-group-ai-lab/gipformer-65M-rnnt` là offline (non-causal) transducer — xác
+nhận trực tiếp bằng cách thử load vào `sherpa_onnx.OnlineRecognizer` (thất
+bại, thiếu metadata streaming-only `encoder_dims`) — nên **không có streaming
+thật**, cần chunk trước khi transcribe.
 
-**Nguồn:** [ASR in 2025-2026: A Deep Dive into Speech Recognition Technology Selection](https://ruoqijin.com/blog/asr-deep-dive-2025-2026) —
-xác nhận đúng con số đã dùng trong code: chunk 30-40s với 1 giây overlap là
-thực hành phổ biến cho "pseudo-streaming" (chunked offline ASR, không phải
-true streaming), và khử trùng lặp overlap bằng LCS ở cấp token là kỹ thuật
-chuẩn để tránh đếm/index trùng phần audio chung giữa 2 chunk liền kề.
+**Vì sao đổi từ fixed-window+LCS-dedup sang VAD+word-count:** cách cũ (cửa sổ
+cố định 30s, overlap 1s, khử trùng lặp bằng token-level LCS) hoạt động đúng
+nhưng ranh giới chunk có thể rơi giữa câu, và LCS dedup chỉ là giải pháp vá
+lỗi cho vấn đề đó, không phải tránh nó từ gốc. Cách mới lấy đúng phương pháp
+2 tầng của pipeline ASR trong dự án tham khảo AIC 2025 (`Whisper_VAD.py`:
+Silero-VAD segmentation → semantic/word-count regrouping), giữ nguyên model
+gốc (gipformer, không đổi sang Whisper) — ranh giới chunk luôn rơi đúng chỗ
+im lặng nên không cần dedup nữa.
 
 ---
 

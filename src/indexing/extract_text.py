@@ -21,6 +21,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import os
 
+from core.errors import CodeNovaError
 from core.logging import get_logger
 from core.types import FrameRecord, VideoRecord
 from indexing.manifest import JsonlManifest
@@ -137,3 +138,55 @@ def extract_asr(experiment, force: bool = False) -> int:
 
     LOGGER.info("ASR extraction complete: %s segments indexed", indexed)
     return indexed
+
+
+def export_text(experiment) -> int:
+    """Dump every OCR/ASR document from Elasticsearch to ``manifests/text.jsonl``.
+
+    Elasticsearch (a Docker-managed volume, not a project directory) is the
+    system of record for OCR/ASR text — this just makes a local JSONL copy
+    for backup/inspection without needing to query Elasticsearch directly,
+    mirroring how ``captions.jsonl`` mirrors the Vietnamese embedder's captions.
+    """
+    text_index = build_text_index(experiment)
+    output_path = experiment.run_dir / "manifests" / "text.jsonl"
+    manifest = JsonlManifest(output_path)
+    output_path.write_text("", encoding="utf-8")  # start fresh; this is a full re-export
+
+    count = 0
+    for doc in text_index.export_all():
+        manifest.append(doc)
+        count += 1
+
+    LOGGER.info("Exported %s text documents to %s", count, output_path)
+    return count
+
+
+def import_text(experiment) -> int:
+    """Load ``manifests/text.jsonl`` back into Elasticsearch.
+
+    The counterpart to ``export_text`` — lets a teammate who only received
+    the JSONL file (e.g. over git/Slack, without access to this machine's
+    Elasticsearch volume) reconstruct the text index locally with one
+    command, same as ``build-index`` reconstructs Qdrant from the local
+    ``embeddings/*.npz`` files.
+    """
+    manifest_path = experiment.run_dir / "manifests" / "text.jsonl"
+    if not manifest_path.exists():
+        raise CodeNovaError(f"No text.jsonl found at {manifest_path}. Run export-text first.")
+
+    text_index = build_text_index(experiment)
+    documents = [
+        TextDocument(
+            doc_id=row["doc_id"],
+            video_id=row["video_id"],
+            text=row["text"],
+            source=row["source"],
+            frame_id=row.get("frame_id"),
+            timestamp_sec=row.get("timestamp_sec"),
+        )
+        for row in JsonlManifest(manifest_path).read_all()
+    ]
+    text_index.index_documents(documents)
+    LOGGER.info("Imported %s text documents from %s", len(documents), manifest_path)
+    return len(documents)

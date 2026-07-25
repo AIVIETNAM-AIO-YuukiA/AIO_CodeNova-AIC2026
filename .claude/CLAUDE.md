@@ -63,7 +63,7 @@ landmark image-to-image reasoning, adaptive keyframe/subframe extraction — see
   structured-captioning-for-embedding best practices (why the caption prompt in
   `prompts/captioning.py` is rigid, not free-form), AIC 2025 teams' OCR/rerank
   techniques and confirmation that AIC 2026 has no results yet as of 7/2026, and
-  ASR chunking/overlap-deduplication practice behind `modules/asr/gipformer.py`.
+  ASR VAD-segmentation + word-count chunking practice behind `modules/asr/gipformer.py`.
 
 Each entry in all three files is tagged Implemented / Not implemented against
 current code; check that tag before assuming an upgrade idea already exists.
@@ -159,8 +159,15 @@ src/
                             #   sherpa-onnx, called as a subprocess into its
                             #   own isolated repo+venv at external/gipformer/
                             #   (NOT a HuggingFace Transformers checkpoint).
-                            #   Chunks long audio (30s windows, 1s overlap,
-                            #   LCS-deduplicated) — see its docstring.
+                            #   Segments audio with Silero-VAD (asr/vad.py)
+                            #   instead of fixed-time windows, then regroups
+                            #   transcribed segments into ~ASR_TARGET_WORDS-word
+                            #   chunks — same two-stage approach as the AIC 2025
+                            #   reference project's ASR pipeline; see docstring.
+    asr/vad.py              # real: Silero-VAD (snakers4/silero-vad via
+                            #   torch.hub), speech-segment detection ahead of
+                            #   gipformer transcription — same VAD backend the
+                            #   AIC 2025 reference project uses.
     detection/              # base.py interface ONLY — no subclass. NOT the
                             #   same code path as agent/tools.py (see below).
   stores/
@@ -258,8 +265,12 @@ other way.
   infra, not per-experiment tuning, because swapping which VLM/embedder is
   *hosted* is a deployment concern, unlike which embedders an experiment
   *uses* (that's `--embedding-models`, a CLI flag, see below). gipformer (ASR)
-  has no env var — it's not HF-ID swappable, it's a fixed subprocess call into
-  `external/gipformer/`. Loaded automatically, per-machine, git-ignored.
+  isn't HF-ID swappable — it's a fixed subprocess call into
+  `external/gipformer/` — but its runtime tuning (`GIPFORMER_QUANTIZE`,
+  `GIPFORMER_NUM_THREADS`) and the Silero-VAD segmentation ahead of it
+  (`ASR_VAD_MIN_SILENCE_MS`, `ASR_VAD_SPEECH_PAD_MS`, `ASR_VAD_THRESHOLD`,
+  `ASR_TARGET_WORDS`) still count as infra, same reasoning as the VLM knobs
+  above. Loaded automatically, per-machine, git-ignored.
 - **CLI flags** — per-experiment settings (embedding models, keyframe percentiles,
   top-k, device). Recorded verbatim in `runs/<exp>/config.json` for reproducibility.
   **Never move one of these into `.env`** — the whole point is that changing them
@@ -306,12 +317,29 @@ make serve-ui EXP=demo                          # http://127.0.0.1:7860
 make vllm-index && make elasticsearch-up && make elasticsearch-health
 make extract-text EXP=demo
 
+# Share OCR/ASR text with a teammate without giving them Elasticsearch access:
+# export-text dumps Elasticsearch -> manifests/text.jsonl (small, git/Slack-able);
+# import-text loads that file back into their own Elasticsearch with one
+# command, same idea as build-index reconstructing Qdrant from local .npz files.
+make export-text EXP=demo
+make import-text EXP=demo
+
 make lint / make format / make check / make test / make precommit
 ```
 
 `external/gipformer/` needs its own one-time setup (`cd external/gipformer && uv sync`)
 before ASR extraction works — it's an isolated repo+venv, not part of the main
 project's `uv sync`.
+
+**`onnxruntime` (Silero-VAD, `modules/asr/vad.py`) must be installed with
+`uv pip install onnxruntime`, NOT added to `pyproject.toml`.** Adding it there
+makes `uv lock` silently upgrade torch/vllm/triton to newer builds (losing
+the pinned `+cu128` CUDA build) to satisfy its resolver — confirmed by
+testing, not a guess; tried multiple onnxruntime versions, same result every
+time. `uv pip install` puts it in the venv without touching `pyproject.toml`/
+`uv.lock`, so it's not tracked by `uv sync` and needs reinstalling after a
+fresh venv. Don't "fix" this by adding it to dependencies without
+re-verifying `torch.__version__` still ends in `+cu128` afterward.
 
 - Lint/format: `ruff` (line-length 100), config in `pyproject.toml`. `external/` and
   the vendored `src/modules/embedding/_beit3_vendor/` are excluded from ruff.
