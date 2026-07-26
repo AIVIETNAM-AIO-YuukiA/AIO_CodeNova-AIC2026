@@ -54,7 +54,7 @@ class _VlmTool(Tool):
             )
         except Exception as exc:
             LOGGER.exception("%s tool failed", self.name)
-            return f"[{self.name} unavailable: {exc}. Start the VLM with `make vllm-index`.]"
+            return f"[{self.name} unavailable: {exc}. Start the VLM with `make atlas-index-up`.]"
 
 
 class CaptionTool(_VlmTool):

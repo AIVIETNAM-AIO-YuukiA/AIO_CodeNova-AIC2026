@@ -18,7 +18,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 .PHONY: help sync install-hooks lint format check test pre-commit precommit \
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
-        vllm-retrieval vllm-index vllm-down vllm-health \
+        atlas-index-up atlas-index-down atlas-index-health \
         agent-up agent-down agent-health \
         ingest detect-shots extract-frames embed-frames build-index extract-text export-text import-text pipeline \
         search serve-ui clean-runs clean
@@ -69,18 +69,15 @@ elasticsearch-up: ## Khởi động Elasticsearch + Elasticvue qua docker compos
 elasticsearch-health: ## Kiểm tra Elasticsearch có sống không
 	curl -sf http://localhost:8882 && echo
 
-## --- vLLM (VLM tự host; dùng chung port, chỉ chạy 1 cái 1 lúc — chung GPU) ---
-vllm-retrieval: ## Khởi động Qwen3.5-9B cho tác vụ agent/retrieval online
-	docker compose --profile retrieval up -d vllm-retrieval
+## --- Atlas captioning/OCR (Qwen3.6-35B-A3B NVFP4, chỉ DGX Spark/GB10, port 8881) ---
+atlas-index-up: ## Khởi động Atlas cho captioning/OCR offline
+	docker compose --profile atlas-index up -d atlas-index
 
-vllm-index: ## Khởi động Qwen3.6-35B-A3B cho captioning/OCR offline
-	docker compose --profile index up -d vllm-index
+atlas-index-down: ## Dừng atlas-index
+	docker compose stop atlas-index
+	docker compose rm -f atlas-index
 
-vllm-down: ## Dừng service vLLM đang chạy (không đụng service khác)
-	docker compose stop vllm-retrieval vllm-index
-	docker compose rm -f vllm-retrieval vllm-index
-
-vllm-health: ## Kiểm tra vLLM có sống không (model nào đang chạy)
+atlas-index-health: ## Kiểm tra atlas-index có sống không
 	curl -sf http://localhost:8881/v1/models && echo
 
 ## --- Agent LLM (Qwen3.5-4B, port 8888; engine chọn theo phần cứng) ---
@@ -118,7 +115,7 @@ embed-frames: ## Embed keyframe bằng BEiT-3 large (EXP; EMBEDDING_MODELS để
 build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
 	uv run codenova build-index --experiment-name $(EXP)
 
-extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index` đang chạy
+extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make atlas-index-up` đang chạy
 	uv run codenova extract-text --experiment-name $(EXP)
 
 export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifests/text.jsonl (EXP)

@@ -1,10 +1,14 @@
 """Shared low-level client for OpenAI-compatible chat-completions endpoints.
 
 Internal helper — not a public module interface. Used by
-``modules/captioning/vllm.py`` / ``modules/ocr/vllm.py`` (vLLM VLM on port
-8881, image-inlined calls) and by the agent + query processor (Atlas or
-llama.cpp on port 8888, text-only calls). All model serving is Docker-hosted;
-no checkpoint is ever loaded in-process through this module.
+``modules/captioning/vllm.py`` / ``modules/ocr/vllm.py`` (Atlas
+``atlas-index`` service, port 8881, image-inlined calls — GB10 only, no
+non-GB10 fallback) and by the agent + query processor (Atlas ``atlas-agent``
+or llama.cpp ``llamacpp-agent``, port 8888, text-only calls). All model
+serving is Docker-hosted; no checkpoint is ever loaded in-process through
+this module. Class name kept as ``VllmChatClient`` even though nothing here
+calls vLLM anymore — it's just an OpenAI-compatible chat client, and
+renaming would touch every caller for no behavioral change.
 """
 
 from __future__ import annotations
@@ -13,11 +17,11 @@ import base64
 import os
 
 _DEFAULT_BASE_URL = "http://localhost:8881/v1"
-_DEFAULT_MODEL = "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"
+_DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 
 
 class VllmChatClient:
-    """Thin wrapper around vLLM's OpenAI-compatible ``/chat/completions`` endpoint."""
+    """Thin wrapper around an OpenAI-compatible ``/chat/completions`` endpoint."""
 
     def __init__(
         self,

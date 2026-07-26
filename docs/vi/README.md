@@ -15,7 +15,7 @@ OFFLINE (đánh index)
   ingest → detect-shots → extract-frames → embed-frames → build-index
                                           (vector index: BEiT-3 large → Qdrant)
   extract-text  (bước riêng: OCR theo keyframe + ASR theo video → Elasticsearch;
-                 cần `make vllm-index` + `make elasticsearch-up`)
+                 cần `make atlas-index-up` + `make elasticsearch-up`)
 
 ONLINE (truy hồi)
   câu truy vấn → [LLM dịch/mở rộng] → embed (BEiT-3) → tìm trên Qdrant
@@ -37,10 +37,16 @@ BLIP-2) chạy in-process vì là batch encoder.
 | Embed ảnh (tùy chọn) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process |
 | Embed caption tiếng Việt (tùy chọn) | `AITeamVN/Vietnamese_Embedding_v2` trên caption do VLM sinh | caption qua Docker VLM; embed in-process |
 | Reranker (tùy chọn, khi chạy nhiều model) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
-| Captioning + OCR (index & tool agent) | Qwen3.6-35B-A3B AWQ | Docker `vllm-index`, cổng 8881 |
+| Captioning + OCR (index & tool agent) | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Docker `atlas-index` (Atlas, **chỉ GB10**), cổng 8881 |
 | LLM agent (VQA, chat, mở rộng query) | **Qwen3.5-4B 4-bit** | Docker cổng 8888 — Atlas (NVFP4) trên DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) trên GPU khác |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess vào `external/gipformer/` |
 | Tách shot | TransNetV2 (PyTorch) | in-process |
+
+`atlas-agent` (4B, cổng 8888) và `atlas-index` (35B-A3B, cổng 8881) là 2
+container Atlas độc lập, cổng riêng để chạy đồng thời mà không tranh chấp bộ
+nhớ hợp nhất của GB10. Captioning/OCR **không có fallback cho máy khác GB10**
+— `atlas-index` bắt buộc chạy Atlas, chỉ hỗ trợ GB10. `make agent-up` chỉ tự
+chọn engine cho LLM agent (Atlas hay llama.cpp), không liên quan captioning/OCR.
 
 `make agent-up` tự chọn Atlas hay llama.cpp dựa vào `nvidia-smi` (GB10 →
 Atlas). Đổi model qua `ATLAS_MODEL` / `LLAMACPP_MODEL` trong `.env`.
@@ -121,8 +127,8 @@ make extract-frames EXP=demo
 make embed-frames   EXP=demo      # BEiT-3 large; lần đầu tự tải checkpoint ~2GB
 make build-index    EXP=demo      # cần Qdrant đang chạy
 
-# Nhánh OCR/ASR (riêng; cần vllm-index + Elasticsearch)
-make vllm-index elasticsearch-up
+# Nhánh OCR/ASR (riêng; cần atlas-index + Elasticsearch — chỉ GB10)
+make atlas-index-up elasticsearch-up
 make extract-text EXP=demo
 make export-text  EXP=demo        # xuất ES -> manifests/text.jsonl (chia sẻ được)
 make import-text  EXP=demo        # nạp text.jsonl ngược vào ES

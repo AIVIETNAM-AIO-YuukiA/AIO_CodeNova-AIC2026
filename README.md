@@ -15,7 +15,7 @@ OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
                                           (vector index: BEiT-3 large → Qdrant)
   extract-text  (separate stage: OCR per keyframe + ASR per video → Elasticsearch;
-                 needs `make vllm-index` + `make elasticsearch-up`)
+                 needs `make atlas-index-up` + `make elasticsearch-up`)
 
 ONLINE (retrieval)
   text query → [LLM translate/expand] → embed (BEiT-3) → Qdrant search
@@ -37,13 +37,18 @@ BLIP-2) run in-process as batch encoders.
 | Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process |
 | Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
 | Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
-| Captioning + OCR (indexing & agent tools) | Qwen3.6-35B-A3B AWQ | Docker `vllm-index`, port 8881 |
+| Captioning + OCR (indexing & agent tools) | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Docker `atlas-index` (Atlas, **GB10 only**), port 8881 |
 | Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | Docker port 8888 — Atlas (NVFP4) on DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) elsewhere |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess into `external/gipformer/` |
 | Shot detection | TransNetV2 (PyTorch) | in-process |
 
-`make agent-up` picks Atlas vs llama.cpp automatically from `nvidia-smi`
-(GB10 → Atlas). Override models via `ATLAS_MODEL` / `LLAMACPP_MODEL` in `.env`.
+`atlas-agent` (4B, port 8888) and `atlas-index` (35B-A3B, port 8881) are two
+independent Atlas containers — separate ports so both run at once without
+evicting each other's weights/KV cache from GB10's unified memory pool.
+Captioning/OCR has **no non-GB10 fallback**: `atlas-index` requires Atlas,
+which is GB10-only. `make agent-up` picks Atlas vs llama.cpp automatically
+from `nvidia-smi` (GB10 → Atlas) for the *agent* LLM only. Override models
+via `ATLAS_MODEL` / `LLAMACPP_MODEL` / `ATLAS_INDEX_MODEL` in `.env`.
 
 ## Agent
 
@@ -121,8 +126,8 @@ make extract-frames EXP=demo
 make embed-frames   EXP=demo      # BEiT-3 large; ~2GB checkpoint auto-downloads on first run
 make build-index    EXP=demo      # needs Qdrant running
 
-# OCR/ASR text branch (separate; needs vllm-index + Elasticsearch)
-make vllm-index elasticsearch-up
+# OCR/ASR text branch (separate; needs atlas-index + Elasticsearch — GB10 only)
+make atlas-index-up elasticsearch-up
 make extract-text EXP=demo
 make export-text  EXP=demo        # dump ES -> manifests/text.jsonl (shareable)
 make import-text  EXP=demo        # load text.jsonl back into ES

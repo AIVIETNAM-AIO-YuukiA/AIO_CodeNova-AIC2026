@@ -9,67 +9,6 @@ services:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
 
-  vllm-retrieval:
-    image: ghcr.io/timothystewart6/vllm-gb10:latest
-    container_name: codenova-vllm-retrieval
-    profiles: ["retrieval"]
-    command: >
-      vllm serve cyankiwi/Qwen3.5-9B-AWQ-4bit
-      --host 0.0.0.0
-      --port 8881
-      --dtype float16
-      --max-model-len 4096
-      --performance-mode interactivity
-      --max-num-seqs 4
-      --gpu-memory-utilization 0.25
-      --enable-prefix-caching
-      --reasoning-parser qwen3
-      --default-chat-template-kwargs '{"enable_thinking": false}'
-    ports:
-      - "8881:8881"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-
-  vllm-index:
-    image: ghcr.io/timothystewart6/vllm-gb10:latest
-    container_name: codenova-vllm-index
-    profiles: ["index"]
-    command: >
-      vllm serve cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit
-      --host 0.0.0.0
-      --port 8881
-      --dtype float16
-      --max-model-len 8192
-      --performance-mode throughput
-      --max-num-seqs 16
-      --max-num-batched-tokens 32768
-      --gpu-memory-utilization 0.35
-      --enable-prefix-caching
-      --reasoning-parser qwen3
-      --default-chat-template-kwargs '{"enable_thinking": false}'
-    ports:
-      - "8881:8881"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    ipc: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-
   # The agent LLM (Qwen3.5-4B, 4-bit) — the ONLY backend for VQA/TRAKE
   # answering, interactive chat, and query translation. Two engines, picked
   # by hardware via `make agent-up`, never both running (both bind 8888):
@@ -86,10 +25,39 @@ services:
       --bind 0.0.0.0
       --port 8888
       --max-seq-len 8192
-      --gpu-memory-utilization 0.6
+      --gpu-memory-utilization 0.3
       --default-chat-template-kwargs '{"enable_thinking": false}'
     ports:
       - "8888:8888"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # Captioning + OCR (offline indexing + agent caption/ocr tools) — GB10/Atlas
+  # only, no vLLM fallback for any hardware. Own port (8881) so it can run
+  # alongside atlas-agent (4B, port 8888) without either evicting the other's
+  # KV cache / weights from the unified memory pool.
+  atlas-index:
+    image: avarok/atlas-gb10:latest
+    container_name: codenova-atlas-index
+    profiles: ["atlas-index"]
+    command: >
+      serve ${ATLAS_INDEX_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}
+      --bind 0.0.0.0
+      --port 8881
+      --max-seq-len 8192
+      --gpu-memory-utilization 0.6
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+    ports:
+      - "8881:8881"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
