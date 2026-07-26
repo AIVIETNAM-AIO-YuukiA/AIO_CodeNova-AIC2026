@@ -25,6 +25,12 @@ from modules.embedding.base import (
 
 LOGGER = logging.getLogger(__name__)
 
+# SigLIP 2's text tower has a 64-token context. Longer queries are embedded
+# with a sliding window and mean-pooled (window 64, stride 48) — same
+# technique as the AIC_2025 reference project's SigLIP_embedding.py.
+_MAX_TEXT_TOKENS = 64
+_WINDOW_STRIDE = 48
+
 
 class SiglipEmbedder(Embedder):
     """SigLIP 2 image/text embeddings backed by Hugging Face Transformers."""
@@ -32,7 +38,7 @@ class SiglipEmbedder(Embedder):
     def __init__(
         self, model_name: str | None = None, device: str = "auto", batch_size: int = 32
     ) -> None:
-        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2-large")
+        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2")
         self.model_name = normalize_siglip_model_name(resolved)
         self.device = device
         self.batch_size = batch_size
@@ -73,13 +79,28 @@ class SiglipEmbedder(Embedder):
         return vectors
 
     def embed_text(self, query: str) -> list[float]:
-        """Embed a text query with SigLIP text features."""
+        """Embed a text query with SigLIP text features.
+
+        The query is lowercased first — SigLIP 2 was trained on lowercased
+        text, and mixed-case queries measurably hurt recall. Queries longer
+        than the 64-token context are embedded per sliding window and
+        mean-pooled instead of silently truncated.
+        """
         model, processor, torch, device = self._load()
-        inputs = processor(text=[query], return_tensors="pt", padding="max_length").to(device)
+        text = query.lower().strip()
+        windows = _text_windows(processor.tokenizer, text)
+        inputs = processor(
+            text=windows,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=_MAX_TEXT_TOKENS,
+        ).to(device)
         with torch.no_grad():
             features = projected_features(model.get_text_features(**inputs))
             features = torch.nn.functional.normalize(features, p=2, dim=-1)
-        return features.squeeze(0).detach().cpu().numpy().astype("float32").tolist()
+            pooled = torch.nn.functional.normalize(features.mean(dim=0), p=2, dim=0)
+        return pooled.detach().cpu().numpy().astype("float32").tolist()
 
     def _load(self):
         if self._model is not None:
@@ -106,12 +127,34 @@ class SiglipEmbedder(Embedder):
         return model, processor, torch, device
 
 
+def _text_windows(tokenizer, text: str) -> list[str]:
+    """Split ``text`` into <=64-token windows (stride 48); short text passes through."""
+    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if len(token_ids) <= _MAX_TEXT_TOKENS:
+        return [text]
+    windows = []
+    start = 0
+    while start < len(token_ids):
+        chunk = token_ids[start : start + _MAX_TEXT_TOKENS]
+        windows.append(tokenizer.decode(chunk, skip_special_tokens=True))
+        if start + _MAX_TEXT_TOKENS >= len(token_ids):
+            break
+        start += _WINDOW_STRIDE
+    return windows
+
+
 def normalize_siglip_model_name(model_name: str) -> str:
-    """Map local short names to Hugging Face model IDs."""
+    """Map local short names to Hugging Face model IDs.
+
+    ``siglip2`` / ``siglip2-so400m`` resolve to the so400m-patch14-384
+    checkpoint the AIC_2025 reference project uses (dim 1152, 384px) — not
+    the NaFlex variant, whose variable-resolution input path behaves
+    differently under AutoModel.
+    """
     aliases = {
-        "siglip2": "google/siglip2-large-patch16-256",
+        "siglip2": "google/siglip2-so400m-patch14-384",
         "siglip2-base": "google/siglip2-base-patch16-256",
         "siglip2-large": "google/siglip2-large-patch16-256",
-        "siglip2-so400m": "google/siglip2-so400m-patch16-naflex",
+        "siglip2-so400m": "google/siglip2-so400m-patch14-384",
     }
     return aliases.get(model_name.lower(), model_name)

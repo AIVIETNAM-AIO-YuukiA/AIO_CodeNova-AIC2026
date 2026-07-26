@@ -1,4 +1,4 @@
-"""BEiT-3 base embedder (image-text contrastive retrieval).
+"""BEiT-3 large embedder (image-text retrieval, COCO fine-tune).
 
 BEiT-3 has no HuggingFace ``transformers`` port, so this backend loads the
 original Microsoft implementation vendored under ``_beit3_vendor/`` (source:
@@ -11,9 +11,15 @@ The vendor source uses flat, non-relative imports (``import utils``,
 ``import torchscale.xxx``) exactly as in the upstream repo, so it is loaded by
 adding its directory to ``sys.path`` rather than as a regular Python package.
 
-Checkpoint and tokenizer (``beit3_base_itc_patch16_224.pth``, ``beit3.spm``,
-not committed — see ``external/BEiT3/checkpoints/``) are downloaded
-automatically on first use from
+Variant/preprocessing match the AIC_2025 reference project's
+``Beit3_embedding_optimized.py``: ``beit3_large_patch16_384_retrieval`` with
+the COCO-retrieval checkpoint (dim 1024, 384px, ImageNet-default
+normalization, bilinear resize) — deliberately NOT the base-224 ITC variant
+this project used earlier.
+
+Checkpoint and tokenizer (``beit3_large_patch16_384_coco_retrieval.pth``,
+``beit3.spm``, not committed — see ``external/BEiT3/checkpoints/``) are
+downloaded automatically on first use from
 https://github.com/addf400/files/releases/download/beit3/, mirroring how
 ``modules/asr/gipformer.py`` auto-downloads its own weights from HF Hub.
 """
@@ -38,7 +44,7 @@ LOGGER = logging.getLogger(__name__)
 
 _VENDOR_DIR = Path(__file__).resolve().parent / "_beit3_vendor"
 _DEFAULT_CHECKPOINT_DIR = Path(__file__).resolve().parents[3] / "external" / "BEiT3" / "checkpoints"
-_DEFAULT_CHECKPOINT_FILE = "beit3_base_itc_patch16_224.pth"
+_DEFAULT_CHECKPOINT_FILE = "beit3_large_patch16_384_coco_retrieval.pth"
 _DEFAULT_SPM_FILE = "beit3.spm"
 _RELEASE_BASE_URL = "https://github.com/addf400/files/releases/download/beit3"
 
@@ -90,12 +96,12 @@ def _ensure_downloaded(path: Path) -> None:
 # <s>=0 ... </s>=2. Matches microsoft/unilm's XLMRobertaTokenizer usage.
 _BOS_ID, _PAD_ID, _EOS_ID = 0, 1, 2
 _MAX_TEXT_LEN = 64
-_IMAGE_SIZE = 224
-_EMBED_DIM = 768
+_IMAGE_SIZE = 384
+_EMBED_DIM = 1024
 
 
 class Beit3Embedder(Embedder):
-    """BEiT3-base-itc image/text embeddings (dim 768)."""
+    """BEiT3-large-384 COCO-retrieval image/text embeddings (dim 1024)."""
 
     def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32) -> None:
         self.model_name = model_name
@@ -163,7 +169,7 @@ class Beit3Embedder(Embedder):
         try:
             import sentencepiece as spm
             import torch
-            from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
+            from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
             from torchvision import transforms
         except ImportError as exc:
             raise EmbeddingError(
@@ -182,16 +188,22 @@ class Beit3Embedder(Embedder):
             ) from exc
 
         device = resolve_torch_device(torch, self.device)
-        model = modeling_finetune.beit3_base_patch16_224_retrieval()
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        model = modeling_finetune.beit3_large_patch16_384_retrieval()
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
         model.load_state_dict(checkpoint["model"], strict=False)
         model.eval().to(device)
 
+        # ImageNet-default normalization + bilinear resize, matching the
+        # AIC_2025 reference project's BEiT-3 preprocessing for this exact
+        # checkpoint (not the Inception mean/std the base-224 variant used).
         transform = transforms.Compose(
             [
-                transforms.Resize((_IMAGE_SIZE, _IMAGE_SIZE), interpolation=3),
+                transforms.Resize(
+                    (_IMAGE_SIZE, _IMAGE_SIZE),
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                ),
                 transforms.ToTensor(),
-                transforms.Normalize(mean=IMAGENET_INCEPTION_MEAN, std=IMAGENET_INCEPTION_STD),
+                transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
             ]
         )
         sp = spm.SentencePieceProcessor(model_file=str(spm_path))
