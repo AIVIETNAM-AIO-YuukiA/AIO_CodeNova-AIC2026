@@ -1,4 +1,12 @@
-"""VLM Brain - Gemini API wrapper for ReAct reasoning."""
+"""Agent brain — the Docker-hosted LLM behind every agent code path.
+
+One backend only: an OpenAI-compatible ``/v1/chat/completions`` server on
+port 8888, started by ``make agent-up`` (Atlas on DGX Spark/GB10, llama.cpp
+elsewhere — see ``agent/hardware.py``). The brain reasons over text (the
+served Qwen3.5-4B is text-only); anything visual reaches it through the
+caption/ocr tools in ``agent/tools.py``, which call the separate vLLM VLM
+service, or through captions cached at index time.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +15,17 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+
+from prompts.agent import VQA_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
+
+_DEFAULT_BASE_URL = "http://localhost:8888/v1"
 
 
 @dataclass
 class BrainResponse:
-    """Structured response from the VLM brain."""
+    """Structured response from the agent brain."""
 
     thought: str = ""
     action: str = ""
@@ -23,59 +34,18 @@ class BrainResponse:
     finished: bool = False
 
 
-SYSTEM_PROMPT = """Bạn là agent VQA (Video Question Answering). Nhiệm vụ: trả lời câu hỏi về khung hình video.
+class AgentBrain:
+    """ReAct reasoning via the Docker-hosted agent LLM (OpenAI-compatible)."""
 
-## Tools (Công cụ)
-Bạn có các công cụ sau:
-1. **caption(image_path)**: Mô tả hình ảnh tổng quan, hành động, màu sắc, con người, đồ vật, phong cảnh.
-2. **ocr(image_path)**: Đọc và trích xuất chính xác văn bản, chữ viết, tên riêng, câu thơ, số trên biển hiệu/băng rôn.
+    def __init__(self, model_name: str | None = None, base_url: str | None = None) -> None:
+        from agent.hardware import default_agent_model
 
-## Luật bắt buộc
-1. Bắt buộc suy nghĩ (thought) kỹ câu hỏi để chọn đúng tool:
-   - Nếu câu hỏi tìm TÊN XÃ, CHỮ VIẾT, SỐ, CÂU THƠ, BIỂN BÁO -> BẮT BUỘC gọi tool `ocr`.
-   - Nếu câu hỏi hỏi về HÀNH ĐỘNG, MÀU SẮC, SỐ LƯỢNG NGƯỜI/VẬT -> BẮT BUỘC gọi tool `caption`.
-2. Trả lời bằng NGÔN NGỮ của câu hỏi.
-3. Chỉ gọi tool 1 lần, đối chiếu kết quả trả về với câu hỏi để đưa ra đáp án CHÍNH XÁC.
-4. Đáp án ngắn gọn, đi thẳng vào vấn đề. Nếu kết quả tool không chứa thông tin, hãy trả lời "Không tìm thấy thông tin trong khung hình".
-
-## Định dạng JSON (Luôn trả về JSON hợp lệ)
-
-- Khi cần gọi tool:
-{{"thought": "Câu hỏi hỏi về tên xã, mình cần đọc chữ trong ảnh để tìm tên", "action": "ocr", "action_input": {{"image_path": "file.jpg"}}}}
-
-- Khi đã có thông tin để trả lời:
-{{"thought": "Kết quả OCR trả về có nhắc đến 'Xã Diên Điền', vậy đây là đáp án", "answer": "Xã Diên Điền", "finished": true}}
-"""
-
-
-class VlmBrain:
-    """VLM brain that powers the Agent's reasoning via Gemini API."""
-
-    def __init__(self, model_name: str | None = None) -> None:
-        self.model_name = model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
+        self.base_url = base_url or os.environ.get("AGENT_LOCAL_ENGINE_URL", _DEFAULT_BASE_URL)
+        self.model_name = model_name or default_agent_model()
         self._client = None
-        self._messages: list[dict] = []
-
-    def _init_client(self) -> bool:
-        if self._client is not None:
-            return True
-        self._load_dotenv()
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            LOGGER.error("GEMINI_API_KEY environment variable not set.")
-            return False
-        try:
-            from google import genai
-
-            self._client = genai.Client(api_key=api_key)
-            return True
-        except Exception as exc:
-            LOGGER.exception("Failed to init Gemini client: %s", exc)
-            return False
 
     def reset(self) -> None:
-        """Clear conversation history."""
-        self._messages = []
+        """No per-conversation state to clear; kept for the Agent loop's protocol."""
 
     def reason(
         self,
@@ -84,92 +54,59 @@ class VlmBrain:
         frame_count: int,
         tool_results: list[dict] | None = None,
     ) -> BrainResponse:
-        """Send context + question to the VLM and parse structured response.
-
-        Args:
-            question: The VQA question to answer.
-            shot_info: Description of the shot (video info, timestamps).
-            frame_count: Number of frames in the shot.
-            tool_results: Previous tool call results (for ReAct loop).
-
-        Returns:
-            BrainResponse with thought, action, answer.
-        """
-        if not self._init_client():
-            return BrainResponse(answer="VLM unavailable: set GEMINI_API_KEY", finished=True)
-
-        # Build conversation
-        messages = [{"role": "user", "parts": [SYSTEM_PROMPT]}]
-
-        context = (
-            f"Question: {question}\n"
-            f"Shot info: {shot_info}\n"
-            f"Frames available: {frame_count}\n"
-        )
-        messages.append({"role": "user", "parts": [context]})
-
+        """Send context + question to the LLM and parse the JSON ReAct response."""
+        context = f"Question: {question}\nShot info: {shot_info}\nFrames available: {frame_count}\n"
         if tool_results:
             history = "\n".join(
                 f"Tool {r.get('tool', '?')} returned: {r.get('result', '')}" for r in tool_results
             )
-            messages.append({"role": "user", "parts": [f"Previous observations:\n{history}"]})
+            context += f"\nPrevious observations:\n{history}"
 
         try:
-            from google.genai import types
-
-            full_prompt = messages[-1]["parts"][0]
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=[full_prompt],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
+            client = self._load_client()
+            text = client.complete_text(
+                system_prompt=VQA_SYSTEM_PROMPT,
+                user_prompt=context,
+                generation_params={"temperature": 0.0, "max_tokens": 512},
             )
-
-            return self._parse_response(response.text.strip())
-
+            return parse_brain_response(text)
         except Exception as exc:
-            LOGGER.exception("Brain reasoning failed: %s", exc)
-            return BrainResponse(answer=f"Reasoning error: {exc}", finished=True)
-
-    def _parse_response(self, text: str) -> BrainResponse:
-        """Parse JSON response from the VLM."""
-        # Try to extract JSON from the response
-        json_match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not json_match:
-            LOGGER.warning("No JSON found in brain response: %s", text[:200])
-            return BrainResponse(answer=text.strip(), finished=True)
-
-        try:
-            data = json.loads(json_match.group())
-            if data.get("finished") or data.get("answer"):
-                return BrainResponse(
-                    thought=data.get("thought", ""),
-                    answer=data.get("answer", ""),
-                    finished=True,
-                )
+            LOGGER.exception("Brain reasoning failed")
             return BrainResponse(
-                thought=data.get("thought", ""),
-                action=data.get("action", ""),
-                action_input=data.get("action_input", {}),
-                finished=False,
+                answer=f"Agent LLM unavailable ({exc}). Run `make agent-up` to start it.",
+                finished=True,
             )
-        except json.JSONDecodeError as exc:
-            LOGGER.warning("Failed to parse brain JSON: %s", exc)
-            return BrainResponse(answer=text.strip(), finished=True)
 
-    @staticmethod
-    def _load_dotenv() -> None:
-        """Load .env file if GEMINI_API_KEY is not already set."""
-        if os.environ.get("GEMINI_API_KEY"):
-            return
-        env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-        if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, val = line.partition("=")
-                    if key.strip() == "GEMINI_API_KEY":
-                        os.environ["GEMINI_API_KEY"] = val.strip()
-                        break
+    def _load_client(self):
+        if self._client is not None:
+            return self._client
+        from modules._vllm_chat import VllmChatClient
+
+        self._client = VllmChatClient(base_url=self.base_url, model_name=self.model_name)
+        return self._client
+
+
+def parse_brain_response(text: str) -> BrainResponse:
+    """Parse the ``{"thought"/"action"/"answer"}`` JSON the ReAct prompt mandates.
+
+    Non-JSON output is treated as a final answer rather than an error — small
+    local models occasionally drop the format on the last step, and the text
+    itself is usually the answer.
+    """
+    json_match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not json_match:
+        return BrainResponse(answer=text.strip(), finished=True)
+    try:
+        data = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return BrainResponse(answer=text.strip(), finished=True)
+    if data.get("finished") or data.get("answer"):
+        return BrainResponse(
+            thought=data.get("thought", ""), answer=data.get("answer", ""), finished=True
+        )
+    return BrainResponse(
+        thought=data.get("thought", ""),
+        action=data.get("action", ""),
+        action_input=data.get("action_input", {}),
+        finished=False,
+    )

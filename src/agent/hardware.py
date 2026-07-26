@@ -1,8 +1,7 @@
-"""GPU detection for the agent's local-model fallback chain.
+"""GPU detection for choosing the agent's Docker serving engine.
 
-create_agent() (react.py) tries Gemini first (cloud, no local GPU needed);
-when GEMINI_API_KEY isn't set, it falls back to a self-hosted engine chosen
-by hardware, since GB10 and other NVIDIA GPUs need different engines:
+The agent model is fixed at Qwen3.5-4B (4-bit); only the ENGINE differs by
+hardware, since GB10 and other NVIDIA GPUs need different servers:
 
 - DGX Spark / GB10: Atlas (avarok/atlas-gb10) — a from-scratch Rust/CUDA
   engine hand-tuned for GB10's SM121 kernels, ~3x vLLM's decode throughput
@@ -11,8 +10,9 @@ by hardware, since GB10 and other NVIDIA GPUs need different engines:
 - Any other NVIDIA GPU: llama.cpp server — reads GGUF, the portable choice
   when Atlas's GB10-only kernels don't apply.
 
-Within either engine, model size (9B vs 4B) is picked by free VRAM, since
-both a 9B and 4B GGUF/NVFP4 checkpoint exist for this project's models.
+Both are started via ``make agent-up`` (docker-compose profiles
+``atlas-agent`` / ``llamacpp-agent``) and serve OpenAI-compatible ``/v1`` on
+port 8888 — the Python side never loads model weights itself.
 """
 
 from __future__ import annotations
@@ -23,7 +23,8 @@ import subprocess
 
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_VRAM_THRESHOLD_GB = 12.0
+_ATLAS_DEFAULT_MODEL = "AxionML/Qwen3.5-4B-NVFP4"
+_LLAMACPP_DEFAULT_MODEL = "unsloth/Qwen3.5-4B-GGUF:Q4_K_M"
 
 
 def gpu_name() -> str | None:
@@ -49,57 +50,15 @@ def is_dgx_spark() -> bool:
     return bool(name and "GB10" in name)
 
 
-def free_vram_gb() -> float | None:
-    """Return free VRAM in GB on the first NVIDIA GPU, or None if unavailable.
+def default_agent_model() -> str:
+    """Return the model name the running Docker engine serves.
 
-    GB10 shares unified LPDDR5x memory with the system instead of discrete
-    VRAM, so nvidia-smi reports "Memory-Usage: Not Supported" / "[N/A]" for
-    memory.free there (confirmed on this machine) — fall back to
-    /proc/meminfo's MemAvailable in that case, since that pool IS the GPU
-    memory on this hardware.
+    ``AGENT_LOCAL_ENGINE_MODEL`` overrides; otherwise the engine picked by
+    hardware determines the default (Atlas NVFP4 on GB10, llama.cpp GGUF
+    elsewhere) — mirroring which docker-compose profile ``make agent-up``
+    starts on this machine.
     """
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0:
-            first_line = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
-            if first_line and first_line.replace(".", "", 1).isdigit():
-                return float(first_line) / 1024
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    if is_dgx_spark():
-        return _meminfo_available_gb()
-    return None
-
-
-def _meminfo_available_gb() -> float | None:
-    """Return MemAvailable from /proc/meminfo in GB, or None if unreadable."""
-    try:
-        with open("/proc/meminfo", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("MemAvailable:"):
-                    kb = float(line.split()[1])
-                    return kb / (1024 * 1024)
-    except (OSError, IndexError, ValueError):
-        pass
-    return None
-
-
-def has_enough_vram_for_9b() -> bool:
-    """True if free VRAM meets AGENT_VRAM_THRESHOLD_GB (default 12GB) for the 9B model.
-
-    Below the threshold, callers should use the smaller 4B model instead.
-    Unknown/no GPU counts as "not enough" — the local-engine fallback chain
-    only runs when a GPU was already detected, so this should rarely fire.
-    """
-    threshold = float(os.environ.get("AGENT_VRAM_THRESHOLD_GB", _DEFAULT_VRAM_THRESHOLD_GB))
-    free = free_vram_gb()
-    if free is None:
-        LOGGER.warning("Could not read free VRAM; assuming not enough for the 9B model.")
-        return False
-    return free >= threshold
+    override = os.environ.get("AGENT_LOCAL_ENGINE_MODEL")
+    if override:
+        return override
+    return _ATLAS_DEFAULT_MODEL if is_dgx_spark() else _LLAMACPP_DEFAULT_MODEL

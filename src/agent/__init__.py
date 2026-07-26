@@ -1,30 +1,19 @@
-"""VLM Agent package for VQA answer generation."""
+"""Agent package — VQA answering + interactive search, over the Docker LLM."""
 
-from agent.brain import VlmBrain, BrainResponse
-from agent.tools import Tool, CaptionTool, OCRTool, DetectTool, ASRTool, default_tools
+from agent.brain import AgentBrain, BrainResponse, parse_brain_response
+from agent.interactive import run_agent_turn
 from agent.react import Agent, create_agent
-from agent.local import (
-    LocalBrain,
-    LocalCaptionTool,
-    LocalOCRTool,
-    is_ollama_running,
-    local_default_tools,
-)
+from agent.tools import CaptionTool, OCRTool, Tool, default_tools
 
 __all__ = [
     "Agent",
-    "create_agent",
-    "VlmBrain",
+    "AgentBrain",
     "BrainResponse",
-    "Tool",
     "CaptionTool",
     "OCRTool",
-    "DetectTool",
-    "ASRTool",
+    "Tool",
+    "create_agent",
     "default_tools",
-    "LocalBrain",
-    "LocalCaptionTool",
-    "LocalOCRTool",
-    "is_ollama_running",
-    "local_default_tools",
+    "parse_brain_response",
+    "run_agent_turn",
 ]

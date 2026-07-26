@@ -158,6 +158,27 @@ def _run_temporal_pipeline(
     }
 
 
+def _cached_captions_context(experiment: Experiment, shot) -> str:
+    """Best-effort: captions cached at index time for the shot's frames.
+
+    Empty string when the experiment never ran captioning — the agent then
+    relies on its caption/ocr tools alone.
+    """
+    try:
+        from repository.caption_repo import CaptionRepository
+
+        captions = CaptionRepository(experiment).by_id()
+    except Exception:
+        LOGGER.debug("Caption manifest unavailable", exc_info=True)
+        return ""
+    lines = []
+    for frame in shot.frames[:5]:
+        caption = captions.get(str(frame.get("frame_id")))
+        if caption:
+            lines.append(f"- {caption}")
+    return "\n".join(lines)
+
+
 def vqa_search(
     experiment: Experiment,
     query: str,
@@ -166,7 +187,7 @@ def vqa_search(
     top_k: int = 20,
     reranker=None,
     reranker_top_k: int = 10,
-    vqa_backend: str = "gemini",
+    vqa_backend: str = "local",
 ) -> dict:
     """VQA pipeline: Embedding search → (rerank) → temporal → shot validation → agent answer.
 
@@ -232,12 +253,17 @@ def vqa_search(
         "validation_score": best_shot.validation_score,
     }
 
-    # Agent
+    # Agent — kèm caption đã cache lúc index (nếu có) để LLM text-only vẫn có
+    # ngữ cảnh thị giác khi VLM caption/ocr service không chạy.
     pipeline_stages["agent"] = {"max_steps": 5, "backend": vqa_backend}
     agent_error = None
     try:
         agent = create_agent(backend=vqa_backend)
-        answer = agent.answer(shot=best_shot, question=question or query)
+        answer = agent.answer(
+            shot=best_shot,
+            question=question or query,
+            context=_cached_captions_context(experiment, best_shot),
+        )
     except Exception as exc:
         LOGGER.exception("Agent failed")
         agent_error = str(exc)

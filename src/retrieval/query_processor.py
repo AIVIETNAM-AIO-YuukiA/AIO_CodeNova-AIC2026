@@ -9,6 +9,8 @@ import os
 
 LOGGER = logging.getLogger(__name__)
 
+_SYSTEM_PROMPT = "You are an expert query processor for a video retrieval system."
+
 
 @dataclass
 class ProcessedQuery:
@@ -37,44 +39,47 @@ class PassThroughQueryProcessor(QueryProcessor):
 
 
 class LlmQueryProcessor(QueryProcessor):
-    """Query processor backed by Gemini LLM to translate, expand, and parse queries."""
+    """Translate/expand queries via the Docker-hosted agent LLM (port 8888).
 
-    def __init__(self, api_key: str, model_name: str = "gemini-2.5-flash") -> None:
-        self.api_key = api_key
-        self.model_name = model_name
+    Falls back silently to pass-through on any server/parse error and disables
+    itself after the first connection failure — a competition run must never
+    hard-fail (or pay a timeout on every query) because the LLM container
+    isn't up.
+    """
+
+    def __init__(self, base_url: str | None = None, model_name: str | None = None) -> None:
+        self._base_url = base_url
+        self._model_name = model_name
         self._client = None
-        self._initialized = False
+        self._disabled = False
 
-    def _init_client(self) -> bool:
-        if self._initialized:
-            return True
-        try:
-            from google import genai
+    def _load_client(self):
+        if self._client is None:
+            from agent.hardware import default_agent_model
+            from modules._vllm_chat import VllmChatClient
 
-            self._client = genai.Client(api_key=self.api_key)
-            self._initialized = True
-            return True
-        except Exception as exc:
-            LOGGER.exception("Failed to initialize Gemini client: %s", exc)
-            return False
+            self._client = VllmChatClient(
+                base_url=self._base_url
+                or os.environ.get("AGENT_LOCAL_ENGINE_URL", "http://localhost:8888/v1"),
+                model_name=self._model_name or default_agent_model(),
+            )
+        return self._client
 
     def process(self, query: str) -> ProcessedQuery:
-        if not self._init_client():
-            LOGGER.warning("Gemini client not initialized, falling back to pass-through.")
+        if self._disabled:
             return ProcessedQuery(raw_query=query, visual_prompt=query)
 
         prompt = f"""
-        You are an expert query processor for a video retrieval system.
-        Your task is to analyze the user query (which might be in Vietnamese or English) and output a JSON object with the following fields:
+        Analyze the user query (which might be in Vietnamese or English) and output a JSON object with the following fields:
 
-        1. "visual_prompt": If the query is in Vietnamese, translate it to English. Then rewrite it as a natural, easy-to-understand visual search prompt for SigLIP-based video retrieval. Stay as close as possible to the user's original query. Preserve all entities and intent exactly. Do not add, infer, or invent any actions, objects, people, locations, events, attributes, camera details, lighting, colors, or other visual elements that are not explicitly mentioned in the query. Only rephrase for clarity and naturalness. Keep the output concise (max 50 words).
+        1. "visual_prompt": If the query is in Vietnamese, translate it to English. Then rewrite it as a natural, easy-to-understand visual search prompt for vision-language video retrieval. Stay as close as possible to the user's original query. Preserve all entities and intent exactly. Do not add, infer, or invent any actions, objects, people, locations, events, attributes, camera details, lighting, colors, or other visual elements that are not explicitly mentioned in the query. Only rephrase for clarity and naturalness. Keep the output concise (max 50 words).
         2. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
         3. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
         4. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor), or "action", if explicitly mentioned.
 
         User Query: "{query}"
 
-        Output JSON format:
+        Respond with ONLY the JSON object:
         {{
             "visual_prompt": "string",
             "ocr_keywords": ["string"],
@@ -85,32 +90,47 @@ class LlmQueryProcessor(QueryProcessor):
         }}
         """
         try:
-            from google.genai import types
-
-            response = self._client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(response_mime_type="application/json"),
+            text = self._load_client().complete_text(
+                system_prompt=_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                generation_params={"temperature": 0.0, "max_tokens": 400},
             )
-            data = json.loads(response.text.strip())
+            data = _extract_json(text)
             return ProcessedQuery(
                 raw_query=query,
-                visual_prompt=data.get("visual_prompt", query),
+                visual_prompt=data.get("visual_prompt", query) or query,
                 ocr_keywords=data.get("ocr_keywords", []),
                 asr_keywords=data.get("asr_keywords", []),
                 metadata=data.get("metadata", {}),
             )
         except Exception as exc:
-            LOGGER.warning("Gemini query processing failed: %s. Falling back to pass-through.", exc)
+            LOGGER.warning(
+                "LLM query processing failed: %s. Falling back to pass-through "
+                "for the rest of this session.",
+                exc,
+            )
+            self._disabled = True
             return ProcessedQuery(raw_query=query, visual_prompt=query)
 
 
-def get_query_processor() -> QueryProcessor:
-    """Resolve and return the appropriate query processor based on environment configuration."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        LOGGER.info("GEMINI_API_KEY environment variable not set. Using PassThroughQueryProcessor.")
-        return PassThroughQueryProcessor()
+def _extract_json(text: str) -> dict:
+    """Parse the first JSON object out of the LLM response (may be fenced/prefixed)."""
+    import re
 
-    LOGGER.info("GEMINI_API_KEY found. Using LlmQueryProcessor.")
-    return LlmQueryProcessor(api_key=api_key)
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError(f"No JSON object in LLM response: {text[:120]!r}")
+    data = json.loads(match.group())
+    if not isinstance(data, dict):
+        raise ValueError("LLM response JSON is not an object")
+    return data
+
+
+def get_query_processor() -> QueryProcessor:
+    """Return the LLM query processor over the Docker agent endpoint.
+
+    No API key needed — the processor auto-degrades to pass-through when the
+    server (``make agent-up``) isn't running, so returning it unconditionally
+    is safe.
+    """
+    return LlmQueryProcessor()

@@ -85,6 +85,17 @@ class ElasticTextIndex(TextIndex):
         fuzzy matching in one query so typos and partial matches still rank
         below an exact hit rather than needing separate calls.
         """
+        hits = self._query(query, top_k)
+        return [(hit["_id"], float(hit["_score"])) for hit in hits]
+
+    def search_documents(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
+        """Return full matching documents, optionally restricted to one source."""
+        hits = self._query(query, top_k, source=source)
+        return [
+            {"doc_id": hit["_id"], "score": float(hit["_score"]), **hit["_source"]} for hit in hits
+        ]
+
+    def _query(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
         client = self._connect()
         should = [
             {"match_phrase": {"text": {"query": query, "boost": 8.0}}},
@@ -101,12 +112,11 @@ class ElasticTextIndex(TextIndex):
             },
             {"match": {"text": {"query": query, "fuzziness": "AUTO", "boost": 2.0}}},
         ]
-        response = client.search(
-            index=self.index_name,
-            query={"bool": {"should": should, "minimum_should_match": 1}},
-            size=top_k,
-        )
-        return [(hit["_id"], float(hit["_score"])) for hit in response["hits"]["hits"]]
+        bool_query: dict = {"should": should, "minimum_should_match": 1}
+        if source is not None:
+            bool_query["filter"] = [{"term": {"source": source}}]
+        response = client.search(index=self.index_name, query={"bool": bool_query}, size=top_k)
+        return response["hits"]["hits"]
 
     def export_all(self):
         """Yield every document in the index as a dict, for local backup/inspection.

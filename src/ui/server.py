@@ -162,7 +162,7 @@ def build_handler(
                     top_k = int(payload.get("top_k") or default_top_k)
                     req_reranker_top_k = payload.get("reranker_top_k")
                     req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
-                    vqa_backend = payload.get("vqa_backend", "gemini")
+                    vqa_backend = payload.get("vqa_backend", "local")
 
                     result = vqa_search(
                         experiment=experiment,
@@ -181,6 +181,26 @@ def build_handler(
                     self._send_json(result)
                 except Exception as exc:
                     LOGGER.exception("VQA search failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # Interactive search agent (AIC_2025-style narrowing loop) — stateless,
+            # the frontend holds the conversation and re-sends it every turn.
+            if parsed.path == "/api/agent/chat":
+                try:
+                    from agent.interactive import run_agent_turn
+
+                    payload = self._read_json()
+                    messages = payload.get("messages")
+                    if not isinstance(messages, list) or not messages:
+                        raise ValueError("messages (non-empty list) is required.")
+                    result = run_agent_turn(messages, experiment)
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("Agent chat failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -557,9 +577,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="vqa-settings" style="display: none;">
           <label for="vqa-backend">VQA Backend</label>
           <select id="vqa-backend" name="vqa_backend">
-            <option value="internvl">InternVL (Local GPU)</option>
-            <option value="gemini">Gemini (Cloud API)</option>
-            <option value="ollama">Ollama (Local CPU/GPU)</option>
+            <option value="local">Qwen3.5-4B (Docker, Atlas/llama.cpp)</option>
           </select>
         </div>
 
@@ -589,6 +607,15 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </form>
       <p class="hint">VQA: 3-stage pipeline (Embedding search → Temporal → Agent). TRAKE: temporal search + event grouping. Textual/Video KIS: embedding search only.</p>
+      <div id="agent-chat" style="margin-top: 16px; border-top: 1px solid #ddd; padding-top: 12px;">
+        <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);">Agent Chat</div>
+        <div id="chat-messages" style="max-height: 220px; overflow-y: auto; font-size: 13px; margin: 8px 0; line-height: 1.45;"></div>
+        <div id="chat-suggestions" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;"></div>
+        <div style="display: flex; gap: 6px;">
+          <input id="chat-input" type="text" placeholder="Mô tả cảnh cần tìm..." style="flex: 1; padding: 6px 8px; font-size: 13px;">
+          <button id="chat-send" type="button">Gửi</button>
+        </div>
+      </div>
       <div id="status" class="status">Ready.</div>
     </aside>
     <section>
@@ -829,7 +856,7 @@ INDEX_HTML = r"""<!doctype html>
         { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
         { key: "gather_shot", label: "Shot Gather", desc: `${pipeline.gather_shot?.shots_count || 0} valid shots gathered` },
         { key: "shot_validation", label: "Shot Validation", desc: `Score: ${(pipeline.shot_validation?.validation_score || 0).toFixed(4)}` },
-        { key: "agent", label: "Agent (Gemini)", desc: `Answer: ${(pipeline.agent?.answer || "N/A").substring(0, 100)}` },
+        { key: "agent", label: "Agent (Qwen3.5-4B)", desc: `Answer: ${(pipeline.agent?.answer || "N/A").substring(0, 100)}` },
       ] : [
         { key: "embed_search", label: "Embedding Search", desc: `Top-${pipeline.embed_search?.top_k} frames retrieved` },
         { key: "temporal_search", label: "Temporal Search", desc: `${pipeline.temporal_search?.segments_found || 0} segments found` },
@@ -1055,6 +1082,60 @@ INDEX_HTML = r"""<!doctype html>
     if (form.track.value === 'vqa') {
         document.getElementById('vqa-settings').style.display = 'block';
     }
+
+    // --- Interactive agent chat (stateless server: we keep the history) ---
+    const chatMessages = [];
+    const chatBox = document.getElementById("chat-messages");
+    const chatInput = document.getElementById("chat-input");
+    const chatSend = document.getElementById("chat-send");
+    const chatSuggestions = document.getElementById("chat-suggestions");
+
+    function chatRender() {
+      chatBox.innerHTML = chatMessages.map(m =>
+        `<div style="margin-bottom:6px;"><b>${m.role === "user" ? "Bạn" : "Agent"}:</b> ${escapeHtml(m.content)}</div>`
+      ).join("");
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function chatSubmit(text) {
+      if (!text.trim()) return;
+      chatMessages.push({ role: "user", content: text.trim() });
+      chatInput.value = "";
+      chatSuggestions.innerHTML = "";
+      chatRender();
+      chatSend.disabled = true;
+      statusEl.textContent = "Agent đang tìm...";
+      try {
+        const resp = await fetch("/api/agent/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: chatMessages }),
+        });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        chatMessages.push({ role: "assistant", content: data.message || "" });
+        chatRender();
+        (data.suggestions || []).forEach(s => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.textContent = s;
+          btn.style.cssText = "font-size:12px;padding:3px 8px;";
+          btn.onclick = () => chatSubmit(s);
+          chatSuggestions.appendChild(btn);
+        });
+        if (data.results && data.results.length) renderResults(data.results);
+        statusEl.textContent = `Agent: ${data.results ? data.results.length : 0} kết quả.`;
+      } catch (err) {
+        statusEl.textContent = "Agent lỗi: " + err.message;
+      } finally {
+        chatSend.disabled = false;
+      }
+    }
+
+    chatSend.addEventListener("click", () => chatSubmit(chatInput.value));
+    chatInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); chatSubmit(chatInput.value); }
+    });
   </script>
 </body>
 </html>

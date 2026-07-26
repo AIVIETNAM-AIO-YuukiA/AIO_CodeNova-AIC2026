@@ -262,7 +262,7 @@ def load_temporal_data(
 
     if not embeddings_path.exists() or not frame_ids_path.exists():
         raise FileNotFoundError(
-            f"Chưa có embeddings. Chạy 'embed-frames' trước. " f"Missing: {embeddings_path}"
+            f"Chưa có embeddings. Chạy 'embed-frames' trước. Missing: {embeddings_path}"
         )
 
     vectors = np.load(embeddings_path)["embeddings"].astype("float32")

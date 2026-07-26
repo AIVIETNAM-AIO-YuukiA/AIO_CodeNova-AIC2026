@@ -1,10 +1,10 @@
-"""Shared low-level client for calling a self-hosted vLLM chat-completions endpoint.
+"""Shared low-level client for OpenAI-compatible chat-completions endpoints.
 
-Internal helper — not a public module interface. Used by both
-``modules/captioning/vllm.py`` (scene captioning) and ``modules/ocr/vllm.py``
-(on-screen text extraction): same server, same model, same image-inlining
-mechanics, different prompts and different downstream consumers (Vietnamese
-embedding branch vs. Elasticsearch branch).
+Internal helper — not a public module interface. Used by
+``modules/captioning/vllm.py`` / ``modules/ocr/vllm.py`` (vLLM VLM on port
+8881, image-inlined calls) and by the agent + query processor (Atlas or
+llama.cpp on port 8888, text-only calls). All model serving is Docker-hosted;
+no checkpoint is ever loaded in-process through this module.
 """
 
 from __future__ import annotations
@@ -58,6 +58,33 @@ class VllmChatClient:
         response = client.post(
             "/chat/completions",
             json={"model": self.model_name, "messages": messages, **generation_params},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload["choices"][0]["message"]["content"].strip()
+
+    def complete_text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        generation_params: dict[str, object] | None = None,
+        extra_messages: list[dict[str, object]] | None = None,
+    ) -> str:
+        """Send one text-only chat-completions call and return the text response."""
+        client = self._load_client()
+        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}]
+        if extra_messages:
+            messages.extend(extra_messages)
+        if user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
+
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": self.model_name,
+                "messages": messages,
+                **(generation_params or {}),
+            },
         )
         response.raise_for_status()
         payload = response.json()

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import logging
 
 from retrieval.temporal_search import ShotInput
-from agent.brain import VlmBrain
+from agent.brain import AgentBrain
 from agent.tools import Tool, default_tools
 
 LOGGER = logging.getLogger(__name__)
@@ -18,18 +17,18 @@ class Agent:
     """ReAct Agent for VQA answer generation.
 
     Args:
-        brain: VlmBrain instance (Gemini API).
+        brain: AgentBrain instance (Docker-hosted LLM).
         tools: Dict of tool_name → Tool instance.
         max_steps: Maximum ReAct iterations before forced answer.
     """
 
     def __init__(
         self,
-        brain: VlmBrain | None = None,
+        brain: AgentBrain | None = None,
         tools: dict[str, Tool] | None = None,
         max_steps: int = MAX_STEPS,
     ) -> None:
-        self.brain = brain or VlmBrain()
+        self.brain = brain or AgentBrain()
         self.tools = tools or default_tools()
         self.max_steps = max_steps
 
@@ -37,12 +36,16 @@ class Agent:
         self,
         shot: ShotInput,
         question: str,
+        context: str = "",
     ) -> str:
         """Run ReAct loop to answer a VQA question.
 
         Args:
             shot: Validated shot input (frames with context).
             question: The VQA question.
+            context: Optional extra text context for the brain (e.g. captions
+                cached at index time) — lets the text-only LLM answer even
+                when the VLM caption/ocr service isn't running.
 
         Returns:
             Final answer text.
@@ -56,22 +59,15 @@ class Agent:
                 f"time=[{shot.start_timestamp:.1f}s - {shot.end_timestamp:.1f}s]"
             )
             if shot.start_timestamp
-            else (f"video={shot.video_name or shot.video_id}, " f"frames={shot.frame_count}")
+            else (f"video={shot.video_name or shot.video_id}, frames={shot.frame_count}")
         )
+        if context:
+            shot_info += f"\nIndexed context:\n{context}"
 
-        LOGGER.info("Agent starting: question=%s shot_info=%s", question, shot_info)
+        LOGGER.info("Agent starting: question=%s shot_info=%s", question, shot_info[:300])
 
         tool_results: list[dict] = []
         first_frame_path = shot.frame_paths[len(shot.frame_paths) // 2] if shot.frame_paths else ""
-
-        # Inject frame paths into InternVLBrain so it can do direct visual inference.
-        if hasattr(self.brain, "set_frame_paths") and shot.frame_paths:
-            LOGGER.info(
-                "Agent: injecting %d frame paths into brain. sample=%s",
-                len(shot.frame_paths),
-                shot.frame_paths[len(shot.frame_paths) // 2] if shot.frame_paths else "N/A",
-            )
-            self.brain.set_frame_paths(list(shot.frame_paths))
 
         for step in range(1, self.max_steps + 1):
             LOGGER.info("Agent step %d/%d", step, self.max_steps)
@@ -111,7 +107,7 @@ class Agent:
                 tool_input = dict(raw) if isinstance(raw, dict) else {}
 
                 # Luôn gắn image_path mặc định nếu tool cần ảnh và chưa có
-                if response.action in ("caption", "ocr", "detect"):
+                if response.action in ("caption", "ocr"):
                     if "image_path" not in tool_input or not tool_input["image_path"]:
                         tool_input["image_path"] = first_frame_path
                     # Truyền câu hỏi làm prompt cho caption
@@ -135,104 +131,21 @@ class Agent:
         LOGGER.warning("Agent reached max steps without final answer")
         final_context = "\n".join(f"{r['tool']}: {r['result'][:300]}" for r in tool_results)
         fallback = (
-            f"Based on the analysis of the video shot:\n"
-            f"{final_context}\n\n"
-            f"Question: {question}"
+            f"Based on the analysis of the video shot:\n{final_context}\n\nQuestion: {question}"
         )
         return fallback
 
 
-def _load_dotenv() -> None:
-    """Load .env file if GEMINI_API_KEY is not already set."""
-    import os
+def create_agent(backend: str = "local") -> Agent:
+    """Create the Agent over the Docker-hosted LLM.
 
-    if os.environ.get("GEMINI_API_KEY"):
-        return
-    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, val = line.partition("=")
-                if key.strip() == "GEMINI_API_KEY":
-                    os.environ["GEMINI_API_KEY"] = val.strip()
-                    break
-
-
-def create_agent(backend: str = "gemini") -> Agent:
-    """Create an Agent with the specified backend.
-
-    Fallback chain when GEMINI_API_KEY isn't set: Ollama (if running) ->
-    self-hosted local engine (Atlas on DGX Spark/GB10, else llama.cpp; 9B vs
-    4B model picked by free VRAM, see agent/hardware.py) -> Gemini client
-    with no key (will fail at call time, last resort).
-
-    Args:
-        backend: One of 'gemini', 'internvl', 'ollama' (default: 'gemini').
-                 Falls back gracefully if the requested backend is unavailable.
+    There is exactly one backend: the OpenAI-compatible server on port 8888
+    (`make agent-up` — Atlas on GB10, llama.cpp elsewhere; see
+    agent/hardware.py). ``backend`` is accepted for API compatibility with
+    older callers but no longer selects anything.
     """
-    import os
-
-    _load_dotenv()
-
-    if backend == "internvl":
-        model_name = os.environ.get("INTERNVL_MODEL", "OpenGVLab/InternVL3-2B-hf")
-        LOGGER.info("Using InternVL backend (model: %s)", model_name)
-        try:
-            from agent.internvl import InternVLBrain, internvl_default_tools
-
-            brain = InternVLBrain(model_name=model_name)
-            tools = internvl_default_tools(model_name=model_name)
-            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-        except ImportError as exc:
-            LOGGER.error("Failed to load InternVL backend: %s. Falling back to Gemini.", exc)
-            # Fall through to Gemini
-
-    if (backend == "gemini" or backend == "internvl") and os.environ.get("GEMINI_API_KEY"):
-        LOGGER.info("GEMINI_API_KEY found — using cloud brain and tools")
-        brain = VlmBrain()
-        tools = default_tools()
-        return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-
-    try:
-        from agent.local import is_ollama_running, LocalBrain, local_default_tools
-
-        if is_ollama_running():
-            LOGGER.info("Ollama detected — using local brain and tools")
-            brain = LocalBrain()
-            tools = local_default_tools()
-            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-    except Exception as exc:
-        LOGGER.debug("Ollama detection failed: %s", exc)
-
-    try:
-        from agent import hardware
-        from agent.local_engine import LocalEngineBrain, local_engine_default_tools
-
-        if hardware.gpu_name() is not None:
-            use_9b = hardware.has_enough_vram_for_9b()
-            if hardware.is_dgx_spark():
-                default_model = (
-                    "AxionML/Qwen3.5-9B-NVFP4" if use_9b else "AxionML/Qwen3-VL-4B-NVFP4"
-                )
-            else:
-                default_model = (
-                    "unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
-                    if use_9b
-                    else "unsloth/Qwen3-VL-4B-Instruct-GGUF:Q4_K_M"
-                )
-            model_name = os.environ.get("AGENT_LOCAL_ENGINE_MODEL", default_model)
-            LOGGER.info(
-                "No GEMINI_API_KEY/Ollama — using local engine (gpu=%s, model=%s)",
-                hardware.gpu_name(),
-                model_name,
-            )
-            brain = LocalEngineBrain(model_name=model_name)
-            tools = local_engine_default_tools(model_name=model_name)
-            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-    except Exception as exc:
-        LOGGER.debug("Local-engine detection failed: %s", exc)
-
-    brain = VlmBrain()
-    tools = default_tools()
-    return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
+    if backend not in ("local", ""):
+        LOGGER.info(
+            "Agent backend %r requested; only the Docker engine exists — using it.", backend
+        )
+    return Agent(brain=AgentBrain(), tools=default_tools(), max_steps=MAX_STEPS)
