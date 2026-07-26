@@ -15,10 +15,11 @@ PORT        ?=
 TN2_DIR     ?= external/TransNetV2/inference-pytorch
 TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 
-.PHONY: help sync install-hooks lint format check test pre-commit \
+.PHONY: help sync install-hooks lint format check test pre-commit precommit \
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
         vllm-retrieval vllm-index vllm-down vllm-health \
+        agent-up agent-down agent-health \
         ingest detect-shots extract-frames embed-frames build-index extract-text export-text import-text pipeline \
         search serve-ui clean-runs clean
 
@@ -48,6 +49,8 @@ test: ## Chạy unit test
 
 pre-commit: ## Chạy toàn bộ pre-commit hook
 	uv run pre-commit run --all-files
+
+precommit: pre-commit ## Alias của pre-commit
 
 ## --- Qdrant (vector DB) ---
 qdrant-up: ## Khởi động Qdrant qua docker compose
@@ -80,6 +83,23 @@ vllm-down: ## Dừng service vLLM đang chạy (không đụng service khác)
 vllm-health: ## Kiểm tra vLLM có sống không (model nào đang chạy)
 	curl -sf http://localhost:8881/v1/models && echo
 
+## --- Agent LLM (Qwen3.5-4B, port 8888; engine chọn theo phần cứng) ---
+agent-up: ## Khởi động agent LLM: Atlas nếu là DGX Spark/GB10, ngược lại llama.cpp
+	@if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q GB10; then \
+		echo "GB10 detected -> Atlas (NVFP4 4-bit)"; \
+		docker compose --profile atlas-agent up -d atlas-agent; \
+	else \
+		echo "Non-GB10 GPU -> llama.cpp (GGUF Q4_K_M)"; \
+		docker compose --profile llamacpp-agent up -d llamacpp-agent; \
+	fi
+
+agent-down: ## Dừng agent LLM (cả 2 engine)
+	docker compose stop atlas-agent llamacpp-agent 2>/dev/null || true
+	docker compose rm -f atlas-agent llamacpp-agent 2>/dev/null || true
+
+agent-health: ## Kiểm tra agent LLM có sống không
+	curl -sf http://localhost:8888/v1/models && echo
+
 ## --- Pipeline index offline ---
 ingest: ## Quét video (INPUT, EXP; RESUME=1 để dùng lại experiment đã có)
 	uv run codenova ingest --input $(INPUT) --experiment-name $(EXP) $(if $(RESUME),--resume)
@@ -92,7 +112,7 @@ detect-shots: ## Phát hiện shot bằng TransNetV2 (EXP)
 extract-frames: ## Trích keyframe (EXP)
 	uv run codenova extract-frames --experiment-name $(EXP)
 
-embed-frames: ## Embed keyframe: SigLIP2/BEiT-3/Vietnamese caption embedding (EXP)
+embed-frames: ## Embed keyframe bằng BEiT-3 large (EXP; EMBEDDING_MODELS để thêm siglip2/vietnamese)
 	uv run codenova embed-frames --experiment-name $(EXP)
 
 build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
