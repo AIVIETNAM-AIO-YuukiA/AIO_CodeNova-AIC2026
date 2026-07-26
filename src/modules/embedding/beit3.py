@@ -132,7 +132,7 @@ class Beit3Embedder(Embedder):
             images = [Image.open(Path(frame.frame_path)).convert("RGB") for frame in batch]
             try:
                 pixel_values = torch.stack([transform(image) for image in images]).to(device)
-                with torch.no_grad():
+                with torch.no_grad(), _autocast(torch, device):
                     vision_cls, _ = model(image=pixel_values, only_infer=True)
                 batch_vectors = vision_cls.detach().cpu().numpy().astype("float32").tolist()
                 vectors.extend(batch_vectors)
@@ -150,7 +150,7 @@ class Beit3Embedder(Embedder):
         input_ids, padding_mask = _tokenize(sp, query, torch)
         input_ids = input_ids.to(device)
         padding_mask = padding_mask.to(device)
-        with torch.no_grad():
+        with torch.no_grad(), _autocast(torch, device):
             _, language_cls = model(
                 text_description=input_ids, padding_mask=padding_mask, only_infer=True
             )
@@ -214,6 +214,21 @@ class Beit3Embedder(Embedder):
         self._torch = torch
         self._torch_device = device
         return model, sp, transform, torch, device
+
+
+def _autocast(torch, device):
+    """fp16 autocast on CUDA, no-op elsewhere.
+
+    Matches the AIC_2025 reference project's BEiT-3 inference. On GB10's
+    bandwidth-bound unified memory this roughly halves per-image time vs
+    fp32 — measured here as the difference between a ~65h and ~30h full
+    re-embed of 283K frames. Outputs are cast back to float32 on store.
+    """
+    if getattr(device, "type", str(device)) == "cuda" or str(device).startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    import contextlib
+
+    return contextlib.nullcontext()
 
 
 def _tokenize(sp, text: str, torch):
