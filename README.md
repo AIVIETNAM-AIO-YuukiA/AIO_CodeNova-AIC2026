@@ -1,11 +1,10 @@
-# Video Retrieval Pipeline
+# CodeNova — Video Retrieval Pipeline (HCMC AI Challenge 2026)
 
-Resumable video retrieval pipeline using shot decomposition and SigLIP2/BEiT-3
-semantic search.
-
-Videos are split into shots, sampled into keyframes, embedded with SigLIP2 and/or
-BEiT-3, and indexed in Qdrant. Text queries are embedded and matched against keyframes
-for known-item search (KIS).
+Resumable video retrieval system: videos are split into shots, sampled into
+keyframes, embedded with **BEiT-3 large** (384px, dim 1024, COCO-retrieval
+fine-tune), and indexed in Qdrant. OCR/ASR text goes into Elasticsearch. An
+LLM agent (Qwen3.5-4B, Docker-served) answers VQA questions and drives an
+interactive narrowing-loop search chat.
 
 > 🇻🇳 Tài liệu tiếng Việt: [docs/vi/README.md](docs/vi/README.md)
 
@@ -14,139 +13,172 @@ for known-item search (KIS).
 ```
 OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
+                                          (vector index: BEiT-3 large → Qdrant)
+  extract-text  (separate stage: OCR per keyframe + ASR per video → Elasticsearch;
+                 needs `make vllm-index` + `make elasticsearch-up`)
 
 ONLINE (retrieval)
-  text query → embed (SigLIP2/BEiT-3) → Qdrant search → hydrate metadata → results
+  text query → [LLM translate/expand] → embed (BEiT-3) → Qdrant search
+    → temporal search (frame-to-frame walk → segments) → shot validation
+    → track shaping (textual KIS / VQA / TRAKE)
+    → [VQA] agent answer  /  [chat] interactive agent loop
 ```
+
+All generative models (LLM/VLM) are **Docker-served over OpenAI-compatible
+HTTP** — no model checkpoint is loaded inside the Python process for agent,
+captioning, OCR, or query processing. Embedders/rerankers (BEiT-3, SigLIP2,
+BLIP-2) run in-process as batch encoders.
+
+## Models
+
+| Role | Model | Where it runs |
+|------|-------|---------------|
+| Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, auto-downloaded to `external/BEiT3/checkpoints/` |
+| Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process |
+| Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
+| Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
+| Captioning + OCR (indexing & agent tools) | Qwen3.6-35B-A3B AWQ | Docker `vllm-index`, port 8881 |
+| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | Docker port 8888 — Atlas (NVFP4) on DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) elsewhere |
+| ASR | gipformer-65M-rnnt + Silero-VAD | subprocess into `external/gipformer/` |
+| Shot detection | TransNetV2 (PyTorch) | in-process |
+
+`make agent-up` picks Atlas vs llama.cpp automatically from `nvidia-smi`
+(GB10 → Atlas). Override models via `ATLAS_MODEL` / `LLAMACPP_MODEL` in `.env`.
+
+## Agent
+
+Two agent paths, one LLM backend (port 8888):
+
+- **VQA answering** (`agent/react.py`): ReAct loop (max 5 steps) with
+  `caption`/`ocr` tools that call the Docker VLM on port 8881. Cached
+  index-time captions are passed as context, so the text-only LLM can answer
+  even when the VLM service is down.
+- **Interactive search chat** (`agent/interactive.py`, `POST /api/agent/chat`
+  + chat panel in the UI): the AIC_2025-style narrowing loop — tools
+  `search_kis`, `search_asr`, `search_ocr`, `subagent_summarize`, `ask_user`;
+  max 6 tool rounds per turn; stateless (the browser keeps the conversation).
+
+Query processing (`retrieval/query_processor.py`) uses the same LLM to
+translate Vietnamese → English and extract OCR/ASR keywords; it silently
+degrades to pass-through when the server is down and disables itself for the
+session after the first failure (a competition run must never block on it).
 
 ## Project layout
 
 ```
 src/
-  cli/            # command-line interface
+  cli/            # command-line interface (see `make help`)
   config/         # settings, experiment naming, .env loading
   core/           # logging, errors, typed records
   video/          # video discovery, shot detection, frame extraction (OpenCV/TransNetV2)
   indexing/       # offline pipeline stages + manifests + SQLite job state
-  retrieval/      # online search: Retriever, metadata hydration, contest tracks
-  modules/        # AI models: embedding (SigLIP2, BEiT-3), reranker (BLIP-2 ITM),
-                  #   stubs (asr/ocr/captioning/detection)
+  retrieval/      # online search: Retriever, SRRF fusion, temporal search, tracks, VQA/TRAKE
+  modules/        # model backends: embedding (beit3/siglip/vietnamese),
+                  #   reranker (blip2_itm/vietnamese), captioning+ocr (vLLM), asr (gipformer)
+  agent/          # brain (Docker LLM), ReAct VQA loop, interactive chat agent, tools
   stores/
-    vector/       # Qdrant vector index (interface + backend + factory)
-    text/         # Elasticsearch full-text index (interface + backend, not yet wired in)
-  repository/     # data access over run manifests
-  prompts/        # LLM/VLM prompt templates (stub)
-  ui/             # local browser UI
+    vector/       # Qdrant vector index
+    text/         # Elasticsearch BM25 (OCR/ASR), wired in via `extract-text`
+  repository/     # data access over run manifests (frames, videos, captions)
+  prompts/        # LLM/VLM prompt templates (captioning, ocr, agent)
+  ui/             # local browser UI (tracks + agent chat)
 tests/unit/       # unit tests
-docs/             # documentation (English) + docs/vi (Vietnamese)
+docs/vi/          # Vietnamese documentation
 ```
 
 ## Requirements
 
 - Python ≥ 3.13, managed with [uv](https://docs.astral.sh/uv/)
-- NVIDIA GPU + CUDA (SigLIP2, BEiT-3, and TransNetV2 require CUDA when `--device auto`)
-- Docker (for Qdrant)
-- TransNetV2 PyTorch weights (see [docs/transnetv2.md](docs/transnetv2.md))
+- NVIDIA GPU + CUDA (embedders + TransNetV2 need CUDA when `--device auto`)
+- Docker (Qdrant, Elasticsearch, all LLM/VLM serving)
+- TransNetV2 PyTorch weights at
+  `external/TransNetV2/inference-pytorch/transnetv2-pytorch-weights.pth`
+- For ASR: one-time `cd external/gipformer && uv sync` (isolated repo+venv),
+  and `uv pip install onnxruntime` (deliberately NOT in `pyproject.toml` —
+  adding it there silently downgrades the pinned `+cu128` torch build)
 
 ## Setup
 
 ```bash
 uv sync                       # install dependencies
-cp .env.example .env          # configure Qdrant / API keys
-make qdrant-up                # start Qdrant (docker compose)
-make qdrant-health            # -> healthz check passed
-```
-
-Verify CUDA:
-
-```bash
-uv run python - <<'PY'
-import torch
-print("cuda available:", torch.cuda.is_available())
-print("device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else None)
-PY
+cp .env.example .env          # configure endpoints (defaults work locally)
+make qdrant-up qdrant-health  # vector DB
+make agent-up agent-health    # agent LLM (auto-picks Atlas vs llama.cpp)
 ```
 
 ## Running the pipeline
 
-Every step runs through `uv`. The `Makefile` wraps the common commands — run `make help`
-to list them. `EXP` selects the experiment (run) name.
+`EXP` selects the experiment (run) name; run `make help` for all targets.
 
 ```bash
-# Full offline pipeline (ingest → ... → build-index)
+# Full offline pipeline (vector index only)
 make pipeline EXP=demo INPUT=data/raw_videos
 
 # Or step by step
 make ingest         EXP=demo INPUT=data/raw_videos
 make detect-shots   EXP=demo
 make extract-frames EXP=demo
-make embed-frames   EXP=demo
+make embed-frames   EXP=demo      # BEiT-3 large; ~2GB checkpoint auto-downloads on first run
 make build-index    EXP=demo      # needs Qdrant running
+
+# OCR/ASR text branch (separate; needs vllm-index + Elasticsearch)
+make vllm-index elasticsearch-up
+make extract-text EXP=demo
+make export-text  EXP=demo        # dump ES -> manifests/text.jsonl (shareable)
+make import-text  EXP=demo        # load text.jsonl back into ES
 
 # Search / UI
 make search   EXP=demo QUERY="a person riding a motorbike"
-make serve-ui EXP=demo            # http://127.0.0.1:7860
+make serve-ui EXP=demo            # http://127.0.0.1:7860 (tracks + agent chat)
 ```
 
-Each stage records progress in `runs/<EXP>/jobs.sqlite` and the manifests, so re-running a
-stage skips completed work. Pass `--force` (on the raw CLI) to redo a stage.
+Each stage records progress in `runs/<EXP>/jobs.sqlite`; re-running a stage
+skips completed work. Pass `--force` (raw CLI) to redo a stage.
+
+### Re-indexing after an embedding-model change
+
+Changing `--embedding-models` changes the embedding space, so re-run:
+
+```bash
+uv run codenova embed-frames --experiment-name <EXP> --embedding-models beit3 --force
+uv run codenova build-index  --experiment-name <EXP> --embedding-models beit3
+```
+
+`build-index` recreates the Qdrant collection from scratch (delete +
+recreate), so no stale vectors survive.
 
 ## Configuration
 
-Config splits in two:
+Two layers — don't blur them:
 
-- **`.env`** — infrastructure: service endpoints, ports, credentials. Per-machine, loaded
-  automatically (see `.env.example`).
-- **CLI flags** — per-experiment settings (model, keyframes, top-k). Recorded in
-  `runs/<exp>/config.json` so each run is reproducible. These are intentionally *not* in `.env`.
-
-`.env` (loaded automatically):
-
-```bash
-# Vector DB (Qdrant)
-QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=codenova_frames
-QDRANT_API_KEY=                    # empty for local; set for Qdrant Cloud
-
-# Full-text index (Elasticsearch — for OCR/ASR, not yet wired in)
-ELASTIC_URL=http://localhost:9200
-ELASTIC_INDEX=codenova_text
-ELASTIC_API_KEY=
-
-# Retrieval UI defaults
-CODENOVA_UI_HOST=127.0.0.1
-CODENOVA_UI_PORT=7860
-```
+- **`.env`** — infrastructure: service endpoints, ports, hosted-model IDs.
+  Per-machine, git-ignored, loaded automatically (see `.env.example` for the
+  full annotated list).
+- **CLI flags** — per-experiment settings, recorded in
+  `runs/<exp>/config.json`. Changing them changes the experiment identity.
 
 Key pipeline options (CLI flags, defaults shown):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--embedding-models` | `siglip2-large` | Comma-separated embedding model(s) (`siglip2-large`, `beit3-*`); multiple models enable SRRF fusion + BLIP-2 rerank |
+| `--embedding-models` | `beit3` | Comma-separated embedders (`beit3`, `siglip2`, `vietnamese-embedding`); >1 model enables SRRF fusion + BLIP-2 rerank |
 | `--frame-sampling` | `shot-percentile` | Keyframe sampling strategy |
 | `--keyframe-percentiles` | `0.15,0.5,0.85` | Where in each shot to sample keyframes |
 | `--index-backend` | `qdrant` | Vector index backend |
 | `--top-k` | `20` | Number of results |
 | `--device` | `auto` | Torch device (`auto` requires CUDA) |
 
-### Keyframe sampling
-
-Each shot is sampled at the configured percentiles: frame index `= start + round(span * p)`
-for each percentile `p`. The default `0.15, 0.5, 0.85` yields three keyframes per shot
-(near-start, middle, near-end). Duplicate indices for very short shots collapse to a single
-keyframe.
+`serve-ui` extras: `--reranker-model` / `--reranker-top-k` enable the BLIP-2
+cross-encoder rerank stage in the UI.
 
 ## Storage backends
 
-Storage lives under `stores`, each backend behind an interface so new ones can be
-added without touching the pipeline:
-
-- **`stores/vector`** — Qdrant. Embeddings are L2-normalized so cosine distance ranks like
-  inner product. Each experiment uses its own collection: `{QDRANT_COLLECTION}__{experiment}`.
-  Vector + `frame_id` are stored; metadata is hydrated from manifests at query time.
-- **`stores/text`** — Elasticsearch (BM25) for OCR/ASR text. Interface + backend exist but
-  are **not yet wired into the pipeline** (no OCR/ASR text is produced yet). Install with
-  the `text` extra: `uv pip install -e '.[text]'`.
+- **`stores/vector`** — Qdrant. L2-normalized embeddings, cosine distance,
+  named vector per embedding model. One collection per experiment:
+  `{QDRANT_COLLECTION}__{experiment}`. Metadata is hydrated from manifests at
+  query time.
+- **`stores/text`** — Elasticsearch (BM25) for OCR/ASR documents, one index,
+  `source` field distinguishes ocr/asr. Populated by `make extract-text`.
 
 ## Development
 
@@ -165,16 +197,11 @@ runs/<experiment>/
   config.json
   jobs.sqlite
   logs/{pipeline.log, errors.log}
-  manifests/{videos,shots,frames,embeddings}.jsonl
+  manifests/{videos,shots,frames,embeddings}.jsonl  (+captions.jsonl, text.jsonl)
   frames/<video_id>/*.jpg
-  embeddings/{frames.npz, frame_ids.json}
+  embeddings/{frames.npz, frame_ids.json}           (per-model files on multi-model runs)
 ```
 
-The vector index is not on disk — it lives in Qdrant (`qdrant_storage/`).
-`runs/`, `data/`, `external/`, `qdrant_storage/`, and `.env` are git-ignored.
-
-## Documentation
-
-- [docs/qdrant.md](docs/qdrant.md) — Qdrant usage
-- [docs/transnetv2.md](docs/transnetv2.md) — preparing TransNetV2 weights
-- [docs/vi/](docs/vi/) — Vietnamese documentation
+The vector index lives in Qdrant (`qdrant_storage/`), text in Elasticsearch
+(named Docker volume). `runs/`, `data/`, `external/`, `qdrant_storage/`, and
+`.env` are git-ignored.
