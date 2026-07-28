@@ -48,7 +48,7 @@ def kis_detail_search(
 
     # 1. Load frame_embeddings + metadata
     try:
-        frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+        frame_embeddings, frame_records = load_temporal_data(experiment)
     except FileNotFoundError as exc:
         return {"error": str(exc), "results": [], "total": 0}
 

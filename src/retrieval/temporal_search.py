@@ -13,11 +13,13 @@ Pipeline:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import json
 import logging
 
 import numpy as np
+
+from config.settings import Experiment
+from indexing.embedding_paths import frame_ids_path, vectors_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -243,12 +245,15 @@ def gather_frame_s(
 
 
 def load_temporal_data(
-    run_dir: Path,
+    experiment: Experiment,
+    model_name: str | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Load embeddings và metadata frame cho temporal search.
 
     Args:
-        run_dir: Thư mục experiment (runs/<experiment-name>/).
+        experiment: Experiment đang chạy.
+        model_name: Model dùng làm nguồn embedding cho temporal search;
+            mặc định là model đầu tiên trong ``embedding_models``.
 
     Returns:
         (frame_embeddings, frame_metadata_list)
@@ -256,17 +261,20 @@ def load_temporal_data(
         - frame_metadata_list: list[dict] mỗi phần tử chứa frame_id, video_id,
           shot_id, frame_index, timestamp_sec, frame_path.
     """
-    embeddings_path = run_dir / "embeddings" / "frames.npz"
-    frame_ids_path = run_dir / "embeddings" / "frame_ids.json"
-    frames_manifest = run_dir / "manifests" / "frames.jsonl"
+    model_name = model_name or experiment.config.embedding_models[0]
+    embeddings_dir = experiment.run_dir / "embeddings"
+    embeddings_path = vectors_path(embeddings_dir, model_name)
+    frame_ids_json_path = frame_ids_path(embeddings_dir, model_name)
+    frames_manifest = experiment.run_dir / "manifests" / "frames.jsonl"
 
-    if not embeddings_path.exists() or not frame_ids_path.exists():
+    if not embeddings_path.exists() or not frame_ids_json_path.exists():
         raise FileNotFoundError(
-            f"Chưa có embeddings. Chạy 'embed-frames' trước. Missing: {embeddings_path}"
+            f"Chưa có embeddings cho model '{model_name}'. Chạy 'embed-frames' trước. "
+            f"Missing: {embeddings_path}"
         )
 
     vectors = np.load(embeddings_path)["embeddings"].astype("float32")
-    id_list = json.loads(frame_ids_path.read_text(encoding="utf-8"))
+    id_list = json.loads(frame_ids_json_path.read_text(encoding="utf-8"))
 
     frame_map: dict[str, dict] = {}
     if frames_manifest.exists():

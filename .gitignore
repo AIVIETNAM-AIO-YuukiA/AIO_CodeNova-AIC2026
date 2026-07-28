@@ -212,6 +212,9 @@ runs/
 data/
 external/
 
+# ONNX/TensorRT exported weights (large, machine/TensorRT-version specific)
+weights/
+
 # PyPI configuration file
 .pypirc
 

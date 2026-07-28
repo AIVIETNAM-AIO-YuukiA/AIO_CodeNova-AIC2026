@@ -11,21 +11,22 @@ The vendor source uses flat, non-relative imports (``import utils``,
 ``import torchscale.xxx``) exactly as in the upstream repo, so it is loaded by
 adding its directory to ``sys.path`` rather than as a regular Python package.
 
-Variant/preprocessing match the AIC_2025 reference project's
-``Beit3_embedding_optimized.py``: ``beit3_large_patch16_384_retrieval`` with
-the COCO-retrieval checkpoint (dim 1024, 384px, ImageNet-default
-normalization, bilinear resize) — deliberately NOT the base-224 ITC variant
-this project used earlier.
+Uses ``beit3_large_patch16_384_retrieval`` with the COCO-retrieval checkpoint
+(dim 1024, 384px, ImageNet-default normalization, bilinear resize).
 
 Checkpoint and tokenizer (``beit3_large_patch16_384_coco_retrieval.pth``,
 ``beit3.spm``, not committed — see ``external/BEiT3/checkpoints/``) are
 downloaded automatically on first use from
-https://github.com/addf400/files/releases/download/beit3/, mirroring how
-``modules/asr/gipformer.py`` auto-downloads its own weights from HF Hub.
+https://github.com/addf400/files/releases/download/beit3/.
+
+Image embedding runs through a TensorRT engine (auto-exported/built on first
+use, see ``tensorrt_runtime.py``) unless ``BEIT3_USE_TENSORRT=0``. Text
+embedding always uses PyTorch.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 from pathlib import Path
@@ -39,8 +40,15 @@ from modules.embedding.base import (
     Embedder,
     resolve_torch_device,
 )
+from modules.embedding.tensorrt_runtime import TensorRTVisionEncoder
 
 LOGGER = logging.getLogger(__name__)
+
+# Parallel image decode workers.
+_DECODE_WORKERS = int(os.environ.get("BEIT3_DECODE_WORKERS", "8"))
+
+# Set BEIT3_USE_TENSORRT=0 to force PyTorch instead of the TensorRT engine.
+_USE_TENSORRT = os.environ.get("BEIT3_USE_TENSORRT", "1").lower() not in ("0", "false")
 
 _VENDOR_DIR = Path(__file__).resolve().parent / "_beit3_vendor"
 _DEFAULT_CHECKPOINT_DIR = Path(__file__).resolve().parents[3] / "external" / "BEiT3" / "checkpoints"
@@ -112,6 +120,18 @@ class Beit3Embedder(Embedder):
         self._transform = None
         self._torch = None
         self._torch_device = None
+        self._trt_encoder = (
+            TensorRTVisionEncoder(
+                model_key="beit3-large",
+                export_onnx_fn=self._export_onnx,
+                input_name="image",
+                output_name="vision_cls",
+                output_dim=_EMBED_DIM,
+                opt_batch=batch_size,
+            )
+            if _USE_TENSORRT
+            else None
+        )
 
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
@@ -124,25 +144,62 @@ class Beit3Embedder(Embedder):
         except ImportError as exc:
             raise EmbeddingError("Install Pillow before embedding images.") from exc
 
-        model, _, transform, torch, device = self._load()
+        use_trt = self._trt_encoder is not None
+        if use_trt:
+            transform, torch, device = self._load_preprocessing()
+            model = None
+        else:
+            model, _, transform, torch, device = self._load()
+
         vectors: list[list[float]] = []
         progress = BatchProgressLogger(LOGGER, self.model_name, len(frames))
-        for start in range(0, len(frames), self.batch_size):
-            batch = frames[start : start + self.batch_size]
-            images = [Image.open(Path(frame.frame_path)).convert("RGB") for frame in batch]
-            try:
-                pixel_values = torch.stack([transform(image) for image in images]).to(device)
-                with torch.no_grad(), _autocast(torch, device):
-                    vision_cls, _ = model(image=pixel_values, only_infer=True)
+
+        def _load_tensor(frame: FrameRecord):
+            with Image.open(Path(frame.frame_path)) as image:
+                return transform(image.convert("RGB"))
+
+        with ThreadPoolExecutor(max_workers=_DECODE_WORKERS) as executor:
+            for start in range(0, len(frames), self.batch_size):
+                batch = frames[start : start + self.batch_size]
+                tensors = list(executor.map(_load_tensor, batch))
+                pixel_values = torch.stack(tensors).to(device)
+                if use_trt:
+                    vision_cls = self._trt_encoder.infer(pixel_values)
+                else:
+                    with torch.no_grad(), _autocast(torch, device):
+                        vision_cls, _ = model(image=pixel_values, only_infer=True)
                 batch_vectors = vision_cls.detach().cpu().numpy().astype("float32").tolist()
                 vectors.extend(batch_vectors)
-            finally:
-                for image in images:
-                    image.close()
-            progress.advance(len(batch))
-            if on_batch is not None:
-                on_batch(batch, batch_vectors)
+                progress.advance(len(batch))
+                if on_batch is not None:
+                    on_batch(batch, batch_vectors)
         return vectors
+
+    def _export_onnx(self, onnx_path: Path) -> None:
+        """Trace the BEiT-3 vision-only forward path and export it to ONNX."""
+        model, _, _, torch, device = self._load()
+
+        class _VisionOnly(torch.nn.Module):
+            def __init__(self, wrapped) -> None:
+                super().__init__()
+                self.wrapped = wrapped
+
+            def forward(self, image):
+                vision_cls, _ = self.wrapped(image=image, only_infer=True)
+                return vision_cls
+
+        wrapper = _VisionOnly(model).eval()
+        dummy = torch.randn(1, 3, _IMAGE_SIZE, _IMAGE_SIZE, device=device)
+        torch.onnx.export(
+            wrapper,
+            (dummy,),
+            str(onnx_path),
+            input_names=["image"],
+            output_names=["vision_cls"],
+            dynamic_axes={"image": {0: "batch"}, "vision_cls": {0: "batch"}},
+            opset_version=18,
+            do_constant_folding=True,
+        )
 
     def embed_text(self, query: str) -> list[float]:
         """Embed a text query with BEiT-3 language features."""
@@ -155,6 +212,36 @@ class Beit3Embedder(Embedder):
                 text_description=input_ids, padding_mask=padding_mask, only_infer=True
             )
         return language_cls.squeeze(0).detach().cpu().numpy().astype("float32").tolist()
+
+    def _load_preprocessing(self):
+        """Return (transform, torch, device) without loading the PyTorch model."""
+        if self._transform is not None:
+            return self._transform, self._torch, self._torch_device
+
+        try:
+            import torch
+            from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
+            from torchvision import transforms
+        except ImportError as exc:
+            raise EmbeddingError(
+                "Install torch, torchvision, and timm before running BEiT-3 embeddings."
+            ) from exc
+
+        device = resolve_torch_device(torch, self.device)
+        transform = transforms.Compose(
+            [
+                transforms.Resize(
+                    (_IMAGE_SIZE, _IMAGE_SIZE),
+                    interpolation=transforms.InterpolationMode.BILINEAR,
+                ),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+            ]
+        )
+        self._transform = transform
+        self._torch = torch
+        self._torch_device = device
+        return transform, torch, device
 
     def _load(self):
         if self._model is not None:
@@ -193,9 +280,6 @@ class Beit3Embedder(Embedder):
         model.load_state_dict(checkpoint["model"], strict=False)
         model.eval().to(device)
 
-        # ImageNet-default normalization + bilinear resize, matching the
-        # AIC_2025 reference project's BEiT-3 preprocessing for this exact
-        # checkpoint (not the Inception mean/std the base-224 variant used).
         transform = transforms.Compose(
             [
                 transforms.Resize(
@@ -217,13 +301,7 @@ class Beit3Embedder(Embedder):
 
 
 def _autocast(torch, device):
-    """fp16 autocast on CUDA, no-op elsewhere.
-
-    Matches the AIC_2025 reference project's BEiT-3 inference. On GB10's
-    bandwidth-bound unified memory this roughly halves per-image time vs
-    fp32 — measured here as the difference between a ~65h and ~30h full
-    re-embed of 283K frames. Outputs are cast back to float32 on store.
-    """
+    """fp16 autocast on CUDA (PyTorch fallback path only), no-op elsewhere."""
     if getattr(device, "type", str(device)) == "cuda" or str(device).startswith("cuda"):
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     import contextlib

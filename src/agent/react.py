@@ -139,8 +139,8 @@ class Agent:
 def create_agent(backend: str = "local") -> Agent:
     """Create the Agent over the Docker-hosted LLM.
 
-    There is exactly one backend: the OpenAI-compatible server on port 8888
-    (`make agent-up` — Atlas on GB10, llama.cpp elsewhere; see
+    There is exactly one backend: the OpenAI-compatible server on port 8884
+    (`make agent-up` — vLLM on GB10, llama.cpp elsewhere; see
     agent/hardware.py). ``backend`` is accepted for API compatibility with
     older callers but no longer selects anything.
     """

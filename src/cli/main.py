@@ -123,7 +123,7 @@ def add_config_args(parser: ArgumentParser) -> None:
     parser.add_argument("--runs-dir", default=Path("runs"), type=Path)
     parser.add_argument(
         "--embedding-models",
-        default=os.environ.get("EMBEDDING_MODELS", "beit3"),
+        default=os.environ.get("EMBEDDING_MODELS", "beit3-large"),
         help=(
             "Comma-separated embedding models. BEiT-3 large only by default; "
             "add siglip2/vietnamese-embedding for SRRF fusion + rerank. "
@@ -237,7 +237,11 @@ def handle_extract_frames(args: Namespace) -> int:
 def handle_embed_frames(args: Namespace) -> int:
     """Run keyframe embedding for every configured model."""
     experiment = load_experiment(args)
-    count = embed_frames(experiment=experiment, batch_size=args.batch_size, force=args.force)
+    count = embed_frames(
+        experiment=experiment,
+        batch_size=args.batch_size,
+        force=args.force,
+    )
     print(json.dumps({"experiment": experiment.name, "embeddings": count}))
     return 0
 

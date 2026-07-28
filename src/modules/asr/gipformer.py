@@ -61,6 +61,9 @@ _SAMPLE_RATE = 16000
 # non-causal, so an unbounded segment (e.g. 2 minutes of continuous speech)
 # would blow up decode time/memory.
 _MAX_SEGMENT_SECONDS = 30.0
+# Below this, a window is too few audio samples for sherpa-onnx's batched
+# decode_streams() to build a valid tensor from — see _speech_windows.
+_MIN_SEGMENT_SECONDS = 0.1
 _DEFAULT_TARGET_WORDS = 150
 
 # infer_json.py decodes all its --audio segments in one batched
@@ -210,6 +213,15 @@ def _speech_windows(vad: SileroVad, wav_path: str) -> list[tuple[float, float]]:
     segment would blow up decode time/memory). Falls back to one segment
     covering the whole file if VAD found nothing (silent audio) or is
     unavailable (see ``SileroVad.speech_segments``).
+
+    A segment whose length happens to be a near-exact multiple of
+    ``_MAX_SEGMENT_SECONDS`` (e.g. 30.008s) leaves a sub-10ms leftover window
+    after the fixed-size cuts below — too few audio samples for sherpa-onnx's
+    batched ``decode_streams`` to build a valid tensor from (confirmed via a
+    real failure: ``Tensor shape.Size() must be >= 0``, on a video with a
+    30.008s segment). Such a sliver carries no usable speech anyway, so it's
+    merged into the previous window instead of becoming its own — the only
+    audio "lost" is exactly the sub-threshold tail.
     """
     segments = vad.speech_segments(wav_path)
     if not segments:
@@ -221,8 +233,13 @@ def _speech_windows(vad: SileroVad, wav_path: str) -> list[tuple[float, float]]:
         while end - start > _MAX_SEGMENT_SECONDS:
             windows.append((start, start + _MAX_SEGMENT_SECONDS))
             start += _MAX_SEGMENT_SECONDS
-        if end > start:
+        if end - start >= _MIN_SEGMENT_SECONDS:
             windows.append((start, end))
+        elif windows and end > start:
+            # Merge a too-short leftover into the previous window rather than
+            # dropping it, so its (negligible) audio still gets transcribed.
+            prev_start, _ = windows[-1]
+            windows[-1] = (prev_start, end)
     return windows
 
 

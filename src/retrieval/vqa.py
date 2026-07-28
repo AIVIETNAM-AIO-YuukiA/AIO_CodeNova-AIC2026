@@ -80,7 +80,7 @@ def _run_temporal_pipeline(
 
     # Load temporal data
     try:
-        frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+        frame_embeddings, frame_records = load_temporal_data(experiment)
     except FileNotFoundError as exc:
         pipeline_stages["error"] = str(exc)
         return {
@@ -125,8 +125,7 @@ def _run_temporal_pipeline(
         "segments_found": len(segments),
     }
 
-    # Query embedding cho shot validation. Uses the first configured model to
-    # match the embedding space of embeddings/frames.npz (see load_temporal_data).
+    # Query embedding cho shot validation — cùng model với load_temporal_data.
     embedder = build_embedder(
         model_name=experiment.config.embedding_models[0],
         device=experiment.config.device,

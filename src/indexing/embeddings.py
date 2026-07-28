@@ -9,6 +9,12 @@ from core.logging import get_logger
 from config.settings import Experiment
 from core.types import FrameRecord
 from modules.embedding import build_embedder
+from indexing.embedding_paths import (
+    checkpoint_frame_ids_path,
+    checkpoint_vectors_path,
+    frame_ids_path,
+    vectors_path,
+)
 from indexing.manifest import JsonlManifest
 from indexing.state import JobState
 
@@ -19,18 +25,6 @@ LOGGER = get_logger(__name__)
 # checkpointing lets a killed/interrupted run resume mid-model instead of
 # redoing all of it, at the cost of a small periodic disk write.
 _CHECKPOINT_INTERVAL_SECONDS = 30.0
-
-
-def _vectors_path(output_dir, model_name: str, single_model: bool):
-    if single_model:
-        return output_dir / "frames.npz"
-    return output_dir / f"frames__{model_name}.npz"
-
-
-def _checkpoint_paths(vectors_path, frame_ids_path):
-    return vectors_path.with_suffix(".checkpoint.npz"), frame_ids_path.with_suffix(
-        ".checkpoint.json"
-    )
 
 
 class _CheckpointWriter:
@@ -55,11 +49,16 @@ class _CheckpointWriter:
             self._last_flush = now
 
     def flush(self) -> None:
+        """Write vectors/ids atomically (temp file + rename)."""
         if not self._ids:
             return
         array = self._np.asarray(self._vectors, dtype="float32")
-        self._np.savez_compressed(self._vectors_path, embeddings=array)
-        self._ids_path.write_text(json.dumps(self._ids) + "\n", encoding="utf-8")
+        vectors_tmp = self._vectors_path.with_name(self._vectors_path.name + ".tmp.npz")
+        ids_tmp = self._ids_path.with_suffix(self._ids_path.suffix + ".tmp")
+        self._np.savez(vectors_tmp, embeddings=array)
+        ids_tmp.write_text(json.dumps(self._ids) + "\n", encoding="utf-8")
+        vectors_tmp.replace(self._vectors_path)
+        ids_tmp.replace(self._ids_path)
 
 
 def _load_checkpoint(np, checkpoint_vectors_path, checkpoint_ids_path):
@@ -76,19 +75,26 @@ def _discard_checkpoint(checkpoint_vectors_path, checkpoint_ids_path) -> None:
     checkpoint_ids_path.unlink(missing_ok=True)
 
 
+def _captioned_frame_ids(captions_path) -> set[str]:
+    """Return frame_ids that already have a cached caption in captions.jsonl."""
+    if not captions_path.exists():
+        return set()
+    manifest = JsonlManifest(captions_path)
+    return {row["frame_id"] for row in manifest.read_all() if row.get("frame_id")}
+
+
 def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = False) -> int:
     """Embed extracted frames for every configured embedding model.
 
     Incremental per model: only frames not already embedded by a given model are
     processed and appended, so re-running after more frames are extracted embeds
     just the new ones. ``force`` discards existing embeddings and re-embeds
-    everything. Each model's vectors are stored separately (different backends
-    produce different dimensionalities) but share one ``frame_ids.json`` ordering
-    since every model is run over the same frame set.
+    everything.
 
-    With a single configured model the legacy file names are kept
-    (``frames.npz`` / ``frame_ids.json``) so existing runs stay compatible.
-    With multiple models, each gets its own ``frames__<model>.npz``.
+    Every model always gets its own ``frames__<model>.npz`` /
+    ``frame_ids__<model>.json`` — even with one model configured — so two
+    separate embed-frames runs (e.g. different models on the same experiment)
+    can never collide on the same output file.
 
     Returns the number of newly embedded (frame, model) pairs across all models.
     """
@@ -109,30 +115,26 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
         return 0
 
     models = experiment.config.embedding_models
-    single_model = len(models) == 1
     total_added = 0
 
     for model_name in models:
-        vectors_path = _vectors_path(output_dir, model_name, single_model)
-        frame_ids_path = output_dir / (
-            "frame_ids.json" if single_model else f"frame_ids__{model_name}.json"
-        )
-        checkpoint_vectors_path, checkpoint_ids_path = _checkpoint_paths(
-            vectors_path, frame_ids_path
-        )
+        model_vectors_path = vectors_path(output_dir, model_name)
+        model_frame_ids_path = frame_ids_path(output_dir, model_name)
+        model_checkpoint_vectors_path = checkpoint_vectors_path(output_dir, model_name)
+        model_checkpoint_ids_path = checkpoint_frame_ids_path(output_dir, model_name)
 
         existing_ids: list[str] = []
         existing_vectors = None
-        if not force and vectors_path.exists() and frame_ids_path.exists():
-            existing_ids = json.loads(frame_ids_path.read_text(encoding="utf-8"))
-            existing_vectors = np.load(vectors_path)["embeddings"].astype("float32")
+        if not force and model_vectors_path.exists() and model_frame_ids_path.exists():
+            existing_ids = json.loads(model_frame_ids_path.read_text(encoding="utf-8"))
+            existing_vectors = np.load(model_vectors_path)["embeddings"].astype("float32")
 
         # A prior interrupted run may have left mid-model progress behind —
         # fold it in as if it were already-embedded, so those frames aren't
         # redone. Discarded entirely when --force is passed, same as the
         # completed-model file above.
         checkpoint_ids, checkpoint_vectors = (
-            _load_checkpoint(np, checkpoint_vectors_path, checkpoint_ids_path)
+            _load_checkpoint(np, model_checkpoint_vectors_path, model_checkpoint_ids_path)
             if not force
             else ([], [])
         )
@@ -145,8 +147,27 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
 
         already = set(existing_ids) | set(checkpoint_ids)
         new_frames = [frame for frame in frames if frame.frame_id not in already]
+
+        # vietnamese-embedding embeds an existing caption rather than the
+        # pixels; frames the VLM hasn't captioned yet have nothing to embed
+        # and would otherwise trigger a live captioning call. Skip them here
+        # so a captioning-only outage doesn't block embedding what's already
+        # captioned — they'll be picked up on a later run once captioned.
+        if model_name == "vietnamese-embedding":
+            captioned_ids = _captioned_frame_ids(
+                experiment.run_dir / "manifests" / "captions.jsonl"
+            )
+            skipped = [frame for frame in new_frames if frame.frame_id not in captioned_ids]
+            new_frames = [frame for frame in new_frames if frame.frame_id in captioned_ids]
+            if skipped:
+                LOGGER.info(
+                    "[%s] Skipping %s frames with no caption yet (will pick up later)",
+                    model_name,
+                    len(skipped),
+                )
+
         if not new_frames:
-            _discard_checkpoint(checkpoint_vectors_path, checkpoint_ids_path)
+            _discard_checkpoint(model_checkpoint_vectors_path, model_checkpoint_ids_path)
             LOGGER.info(
                 "[%s] All %s frames already embedded; nothing to do", model_name, len(frames)
             )
@@ -159,7 +180,11 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
             captions_path=experiment.run_dir / "manifests" / "captions.jsonl",
         )
         checkpoint_writer = _CheckpointWriter(
-            np, checkpoint_vectors_path, checkpoint_ids_path, checkpoint_ids, checkpoint_vectors
+            np,
+            model_checkpoint_vectors_path,
+            model_checkpoint_ids_path,
+            checkpoint_ids,
+            checkpoint_vectors,
         )
         fresh_vectors = embedder.embed_images(new_frames, on_batch=checkpoint_writer.add_batch)
 
@@ -176,13 +201,13 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
             vectors = new_vectors
             frame_ids = new_ids
 
-        np.savez_compressed(vectors_path, embeddings=vectors)
-        frame_ids_path.write_text(json.dumps(frame_ids, indent=2) + "\n", encoding="utf-8")
-        _discard_checkpoint(checkpoint_vectors_path, checkpoint_ids_path)
+        np.savez_compressed(model_vectors_path, embeddings=vectors)
+        model_frame_ids_path.write_text(json.dumps(frame_ids, indent=2) + "\n", encoding="utf-8")
+        _discard_checkpoint(model_checkpoint_vectors_path, model_checkpoint_ids_path)
         embedding_manifest.append(
             {
-                "embedding_path": str(vectors_path),
-                "frame_ids_path": str(frame_ids_path),
+                "embedding_path": str(model_vectors_path),
+                "frame_ids_path": str(model_frame_ids_path),
                 "added": len(new_ids),
                 "total": len(frame_ids),
                 "model_name": model_name,
@@ -193,7 +218,7 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
             model_name,
             len(new_ids),
             len(frame_ids),
-            vectors_path,
+            model_vectors_path,
         )
         total_added += len(new_ids)
 

@@ -52,7 +52,7 @@ class InteractiveAgent:
             from modules._vllm_chat import VllmChatClient
 
             self._client = VllmChatClient(
-                base_url=os.environ.get("AGENT_LOCAL_ENGINE_URL", "http://localhost:8888/v1"),
+                base_url=os.environ.get("AGENT_LOCAL_ENGINE_URL", "http://localhost:8884/v1"),
                 model_name=default_agent_model(),
             )
         return self._client

@@ -1,12 +1,16 @@
 """Tests for temporal search."""
 
+import json
+
 import numpy as np
 
+from config.settings import Experiment, PipelineConfig
 from retrieval.temporal_search import (
     temporal_search_forward,
     temporal_search_backward,
     find_segments,
     gather_frame_s,
+    load_temporal_data,
 )
 
 
@@ -122,3 +126,34 @@ def test_temporal_search_stops_at_different_video() -> None:
     # Backward search starting at 4 should stop at 2
     start = temporal_search_backward(4, emb, frame_records=records, tolerance_threshold=2)
     assert start == 2
+
+
+def _write_embeddings(embeddings_dir, model_name: str, ids: list[str], vectors) -> None:
+    embeddings_dir.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(embeddings_dir / f"frames__{model_name}.npz", embeddings=vectors)
+    (embeddings_dir / f"frame_ids__{model_name}.json").write_text(json.dumps(ids))
+
+
+def test_load_temporal_data_uses_first_configured_model(tmp_path) -> None:
+    config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3", "siglip2"))
+    experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
+    embeddings_dir = tmp_path / "embeddings"
+    _write_embeddings(embeddings_dir, "beit3", ["f1", "f2"], np.array([[1.0, 0.0], [0.0, 1.0]]))
+    _write_embeddings(embeddings_dir, "siglip2", ["f1", "f2"], np.array([[9.0, 9.0], [9.0, 9.0]]))
+
+    vectors, records = load_temporal_data(experiment)
+
+    assert vectors.shape == (2, 2)
+    assert vectors[0].tolist() == [1.0, 0.0]  # loaded beit3's file, not siglip2's
+    assert [r["frame_id"] for r in records] == ["f1", "f2"]
+
+
+def test_load_temporal_data_missing_file_raises(tmp_path) -> None:
+    config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3",))
+    experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
+
+    try:
+        load_temporal_data(experiment)
+        raise AssertionError("expected FileNotFoundError")
+    except FileNotFoundError as exc:
+        assert "beit3" in str(exc)

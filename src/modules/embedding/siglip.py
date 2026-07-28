@@ -9,6 +9,7 @@ backend class is picked per checkpoint.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 from pathlib import Path
@@ -22,14 +23,26 @@ from modules.embedding.base import (
     projected_features,
     resolve_torch_device,
 )
+from modules.embedding.tensorrt_runtime import TensorRTVisionEncoder
 
 LOGGER = logging.getLogger(__name__)
 
-# SigLIP 2's text tower has a 64-token context. Longer queries are embedded
-# with a sliding window and mean-pooled (window 64, stride 48) — same
-# technique as the AIC_2025 reference project's SigLIP_embedding.py.
+# SigLIP 2's text tower has a 64-token context. Longer queries are split into
+# windows (stride 48) and mean-pooled instead of being truncated.
 _MAX_TEXT_TOKENS = 64
 _WINDOW_STRIDE = 48
+
+# Downscale oversized source images before the processor.
+_MAX_SOURCE_SIDE = 512
+
+_IMAGE_SIZE = 384
+_EMBED_DIM = 1152
+
+# Parallel image decode workers.
+_DECODE_WORKERS = int(os.environ.get("SIGLIP2_DECODE_WORKERS", "8"))
+
+# Set SIGLIP2_USE_TENSORRT=0 to force PyTorch instead of the TensorRT engine.
+_USE_TENSORRT = os.environ.get("SIGLIP2_USE_TENSORRT", "1").lower() not in ("0", "false")
 
 
 class SiglipEmbedder(Embedder):
@@ -38,13 +51,25 @@ class SiglipEmbedder(Embedder):
     def __init__(
         self, model_name: str | None = None, device: str = "auto", batch_size: int = 32
     ) -> None:
-        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2")
+        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2-so400m")
         self.model_name = normalize_siglip_model_name(resolved)
         self.device = device
         self.batch_size = batch_size
         self._model = None
         self._processor = None
         self._torch = None
+        self._trt_encoder = (
+            TensorRTVisionEncoder(
+                model_key=self.model_name.replace("/", "__"),
+                export_onnx_fn=self._export_onnx,
+                input_name="pixel_values",
+                output_name="select_2",
+                output_dim=_EMBED_DIM,
+                opt_batch=batch_size,
+            )
+            if _USE_TENSORRT
+            else None
+        )
 
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
@@ -57,35 +82,58 @@ class SiglipEmbedder(Embedder):
         except ImportError as exc:
             raise EmbeddingError("Install Pillow before embedding images.") from exc
 
-        model, processor, torch, device = self._load()
+        use_trt = self._trt_encoder is not None
+        if use_trt:
+            processor, torch, device = self._load_preprocessing()
+            model = None
+        else:
+            model, processor, torch, device = self._load()
+
+        def _load_image(frame: FrameRecord):
+            return _downscale(Image.open(Path(frame.frame_path)).convert("RGB"))
+
         vectors: list[list[float]] = []
         progress = BatchProgressLogger(LOGGER, self.model_name, len(frames))
-        for start in range(0, len(frames), self.batch_size):
-            batch = frames[start : start + self.batch_size]
-            images = [Image.open(Path(frame.frame_path)).convert("RGB") for frame in batch]
-            try:
-                inputs = processor(images=images, return_tensors="pt").to(device)
-                with torch.no_grad():
-                    features = projected_features(model.get_image_features(**inputs))
-                    features = torch.nn.functional.normalize(features, p=2, dim=-1)
-                batch_vectors = features.detach().cpu().numpy().astype("float32").tolist()
-                vectors.extend(batch_vectors)
-            finally:
-                for image in images:
-                    image.close()
-            progress.advance(len(batch))
-            if on_batch is not None:
-                on_batch(batch, batch_vectors)
+        with ThreadPoolExecutor(max_workers=_DECODE_WORKERS) as executor:
+            for start in range(0, len(frames), self.batch_size):
+                batch = frames[start : start + self.batch_size]
+                images = list(executor.map(_load_image, batch))
+                try:
+                    inputs = processor(images=images, return_tensors="pt").to(device)
+                    if use_trt:
+                        raw = self._trt_encoder.infer(inputs["pixel_values"].to(torch.float32))
+                        features = torch.nn.functional.normalize(raw, p=2, dim=-1)
+                    else:
+                        with torch.no_grad(), _autocast(torch, device):
+                            features = projected_features(model.get_image_features(**inputs))
+                            features = torch.nn.functional.normalize(features, p=2, dim=-1)
+                    batch_vectors = features.detach().cpu().numpy().astype("float32").tolist()
+                    vectors.extend(batch_vectors)
+                finally:
+                    for image in images:
+                        image.close()
+                progress.advance(len(batch))
+                if on_batch is not None:
+                    on_batch(batch, batch_vectors)
         return vectors
 
-    def embed_text(self, query: str) -> list[float]:
-        """Embed a text query with SigLIP text features.
+    def _export_onnx(self, onnx_path: Path) -> None:
+        """Trace the SigLIP2 vision tower and export it to ONNX."""
+        model, _, torch, device = self._load()
+        dummy = torch.randn(1, 3, _IMAGE_SIZE, _IMAGE_SIZE, device=device)
+        torch.onnx.export(
+            model.vision_model,
+            (dummy,),
+            str(onnx_path),
+            input_names=["pixel_values"],
+            output_names=["pooler_output"],
+            dynamic_axes={"pixel_values": {0: "batch"}, "pooler_output": {0: "batch"}},
+            opset_version=18,
+            do_constant_folding=True,
+        )
 
-        The query is lowercased first — SigLIP 2 was trained on lowercased
-        text, and mixed-case queries measurably hurt recall. Queries longer
-        than the 64-token context are embedded per sliding window and
-        mean-pooled instead of silently truncated.
-        """
+    def embed_text(self, query: str) -> list[float]:
+        """Embed a text query with SigLIP text features."""
         model, processor, torch, device = self._load()
         text = query.lower().strip()
         windows = _text_windows(processor.tokenizer, text)
@@ -96,11 +144,31 @@ class SiglipEmbedder(Embedder):
             truncation=True,
             max_length=_MAX_TEXT_TOKENS,
         ).to(device)
-        with torch.no_grad():
+        with torch.no_grad(), _autocast(torch, device):
             features = projected_features(model.get_text_features(**inputs))
             features = torch.nn.functional.normalize(features, p=2, dim=-1)
             pooled = torch.nn.functional.normalize(features.mean(dim=0), p=2, dim=0)
         return pooled.detach().cpu().numpy().astype("float32").tolist()
+
+    def _load_preprocessing(self):
+        """Return (processor, torch, device) without loading the PyTorch model."""
+        if self._processor is not None:
+            return self._processor, self._torch, self._device
+
+        try:
+            import torch
+            from transformers import AutoProcessor
+        except ImportError as exc:
+            raise EmbeddingError(
+                "Install torch and transformers before running SigLIP embeddings."
+            ) from exc
+
+        device = resolve_torch_device(torch, self.device)
+        processor = AutoProcessor.from_pretrained(self.model_name)
+        self._processor = processor
+        self._torch = torch
+        self._device = device
+        return processor, torch, device
 
     def _load(self):
         if self._model is not None:
@@ -116,15 +184,34 @@ class SiglipEmbedder(Embedder):
 
         device = resolve_torch_device(torch, self.device)
         processor = AutoProcessor.from_pretrained(self.model_name)
-        # Use AutoModel so the right class is chosen by ``model_type``: SigLIP 2
-        # fixed-resolution checkpoints (e.g. *-patch16-256) report model_type
-        # "siglip", while only the NaFlex variant is genuine "siglip2".
         model = AutoModel.from_pretrained(self.model_name).eval().to(device)
         self._model = model
         self._processor = processor
         self._torch = torch
         self._device = device
         return model, processor, torch, device
+
+
+def _downscale(image):
+    """Shrink an image so its longest side is at most 512px (LANCZOS)."""
+    from PIL import Image
+
+    if max(image.size) <= _MAX_SOURCE_SIDE:
+        return image
+    ratio = _MAX_SOURCE_SIDE / max(image.size)
+    new_size = tuple(int(dim * ratio) for dim in image.size)
+    resized = image.resize(new_size, Image.Resampling.LANCZOS)
+    image.close()
+    return resized
+
+
+def _autocast(torch, device):
+    """fp16 autocast on CUDA, no-op elsewhere."""
+    if getattr(device, "type", str(device)) == "cuda" or str(device).startswith("cuda"):
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    import contextlib
+
+    return contextlib.nullcontext()
 
 
 def _text_windows(tokenizer, text: str) -> list[str]:
@@ -146,10 +233,9 @@ def _text_windows(tokenizer, text: str) -> list[str]:
 def normalize_siglip_model_name(model_name: str) -> str:
     """Map local short names to Hugging Face model IDs.
 
-    ``siglip2`` / ``siglip2-so400m`` resolve to the so400m-patch14-384
-    checkpoint the AIC_2025 reference project uses (dim 1152, 384px) — not
-    the NaFlex variant, whose variable-resolution input path behaves
-    differently under AutoModel.
+    ``siglip2`` / ``siglip2-so400m`` resolve to the fixed-resolution
+    so400m-patch14-384 checkpoint (dim 1152), not the NaFlex variant, whose
+    variable-resolution input path behaves differently under AutoModel.
     """
     aliases = {
         "siglip2": "google/siglip2-so400m-patch14-384",

@@ -6,6 +6,12 @@ import json
 
 from config.settings import Experiment
 from core.errors import IndexBuildError
+from indexing.embedding_paths import (
+    checkpoint_frame_ids_path,
+    checkpoint_vectors_path,
+    frame_ids_path,
+    vectors_path,
+)
 from stores.vector.factory import build_vector_index
 
 
@@ -20,6 +26,13 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
     numbers of frames (e.g. one model's ``embed-frames`` run is behind), only
     the frames common to every model are indexed, so every point has a
     complete set of named vectors.
+
+    Falls back to a model's in-progress checkpoint (``*.checkpoint.npz`` /
+    ``*.checkpoint.json``) when the finished file doesn't exist yet — lets you
+    build and search a partial index while ``embed-frames`` is still running,
+    to sanity-check results before the full run completes. The checkpoint
+    writer flushes atomically (temp file + rename), so this is always safe to
+    read even mid-write.
     """
     try:
         import numpy as np
@@ -28,25 +41,24 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
 
     embeddings_dir = experiment.run_dir / "embeddings"
     models = experiment.config.embedding_models
-    single_model = len(models) == 1
 
     per_model_vectors: dict[str, "np.ndarray"] = {}
     per_model_ids: dict[str, list[str]] = {}
     for model_name in models:
-        if single_model:
-            vectors_path = embeddings_dir / "frames.npz"
-            frame_ids_path = embeddings_dir / "frame_ids.json"
-        else:
-            vectors_path = embeddings_dir / f"frames__{model_name}.npz"
-            frame_ids_path = embeddings_dir / f"frame_ids__{model_name}.json"
+        model_vectors_path = vectors_path(embeddings_dir, model_name)
+        model_frame_ids_path = frame_ids_path(embeddings_dir, model_name)
 
-        if not vectors_path.exists() or not frame_ids_path.exists():
+        if not model_vectors_path.exists() or not model_frame_ids_path.exists():
+            model_vectors_path = checkpoint_vectors_path(embeddings_dir, model_name)
+            model_frame_ids_path = checkpoint_frame_ids_path(embeddings_dir, model_name)
+
+        if not model_vectors_path.exists() or not model_frame_ids_path.exists():
             raise IndexBuildError(
-                f"No embeddings found for model '{model_name}' at {vectors_path}. "
-                "Run embed-frames first."
+                f"No embeddings (finished or in-progress) found for model '{model_name}' "
+                f"under {embeddings_dir}. Run embed-frames first."
             )
-        per_model_vectors[model_name] = np.load(vectors_path)["embeddings"].astype("float32")
-        per_model_ids[model_name] = json.loads(frame_ids_path.read_text(encoding="utf-8"))
+        per_model_vectors[model_name] = np.load(model_vectors_path)["embeddings"].astype("float32")
+        per_model_ids[model_name] = json.loads(model_frame_ids_path.read_text(encoding="utf-8"))
 
     # Frames common to every model, in the first model's order.
     common_ids = set(per_model_ids[models[0]])

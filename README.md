@@ -15,7 +15,7 @@ OFFLINE (indexing)
   ingest → detect-shots → extract-frames → embed-frames → build-index
                                           (vector index: BEiT-3 large → Qdrant)
   extract-text  (separate stage: OCR per keyframe + ASR per video → Elasticsearch;
-                 needs `make atlas-index-up` + `make elasticsearch-up`)
+                 needs `make vllm-index-up` + `make elasticsearch-up`)
 
 ONLINE (retrieval)
   text query → [LLM translate/expand] → embed (BEiT-3) → Qdrant search
@@ -33,22 +33,36 @@ BLIP-2) run in-process as batch encoders.
 
 | Role | Model | Where it runs |
 |------|-------|---------------|
-| Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, auto-downloaded to `external/BEiT3/checkpoints/` |
-| Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process |
+| Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x vs PyTorch on GB10) |
+| Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x vs PyTorch on GB10) |
 | Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
 | Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
-| Captioning + OCR (indexing & agent tools) | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Docker `atlas-index` (Atlas, **GB10 only**), port 8881 |
-| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | Docker port 8888 — Atlas (NVFP4) on DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) elsewhere |
+| Captioning + OCR (indexing & agent tools) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **GB10 only**), port 8881 |
+| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | Docker port 8884 — vLLM (AWQ) on DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) elsewhere |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess into `external/gipformer/` |
 | Shot detection | TransNetV2 (PyTorch) | in-process |
 
-`atlas-agent` (4B, port 8888) and `atlas-index` (35B-A3B, port 8881) are two
-independent Atlas containers — separate ports so both run at once without
+`vllm-agent` (4B, port 8884) and `vllm-index` (35B-A3B, port 8881) are two
+independent vLLM containers — separate ports so both run at once without
 evicting each other's weights/KV cache from GB10's unified memory pool.
-Captioning/OCR has **no non-GB10 fallback**: `atlas-index` requires Atlas,
-which is GB10-only. `make agent-up` picks Atlas vs llama.cpp automatically
-from `nvidia-smi` (GB10 → Atlas) for the *agent* LLM only. Override models
-via `ATLAS_MODEL` / `LLAMACPP_MODEL` / `ATLAS_INDEX_MODEL` in `.env`.
+Captioning/OCR has **no non-GB10 fallback**: `vllm-index` needs GB10's
+Blackwell (SM121) GPU for its AWQ/Marlin kernel. `make agent-up` picks vLLM
+vs llama.cpp automatically from `nvidia-smi` (GB10 → vLLM) for the *agent*
+LLM only. Override models via `VLLM_AGENT_MODEL` / `LLAMACPP_MODEL` /
+`VLLM_INDEX_MODEL` in `.env`.
+
+### TensorRT-accelerated embedding
+
+BEiT-3 and SigLIP2 spend nearly all their time in the vision tower's forward
+pass — measured on GB10, PyTorch eager mode takes ~400-860ms/image, which
+would put a 283K-frame corpus at 1-2 days. `modules/embedding/tensorrt_runtime.py`
+exports each model's vision tower to ONNX and builds a TensorRT FP16 engine
+the first time `embed-frames` runs (a few minutes, one-time), caching it
+under `weights/<model>/`. Every later run just loads the cached engine —
+verified cosine similarity >=0.9999 against the PyTorch output, ~27x faster
+for BEiT-3 and ~3.5x for SigLIP2. Text queries stay on PyTorch (a single
+short sequence per call has no batching gain to capture). Disable per-model
+with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
 
 ## Agent
 
@@ -101,6 +115,11 @@ docs/vi/          # Vietnamese documentation
 - For ASR: one-time `cd external/gipformer && uv sync` (isolated repo+venv),
   and `uv pip install onnxruntime` (deliberately NOT in `pyproject.toml` —
   adding it there silently downgrades the pinned `+cu128` torch build)
+- For TensorRT-accelerated embedding (optional, on by default — see Models
+  table below): `uv pip install onnx onnxscript tensorrt` (same reasoning as
+  onnxruntime above — not in `pyproject.toml`). Set `BEIT3_USE_TENSORRT=0` /
+  `SIGLIP2_USE_TENSORRT=0` in `.env` to fall back to PyTorch if these aren't
+  installed or an engine build fails on unusual hardware.
 
 ## Setup
 
@@ -108,7 +127,7 @@ docs/vi/          # Vietnamese documentation
 uv sync                       # install dependencies
 cp .env.example .env          # configure endpoints (defaults work locally)
 make qdrant-up qdrant-health  # vector DB
-make agent-up agent-health    # agent LLM (auto-picks Atlas vs llama.cpp)
+make agent-up agent-health    # agent LLM (auto-picks vLLM vs llama.cpp)
 ```
 
 ## Running the pipeline
@@ -126,8 +145,8 @@ make extract-frames EXP=demo
 make embed-frames   EXP=demo      # BEiT-3 large; ~2GB checkpoint auto-downloads on first run
 make build-index    EXP=demo      # needs Qdrant running
 
-# OCR/ASR text branch (separate; needs atlas-index + Elasticsearch — GB10 only)
-make atlas-index-up elasticsearch-up
+# OCR/ASR text branch (separate; needs vllm-index + Elasticsearch — GB10 only)
+make vllm-index-up elasticsearch-up
 make extract-text EXP=demo
 make export-text  EXP=demo        # dump ES -> manifests/text.jsonl (shareable)
 make import-text  EXP=demo        # load text.jsonl back into ES
@@ -145,8 +164,8 @@ skips completed work. Pass `--force` (raw CLI) to redo a stage.
 Changing `--embedding-models` changes the embedding space, so re-run:
 
 ```bash
-uv run codenova embed-frames --experiment-name <EXP> --embedding-models beit3 --force
-uv run codenova build-index  --experiment-name <EXP> --embedding-models beit3
+uv run codenova embed-frames --experiment-name <EXP> --embedding-models beit3-large --force
+uv run codenova build-index  --experiment-name <EXP> --embedding-models beit3-large
 ```
 
 `build-index` recreates the Qdrant collection from scratch (delete +
@@ -166,7 +185,7 @@ Key pipeline options (CLI flags, defaults shown):
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--embedding-models` | `beit3` | Comma-separated embedders (`beit3`, `siglip2`, `vietnamese-embedding`); >1 model enables SRRF fusion + BLIP-2 rerank |
+| `--embedding-models` | `beit3-large` | Comma-separated embedders (`beit3`, `siglip2`, `vietnamese-embedding`); >1 model enables SRRF fusion + BLIP-2 rerank |
 | `--frame-sampling` | `shot-percentile` | Keyframe sampling strategy |
 | `--keyframe-percentiles` | `0.15,0.5,0.85` | Where in each shot to sample keyframes |
 | `--index-backend` | `qdrant` | Vector index backend |
@@ -204,7 +223,7 @@ runs/<experiment>/
   logs/{pipeline.log, errors.log}
   manifests/{videos,shots,frames,embeddings}.jsonl  (+captions.jsonl, text.jsonl)
   frames/<video_id>/*.jpg
-  embeddings/{frames.npz, frame_ids.json}           (per-model files on multi-model runs)
+  embeddings/{frames,frame_ids}__<model>.{npz,json} (one pair per configured model)
 ```
 
 The vector index lives in Qdrant (`qdrant_storage/`), text in Elasticsearch

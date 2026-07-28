@@ -45,7 +45,7 @@ class PipelineConfig:
     data_dir: Path = Path("data")
     runs_dir: Path = Path("runs")
     pipeline: str = "retrieval"
-    embedding_models: tuple[str, ...] = ("beit3",)
+    embedding_models: tuple[str, ...] = ("beit3-large",)
     frame_sampling: str = "shot-percentile"
     index_backend: str = "qdrant"
     keyframe_percentiles: tuple[float, ...] = (0.15, 0.5, 0.85)

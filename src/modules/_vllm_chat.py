@@ -1,14 +1,11 @@
 """Shared low-level client for OpenAI-compatible chat-completions endpoints.
 
 Internal helper — not a public module interface. Used by
-``modules/captioning/vllm.py`` / ``modules/ocr/vllm.py`` (Atlas
-``atlas-index`` service, port 8881, image-inlined calls — GB10 only, no
-non-GB10 fallback) and by the agent + query processor (Atlas ``atlas-agent``
-or llama.cpp ``llamacpp-agent``, port 8888, text-only calls). All model
-serving is Docker-hosted; no checkpoint is ever loaded in-process through
-this module. Class name kept as ``VllmChatClient`` even though nothing here
-calls vLLM anymore — it's just an OpenAI-compatible chat client, and
-renaming would touch every caller for no behavioral change.
+``modules/captioning/vllm.py`` / ``modules/ocr/vllm.py`` (``vllm-index``
+service, port 8881, image-inlined calls — GB10 only, no non-GB10 fallback)
+and by the agent + query processor (``vllm-agent`` or llama.cpp
+``llamacpp-agent``, port 8884, text-only calls). All model serving is
+Docker-hosted; no checkpoint is ever loaded in-process through this module.
 """
 
 from __future__ import annotations

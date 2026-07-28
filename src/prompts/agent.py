@@ -1,14 +1,8 @@
 """Agent prompts: VQA ReAct brain + interactive search agent + caption subagent.
 
-The interactive-agent flow (system prompt, tool set, narrowing loop, subagent
-summarizer) is ported from the AIC_2025 reference project's
-``online/backend/agent.py``, with two deliberate changes:
-
-- Tool calls use a JSON-in-text protocol instead of the OpenAI ``tools`` API,
-  so the same prompt works on any OpenAI-compatible server (Atlas, llama.cpp)
-  regardless of whether its chat template supports native function calling.
-- ``search_kis`` has no YOLO ``object_filters``/``video_filter`` parameters —
-  this project's Qdrant payload carries no object detections.
+Tool calls use a JSON-in-text protocol instead of the OpenAI ``tools`` API,
+so the same prompt works on any OpenAI-compatible server (vLLM, llama.cpp)
+regardless of whether its chat template supports native function calling.
 """
 
 VQA_SYSTEM_PROMPT = """Bạn là agent VQA (Video Question Answering). Nhiệm vụ: trả lời câu hỏi về khung hình video.

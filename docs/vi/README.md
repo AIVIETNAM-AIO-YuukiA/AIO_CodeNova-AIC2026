@@ -15,7 +15,7 @@ OFFLINE (đánh index)
   ingest → detect-shots → extract-frames → embed-frames → build-index
                                           (vector index: BEiT-3 large → Qdrant)
   extract-text  (bước riêng: OCR theo keyframe + ASR theo video → Elasticsearch;
-                 cần `make atlas-index-up` + `make elasticsearch-up`)
+                 cần `make vllm-index-up` + `make elasticsearch-up`)
 
 ONLINE (truy hồi)
   câu truy vấn → [LLM dịch/mở rộng] → embed (BEiT-3) → tìm trên Qdrant
@@ -33,23 +33,38 @@ BLIP-2) chạy in-process vì là batch encoder.
 
 | Vai trò | Model | Chạy ở đâu |
 |---------|-------|------------|
-| Embed ảnh (mặc định) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, tự tải về `external/BEiT3/checkpoints/` |
-| Embed ảnh (tùy chọn) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process |
+| Embed ảnh (mặc định) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x so với PyTorch trên GB10) |
+| Embed ảnh (tùy chọn) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x so với PyTorch trên GB10) |
 | Embed caption tiếng Việt (tùy chọn) | `AITeamVN/Vietnamese_Embedding_v2` trên caption do VLM sinh | caption qua Docker VLM; embed in-process |
 | Reranker (tùy chọn, khi chạy nhiều model) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
-| Captioning + OCR (index & tool agent) | `nvidia/Qwen3.6-35B-A3B-NVFP4` | Docker `atlas-index` (Atlas, **chỉ GB10**), cổng 8881 |
-| LLM agent (VQA, chat, mở rộng query) | **Qwen3.5-4B 4-bit** | Docker cổng 8888 — Atlas (NVFP4) trên DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) trên GPU khác |
+| Captioning + OCR (index & tool agent) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **chỉ GB10**), cổng 8881 |
+| LLM agent (VQA, chat, mở rộng query) | **Qwen3.5-4B 4-bit** | Docker cổng 8884 — vLLM (AWQ) trên DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) trên GPU khác |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess vào `external/gipformer/` |
 | Tách shot | TransNetV2 (PyTorch) | in-process |
 
-`atlas-agent` (4B, cổng 8888) và `atlas-index` (35B-A3B, cổng 8881) là 2
-container Atlas độc lập, cổng riêng để chạy đồng thời mà không tranh chấp bộ
+`vllm-agent` (4B, cổng 8884) và `vllm-index` (35B-A3B, cổng 8881) là 2
+container vLLM độc lập, cổng riêng để chạy đồng thời mà không tranh chấp bộ
 nhớ hợp nhất của GB10. Captioning/OCR **không có fallback cho máy khác GB10**
-— `atlas-index` bắt buộc chạy Atlas, chỉ hỗ trợ GB10. `make agent-up` chỉ tự
-chọn engine cho LLM agent (Atlas hay llama.cpp), không liên quan captioning/OCR.
+— `vllm-index` cần GPU Blackwell (SM121) của GB10 cho kernel AWQ/Marlin.
+`make agent-up` chỉ tự chọn engine cho LLM agent (vLLM hay llama.cpp), không
+liên quan captioning/OCR.
 
-`make agent-up` tự chọn Atlas hay llama.cpp dựa vào `nvidia-smi` (GB10 →
-Atlas). Đổi model qua `ATLAS_MODEL` / `LLAMACPP_MODEL` trong `.env`.
+`make agent-up` tự chọn vLLM hay llama.cpp dựa vào `nvidia-smi` (GB10 →
+vLLM). Đổi model qua `VLLM_AGENT_MODEL` / `LLAMACPP_MODEL` / `VLLM_INDEX_MODEL`
+trong `.env`.
+
+### Embedding tăng tốc bằng TensorRT
+
+BEiT-3 và SigLIP2 tốn gần như toàn bộ thời gian ở forward pass của vision
+tower — đo trên GB10, PyTorch eager mode mất ~400-860ms/ảnh, tức là 283K
+keyframe sẽ mất 1-2 ngày. `modules/embedding/tensorrt_runtime.py` tự động
+export vision tower sang ONNX rồi build TensorRT engine FP16 ngay lần đầu
+`embed-frames` chạy (vài phút, chỉ 1 lần), cache tại `weights/<model>/`. Các
+lần chạy sau chỉ load engine đã cache — đã kiểm chứng cosine similarity
+>=0.9999 so với PyTorch, nhanh hơn ~27x với BEiT-3 và ~3.5x với SigLIP2. Câu
+truy vấn văn bản vẫn dùng PyTorch (mỗi lần chỉ 1 câu ngắn, không có lợi từ
+batch). Tắt riêng từng model bằng `BEIT3_USE_TENSORRT=0` /
+`SIGLIP2_USE_TENSORRT=0` trong `.env`.
 
 ## Agent
 
@@ -102,6 +117,11 @@ docs/vi/          # tài liệu tiếng Việt
 - Cho ASR: chạy 1 lần `cd external/gipformer && uv sync` (repo+venv cô lập),
   và `uv pip install onnxruntime` (cố ý KHÔNG đưa vào `pyproject.toml` — thêm
   vào đó sẽ âm thầm hạ cấp bản torch `+cu128` đã pin)
+- Cho embedding tăng tốc TensorRT (tùy chọn, bật mặc định — xem mục Model):
+  `uv pip install onnx onnxscript tensorrt` (cùng lý do như onnxruntime ở
+  trên — không đưa vào `pyproject.toml`). Đặt `BEIT3_USE_TENSORRT=0` /
+  `SIGLIP2_USE_TENSORRT=0` trong `.env` để dùng lại PyTorch nếu chưa cài
+  hoặc build engine lỗi trên phần cứng lạ.
 
 ## Cài đặt
 
@@ -109,7 +129,7 @@ docs/vi/          # tài liệu tiếng Việt
 uv sync                       # cài dependency
 cp .env.example .env          # cấu hình endpoint (mặc định chạy được local)
 make qdrant-up qdrant-health  # vector DB
-make agent-up agent-health    # LLM agent (tự chọn Atlas hay llama.cpp)
+make agent-up agent-health    # LLM agent (tự chọn vLLM hay llama.cpp)
 ```
 
 ## Chạy pipeline
@@ -127,8 +147,8 @@ make extract-frames EXP=demo
 make embed-frames   EXP=demo      # BEiT-3 large; lần đầu tự tải checkpoint ~2GB
 make build-index    EXP=demo      # cần Qdrant đang chạy
 
-# Nhánh OCR/ASR (riêng; cần atlas-index + Elasticsearch — chỉ GB10)
-make atlas-index-up elasticsearch-up
+# Nhánh OCR/ASR (riêng; cần vllm-index + Elasticsearch — chỉ GB10)
+make vllm-index-up elasticsearch-up
 make extract-text EXP=demo
 make export-text  EXP=demo        # xuất ES -> manifests/text.jsonl (chia sẻ được)
 make import-text  EXP=demo        # nạp text.jsonl ngược vào ES
@@ -203,7 +223,7 @@ runs/<experiment>/
   logs/{pipeline.log, errors.log}
   manifests/{videos,shots,frames,embeddings}.jsonl  (+captions.jsonl, text.jsonl)
   frames/<video_id>/*.jpg
-  embeddings/{frames.npz, frame_ids.json}           (file theo model khi chạy nhiều model)
+  embeddings/{frames,frame_ids}__<model>.{npz,json} (mỗi model 1 cặp file riêng)
 ```
 
 Vector index nằm trong Qdrant (`qdrant_storage/`), text nằm trong

@@ -18,7 +18,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 .PHONY: help sync install-hooks lint format check test pre-commit precommit \
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
-        atlas-index-up atlas-index-down atlas-index-health \
+        vllm-index-up vllm-index-down vllm-index-health \
         agent-up agent-down agent-health \
         ingest detect-shots extract-frames embed-frames build-index extract-text export-text import-text pipeline \
         search serve-ui clean-runs clean
@@ -69,33 +69,33 @@ elasticsearch-up: ## Khởi động Elasticsearch + Elasticvue qua docker compos
 elasticsearch-health: ## Kiểm tra Elasticsearch có sống không
 	curl -sf http://localhost:8882 && echo
 
-## --- Atlas captioning/OCR (Qwen3.6-35B-A3B NVFP4, chỉ DGX Spark/GB10, port 8881) ---
-atlas-index-up: ## Khởi động Atlas cho captioning/OCR offline
-	docker compose --profile atlas-index up -d atlas-index
+## --- vLLM captioning/OCR (Qwen3.6-35B-A3B AWQ 4bit, GB10, port 8881) ---
+vllm-index-up: ## Khởi động vLLM cho captioning/OCR offline
+	docker compose --profile vllm-index up -d vllm-index
 
-atlas-index-down: ## Dừng atlas-index
-	docker compose stop atlas-index
-	docker compose rm -f atlas-index
+vllm-index-down: ## Dừng vllm-index
+	docker compose stop vllm-index
+	docker compose rm -f vllm-index
 
-atlas-index-health: ## Kiểm tra atlas-index có sống không
+vllm-index-health: ## Kiểm tra vllm-index có sống không
 	curl -sf http://localhost:8881/v1/models && echo
 
-## --- Agent LLM (Qwen3.5-4B, port 8888; engine chọn theo phần cứng) ---
-agent-up: ## Khởi động agent LLM: Atlas nếu là DGX Spark/GB10, ngược lại llama.cpp
+## --- Agent LLM (Qwen3.5-4B, port 8884; engine chọn theo phần cứng) ---
+agent-up: ## Khởi động agent LLM: vLLM nếu là DGX Spark/GB10, ngược lại llama.cpp
 	@if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q GB10; then \
-		echo "GB10 detected -> Atlas (NVFP4 4-bit)"; \
-		docker compose --profile atlas-agent up -d atlas-agent; \
+		echo "GB10 detected -> vLLM (AWQ 4-bit)"; \
+		docker compose --profile vllm-agent up -d vllm-agent; \
 	else \
 		echo "Non-GB10 GPU -> llama.cpp (GGUF Q4_K_M)"; \
 		docker compose --profile llamacpp-agent up -d llamacpp-agent; \
 	fi
 
 agent-down: ## Dừng agent LLM (cả 2 engine)
-	docker compose stop atlas-agent llamacpp-agent 2>/dev/null || true
-	docker compose rm -f atlas-agent llamacpp-agent 2>/dev/null || true
+	docker compose stop vllm-agent llamacpp-agent 2>/dev/null || true
+	docker compose rm -f vllm-agent llamacpp-agent 2>/dev/null || true
 
 agent-health: ## Kiểm tra agent LLM có sống không
-	curl -sf http://localhost:8888/v1/models && echo
+	curl -sf http://localhost:8884/v1/models && echo
 
 ## --- Pipeline index offline ---
 ingest: ## Quét video (INPUT, EXP; RESUME=1 để dùng lại experiment đã có)
@@ -115,7 +115,7 @@ embed-frames: ## Embed keyframe bằng BEiT-3 large (EXP; EMBEDDING_MODELS để
 build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
 	uv run codenova build-index --experiment-name $(EXP)
 
-extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make atlas-index-up` đang chạy
+extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
 	uv run codenova extract-text --experiment-name $(EXP)
 
 export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifests/text.jsonl (EXP)

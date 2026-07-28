@@ -9,29 +9,32 @@ services:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
 
-  # The agent LLM (Qwen3.5-4B, 4-bit) — the ONLY backend for VQA/TRAKE
-  # answering, interactive chat, and query translation. Two engines, picked
-  # by hardware via `make agent-up`, never both running (both bind 8888):
-  #   atlas-agent     -> DGX Spark / GB10 only (nvidia-smi name contains "GB10").
-  #                      Atlas reads HF checkpoints in its own quant formats
-  #                      (NVFP4/FP8/BF16) — never GGUF or AWQ.
-  #   llamacpp-agent  -> any other NVIDIA GPU. GGUF Q4_K_M via llama.cpp.
-  atlas-agent:
-    image: avarok/atlas-gb10:latest
-    container_name: codenova-atlas-agent
-    profiles: ["atlas-agent"]
+  # Agent LLM (Qwen3.5-4B, port 8884) — GB10, via vLLM. Non-GB10 uses
+  # llamacpp-agent below instead; the two are mutually exclusive (both bind
+  # 8884), picked by `make agent-up`.
+  vllm-agent:
+    image: vllm/vllm-openai:cu130-nightly
+    container_name: codenova-vllm-agent
+    profiles: ["vllm-agent"]
+    environment:
+      - VLLM_DISABLED_KERNELS=cutlass_moe_mm,cutlass_scaled_mm
+      - TORCH_CUDA_ARCH_LIST=12.0
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
     command: >
-      serve ${ATLAS_MODEL:-AxionML/Qwen3.5-4B-NVFP4}
-      --bind 0.0.0.0
-      --port 8888
-      --max-seq-len 8192
+      ${VLLM_AGENT_MODEL:-cyankiwi/Qwen3.5-4B-AWQ-4bit}
+      --host 0.0.0.0
+      --port 8884
+      --max-model-len 8192
       --gpu-memory-utilization 0.3
+      --max-num-seqs 16
+      --reasoning-parser qwen3
       --default-chat-template-kwargs '{"enable_thinking": false}'
     ports:
-      - "8888:8888"
+      - "8884:8884"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
+    shm_size: "64gb"
     deploy:
       resources:
         reservations:
@@ -41,26 +44,30 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
-  # Captioning + OCR (offline indexing + agent caption/ocr tools) — GB10/Atlas
-  # only, no vLLM fallback for any hardware. Own port (8881) so it can run
-  # alongside atlas-agent (4B, port 8888) without either evicting the other's
-  # KV cache / weights from the unified memory pool.
-  atlas-index:
-    image: avarok/atlas-gb10:latest
-    container_name: codenova-atlas-index
-    profiles: ["atlas-index"]
+  vllm-index:
+    image: vllm/vllm-openai:cu130-nightly
+    container_name: codenova-vllm-index
+    profiles: ["vllm-index"]
+    environment:
+      - VLLM_DISABLED_KERNELS=cutlass_moe_mm,cutlass_scaled_mm
+      - TORCH_CUDA_ARCH_LIST=12.0
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
     command: >
-      serve ${ATLAS_INDEX_MODEL:-nvidia/Qwen3.6-35B-A3B-NVFP4}
-      --bind 0.0.0.0
+      ${VLLM_INDEX_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
+      --host 0.0.0.0
       --port 8881
-      --max-seq-len 8192
-      --gpu-memory-utilization 0.6
+      --max-model-len 8192
+      --gpu-memory-utilization 0.5
+      --max-num-seqs 16
+      --moe-backend marlin
+      --reasoning-parser qwen3
       --default-chat-template-kwargs '{"enable_thinking": false}'
     ports:
       - "8881:8881"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     ipc: host
+    shm_size: "64gb"
     deploy:
       resources:
         reservations:
@@ -77,12 +84,12 @@ services:
     command: >
       --hf-repo ${LLAMACPP_MODEL:-unsloth/Qwen3.5-4B-GGUF:Q4_K_M}
       --host 0.0.0.0
-      --port 8888
+      --port 8884
       --ctx-size 8192
       --n-gpu-layers 99
       --chat-template-kwargs '{"enable_thinking":false}'
     ports:
-      - "8888:8888"
+      - "8884:8884"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - llamacpp_cache:/root/.cache/llama.cpp

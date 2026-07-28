@@ -1,7 +1,7 @@
 """Agent brain — the Docker-hosted LLM behind every agent code path.
 
 One backend only: an OpenAI-compatible ``/v1/chat/completions`` server on
-port 8888, started by ``make agent-up`` (Atlas on DGX Spark/GB10, llama.cpp
+port 8884, started by ``make agent-up`` (vLLM on DGX Spark/GB10, llama.cpp
 elsewhere — see ``agent/hardware.py``). The brain reasons over text (the
 served Qwen3.5-4B is text-only); anything visual reaches it through the
 caption/ocr tools in ``agent/tools.py``, which call the separate vLLM VLM
@@ -20,7 +20,7 @@ from prompts.agent import VQA_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "http://localhost:8888/v1"
+_DEFAULT_BASE_URL = "http://localhost:8884/v1"
 
 
 @dataclass

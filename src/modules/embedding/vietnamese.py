@@ -106,6 +106,11 @@ class VietnameseEmbedder(Embedder):
         ``frames`` (same length/order as ``texts``) is given, so embed_images()
         can checkpoint progress the same way SigLIP/BEiT-3 do."""
         model = self._load_model()
+        progress = (
+            BatchProgressLogger(LOGGER, f"{self.model_name} (encoding)", len(texts))
+            if frames is not None
+            else None
+        )
         vectors: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
@@ -116,6 +121,8 @@ class VietnameseEmbedder(Embedder):
             vectors.extend(batch_vectors)
             if on_batch is not None and frames is not None:
                 on_batch(frames[start : start + self.batch_size], batch_vectors)
+            if progress is not None:
+                progress.advance(len(batch))
         return vectors
 
     def _caption_for(self, frame: FrameRecord) -> str:
