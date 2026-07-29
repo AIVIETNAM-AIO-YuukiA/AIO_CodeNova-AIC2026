@@ -14,7 +14,7 @@ from config.settings import Experiment
 from core.types import SearchResult
 from retrieval.vqa import vqa_search, trake_search
 from retrieval.kis_multi_scene_search import kis_multi_scene_search
-from retrieval.kis_detail_search import kis_detail_search
+from retrieval.kis_detail_search import kis_detail_2stage_search
 from retrieval import build_retriever
 from retrieval.temporal_search import load_temporal_data
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
@@ -117,25 +117,29 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
-            # KIS Detail: sum fusion in-memory
-            if parsed.path == "/api/kis-detail":
+            # KIS Detail 2-Stage: coarse (general) → fine (specific)
+            if parsed.path == "/api/kis-detail-2stage":
                 try:
                     payload = self._read_json()
-                    subqueries_raw = payload.get("subqueries")
-                    if not isinstance(subqueries_raw, list) or len(subqueries_raw) < 1:
-                        raise ValueError("At least 1 subquery is required.")
-                    subqueries = [str(s).strip() for s in subqueries_raw if str(s).strip()]
-                    result = kis_detail_search(
+                    general_raw = payload.get("general")
+                    specific_raw = payload.get("specific")
+                    if not isinstance(general_raw, list) or len(general_raw) < 1:
+                        raise ValueError("At least 1 general subquery is required.")
+                    if not isinstance(specific_raw, list) or len(specific_raw) < 1:
+                        raise ValueError("At least 1 specific subquery is required.")
+                    general = [str(s).strip() for s in general_raw if str(s).strip()]
+                    specific = [str(s).strip() for s in specific_raw if str(s).strip()]
+                    result = kis_detail_2stage_search(
                         experiment=experiment,
-                        subqueries=subqueries,
-                        top_k=300,
+                        general=general,
+                        specific=specific,
                     )
                     for r in result.get("results", []):
                         if r.get("frame_path"):
                             r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
                     self._send_json(result)
                 except Exception as exc:
-                    LOGGER.exception("KIS Detail search failed")
+                    LOGGER.exception("KIS Detail 2-Stage search failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -462,7 +466,7 @@ INDEX_HTML = r"""<!doctype html>
         <optgroup label="KIS">
           <option value="textual_kis">KIS Basic</option>
           <option value="kis_multi_scene">KIS Multi-Scene</option>
-          <option value="kis_detail">KIS Detail</option>
+          <option value="kis_detail_2stage">KIS Detail 2-Stage</option>
         </optgroup>
         <option value="vqa">VQA</option>
         <option value="trake">TRAKE</option>
@@ -482,6 +486,14 @@ INDEX_HTML = r"""<!doctype html>
         <input id="window-slider" type="range" min="10" max="300" step="5" value="15" style="width:100%;margin-top:4px;">
         <div class="hint" style="margin-top:4px;font-size:12px;">Khoảng thời gian tối đa giữa 2 scene/event liền kề</div>
       </div>
+      </div>
+      <div id="kis-2stage-section" style="display:none;">
+        <label>General Subqueries <span style="font-weight:400;color:var(--muted);">(stage 1 — chung)</span></label>
+        <div id="general-events-list"></div>
+        <button type="button" id="add-general-btn" style="width:auto;padding:6px 14px;margin-top:6px;font-size:13px;">+ Add general</button>
+        <label style="margin-top:14px;">Specific Subqueries <span style="font-weight:400;color:var(--muted);">(stage 2 — chi tiết)</span></label>
+        <div id="specific-events-list"></div>
+        <button type="button" id="add-specific-btn" style="width:auto;padding:6px 14px;margin-top:6px;font-size:13px;">+ Add specific</button>
       </div>
       <div class="row">
         <div>
@@ -599,31 +611,70 @@ INDEX_HTML = r"""<!doctype html>
       }).filter(Boolean);
   }
 
+  // ─── KIS Detail 2-Stage: general / specific event lists ──────────────────────
+  const GEN_LIST = eid("general-events-list");
+  const SPEC_LIST = eid("specific-events-list");
+
+  function addGeneralEvent(value) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "event-wrapper";
+    wrapper.style.cssText = "margin-bottom:6px;";
+    wrapper.innerHTML = `
+      <div style="display:flex;gap:6px;align-items:start;">
+        <textarea class="event-input" style="flex:1;min-height:48px;" placeholder="General subquery...">${esc(value||"")}</textarea>
+        <button type="button" style="width:auto;padding:6px 10px;margin-top:0;font-size:14px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.closest('.event-wrapper').remove()" title="Remove">✕</button>
+      </div>`;
+    GEN_LIST.appendChild(wrapper);
+  }
+
+  function addSpecificEvent(value) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "event-wrapper";
+    wrapper.style.cssText = "margin-bottom:6px;";
+    wrapper.innerHTML = `
+      <div style="display:flex;gap:6px;align-items:start;">
+        <textarea class="event-input" style="flex:1;min-height:48px;" placeholder="Specific subquery...">${esc(value||"")}</textarea>
+        <button type="button" style="width:auto;padding:6px 10px;margin-top:0;font-size:14px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.closest('.event-wrapper').remove()" title="Remove">✕</button>
+      </div>`;
+    SPEC_LIST.appendChild(wrapper);
+  }
+
+  eid("add-general-btn").addEventListener("click", () => addGeneralEvent(""));
+  eid("add-specific-btn").addEventListener("click", () => addSpecificEvent(""));
+
+  function get2StageEvents() {
+    const general = Array.from(GEN_LIST.querySelectorAll(".event-wrapper"))
+      .map(w => w.querySelector(".event-input")?.value.trim()).filter(Boolean);
+    const specific = Array.from(SPEC_LIST.querySelectorAll(".event-wrapper"))
+      .map(w => w.querySelector(".event-input")?.value.trim()).filter(Boolean);
+    return { general, specific };
+  }
+
   // ─── Track selector ───────────────────────────────────────────────────────────
   FORM.track.addEventListener("change", () => {
     const t = FORM.track.value;
     const isBasic = t === "textual_kis";
     const isMulti = t === "kis_multi_scene";
-    const isDetail = t === "kis_detail";
+    const is2Stage = t === "kis_detail_2stage";
     const isT = t === "trake";
     const isV = t === "vqa";
-    const isKis = isBasic || isMulti || isDetail;
-    const usesEvents = isMulti || isDetail || isT;
+    const isKis = isBasic || isMulti || is2Stage;
+    const usesEvents = isMulti || isT;
     const showWindow = isMulti || isT;
 
-    eid("query").style.display = usesEvents ? "none" : "";
-    FORM.querySelector("label[for=query]").style.display = usesEvents ? "none" : "";
-    eid("context").style.display = isT ? "none" : "";
-    FORM.querySelector("label[for=context]").style.display = isT ? "none" : "";
+    eid("query").style.display = usesEvents || is2Stage ? "none" : "";
+    FORM.querySelector("label[for=query]").style.display = usesEvents || is2Stage ? "none" : "";
+    eid("context").style.display = isT || is2Stage ? "none" : "";
+    FORM.querySelector("label[for=context]").style.display = isT || is2Stage ? "none" : "";
     eid("question").style.display = isV ? "" : "none";
     FORM.querySelector("label[for=question]").style.display = isV ? "" : "none";
-    eid("top-k").style.display = isT ? "none" : "";
-    FORM.querySelector("label[for=top-k]").style.display = isT ? "none" : "";
+    eid("top-k").style.display = isT || is2Stage ? "none" : "";
+    FORM.querySelector("label[for=top-k]").style.display = isT || is2Stage ? "none" : "";
     EVENTS_SEC.style.display = usesEvents ? "" : "none";
     eid("window-control").style.display = showWindow ? "" : "none";
+    eid("kis-2stage-section").style.display = is2Stage ? "" : "none";
     if (isT && eventCount()===0) { addEvent("a person riding a motorbike"); addEvent("a person falling off"); }
     if (isMulti && eventCount()===0) { addEvent("Scene 1 description"); addEvent("Scene 2 description"); }
-    if (isDetail && eventCount()===0) { addEvent("Detail 1"); addEvent("Detail 2"); addEvent("Detail 3"); }
   });
   FORM.track.dispatchEvent(new Event("change"));
 
@@ -649,10 +700,11 @@ INDEX_HTML = r"""<!doctype html>
       if (events.length < 2) { STATUS.className="status warn"; STATUS.textContent="Need at least 2 scenes."; SUBMIT.disabled=false; return; }
       lastTrakeInput = events;
       endpoint = "/api/kis-multi-scene"; payload = { events, top_k: 300, window: Number(eid("window-slider").value) };
-    } else if (track === "kis_detail") {
-      const events = getEvents();
-      if (events.length < 1) { STATUS.className="status warn"; STATUS.textContent="Need at least 1 subquery."; SUBMIT.disabled=false; return; }
-      endpoint = "/api/kis-detail"; payload = { subqueries: events, top_k: 300 };
+    } else if (track === "kis_detail_2stage") {
+      const { general, specific } = get2StageEvents();
+      if (general.length < 1) { STATUS.className="status warn"; STATUS.textContent="Need at least 1 general subquery."; SUBMIT.disabled=false; return; }
+      if (specific.length < 1) { STATUS.className="status warn"; STATUS.textContent="Need at least 1 specific subquery."; SUBMIT.disabled=false; return; }
+      endpoint = "/api/kis-detail-2stage"; payload = { general, specific };
     } else if (track === "vqa") {
       endpoint = "/api/vqa-search";
       payload = { query: FORM.query.value, context: FORM.context.value, question: FORM.question.value, top_k: Number(FORM.top_k.value||20) };
@@ -674,9 +726,9 @@ INDEX_HTML = r"""<!doctype html>
         const uniqueVideos = new Set(chains.map(v => v.video_id)).size;
         STATUS.innerHTML = `<strong>${chains.length}</strong> chain(s) from <strong>${uniqueVideos}</strong> video(s) match all scenes <span class="pill">KIS Multi-Scene</span>`;
         renderTrake(data);
-      } else if (track === "kis_detail") {
+      } else if (track === "kis_detail_2stage") {
         const results = data.results || [];
-        STATUS.innerHTML = `<strong>${results.length}</strong> frames match all details <span class="pill">KIS Detail</span>`;
+        STATUS.innerHTML = `<strong>${results.length}</strong> frames match all details <span class="pill">KIS Detail 2-Stage</span>`;
         renderDetailCards(results);
       } else if (track === "vqa" && data.answer) {
         STATUS.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
