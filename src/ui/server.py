@@ -235,7 +235,7 @@ def build_handler(
                     if not frame_id or not sub_text:
                         raise ValueError("frame_id and sub_text are required.")
 
-                    frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+                    frame_embeddings, frame_records = load_temporal_data(experiment)
                     idx = None
                     for i, rec in enumerate(frame_records):
                         if rec.get("frame_id") == frame_id:
@@ -577,7 +577,7 @@ INDEX_HTML = r"""<!doctype html>
         <div id="vqa-settings" style="display: none;">
           <label for="vqa-backend">VQA Backend</label>
           <select id="vqa-backend" name="vqa_backend">
-            <option value="local">Qwen3.5-4B (Docker, Atlas/llama.cpp)</option>
+            <option value="local">Qwen3.5-4B (Docker, vLLM/llama.cpp)</option>
           </select>
         </div>
 
@@ -636,81 +636,50 @@ INDEX_HTML = r"""<!doctype html>
     const sidebarAnswer = document.getElementById("sidebar-answer");
     const sidebarAnswerText = document.getElementById("sidebar-answer-text");
 
-    form.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      submitEl.disabled = true;
-      statusEl.className = "status";
-      statusEl.textContent = "Searching...";
-      resultsEl.innerHTML = "";
-      answerBox.innerHTML = "";
-      eventsEl.innerHTML = "";
-      pipelineBox.innerHTML = "";
-      sidebarAnswer.style.display = "none";
-
-  // ─── TRAKE event inputs ───────────────────────────────────────────────────────
-  function eventCount() { return EVENTS_LIST.children.length; }
-  function addSubInput(btn) {
-    const wrapper = btn.closest(".event-wrapper");
-    if (!wrapper) return;
-    const container = wrapper.querySelector(".sub-inputs");
-    const row = document.createElement("div");
-    row.style.cssText = "display:flex;gap:6px;margin:0 0 4px 28px;align-items:start;";
-    row.innerHTML = `
+    // ─── TRAKE event inputs ───────────────────────────────────────────────────────
+    function eventCount() { return EVENTS_LIST.children.length; }
+    function addSubInput(btn) {
+      const wrapper = btn.closest(".event-wrapper");
+      if (!wrapper) return;
+      const container = wrapper.querySelector(".sub-inputs");
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:6px;margin:0 0 4px 28px;align-items:start;";
+      row.innerHTML = `
       <textarea class="sub-detail-input" style="flex:1;min-height:36px;font-size:12px;" placeholder="Sub-detail..."></textarea>
       <button type="button" style="width:auto;padding:2px 8px;margin-top:0;font-size:12px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.parentElement.remove()" title="Remove">✕</button>`;
-    container.appendChild(row);
-  }
-  function addEvent(value) {
-    const idx = eventCount() + 1;
-    const wrapper = document.createElement("div");
-    wrapper.className = "event-wrapper";
-    wrapper.style.cssText = "margin-bottom:8px;";
-    wrapper.innerHTML = `
+      container.appendChild(row);
+    }
+    function addEvent(value) {
+      const idx = eventCount() + 1;
+      const wrapper = document.createElement("div");
+      wrapper.className = "event-wrapper";
+      wrapper.style.cssText = "margin-bottom:8px;";
+      wrapper.innerHTML = `
       <div style="display:flex;gap:6px;align-items:start;">
         <textarea class="event-input" style="flex:1;min-height:56px;" placeholder="Event ${idx} description">${esc(value||"")}</textarea>
         <button type="button" class="add-sub-btn" style="width:auto;padding:6px 10px;margin-top:0;font-size:16px;background:transparent;color:var(--accent);border-color:var(--accent);" onclick="addSubInput(this)" title="Add sub-detail">+</button>
         <button type="button" style="width:auto;padding:6px 10px;margin-top:0;font-size:14px;background:transparent;color:var(--muted);border-color:var(--line);" onclick="this.closest('.event-wrapper').remove()" title="Remove">✕</button>
       </div>
       <div class="sub-inputs"></div>`;
-    EVENTS_LIST.appendChild(wrapper);
-  }
-  eid("add-event-btn").addEventListener("click", () => addEvent(""));
-  eid("window-slider").addEventListener("input", () => {
-    eid("window-value").textContent = eid("window-slider").value;
-  });
-  function getEvents() {
-    return Array.from(EVENTS_LIST.querySelectorAll(".event-wrapper"))
-      .map(w => {
-        const textarea = w.querySelector(".event-input");
-        const text = textarea ? textarea.value.trim() : "";
-        if (!text) return null;
-        const subInputs = w.querySelectorAll(".sub-detail-input");
-        const sub_details = Array.from(subInputs).map(s => s.value.trim()).filter(Boolean);
-        return { text, sub_details };
-      }).filter(Boolean);
-  }
+      EVENTS_LIST.appendChild(wrapper);
+    }
+    eid("add-event-btn").addEventListener("click", () => addEvent(""));
+    eid("window-slider").addEventListener("input", () => {
+      eid("window-value").textContent = eid("window-slider").value;
+    });
+    function getEvents() {
+      return Array.from(EVENTS_LIST.querySelectorAll(".event-wrapper"))
+        .map(w => {
+          const textarea = w.querySelector(".event-input");
+          const text = textarea ? textarea.value.trim() : "";
+          if (!text) return null;
+          const subInputs = w.querySelectorAll(".sub-detail-input");
+          const sub_details = Array.from(subInputs).map(s => s.value.trim()).filter(Boolean);
+          return { text, sub_details };
+        }).filter(Boolean);
+    }
 
-      if (track === "vqa") {
-          payload.vqa_backend = form.vqa_backend.value;
-      }
-      if (form.reranker_top_k.value) {
-        payload.reranker_top_k = Number(form.reranker_top_k.value);
-      }
-
-      let endpoint;
-      if (track === "vqa") {
-        endpoint = "/api/vqa-search";
-      } else if (track === "trake") {
-        endpoint = "/api/trake-search";
-      } else {
-        STATUS.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${track==="textual_kis"?"KIS Basic":"Video KIS"}</span>`;
-        renderCards(data.results);
-      }
-    } catch(err) { STATUS.className="status warn"; STATUS.textContent=err.message; }
-    finally { SUBMIT.disabled = false; }
-  });
-
-      const TIMEOUT_MS = 300_000;  // 5 min — models pre-warm in background but may still need time
+    const TIMEOUT_MS = 300_000;  // 5 min — models pre-warm in background but may still need time
       const MAX_RETRIES = 1;       // No auto-retry: models are pre-warmed at startup, not on first request
       let countdownTimer = null;
 

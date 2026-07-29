@@ -1,7 +1,3 @@
-# CodeNova — các lệnh dùng chung. Mọi thứ chạy qua uv.
-# Ghi đè biến pipeline trên dòng lệnh, ví dụ:
-#   make ingest EXP=demo INPUT=data/raw_videos
-
 .DEFAULT_GOAL := help
 
 EXP         ?= demo
@@ -19,7 +15,6 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
         vllm-index-up vllm-index-down vllm-index-health \
-        agent-up agent-down agent-health \
         ingest detect-shots extract-frames embed-frames build-index extract-text export-text import-text pipeline \
         search serve-ui clean-runs clean
 
@@ -79,23 +74,6 @@ vllm-index-down: ## Dừng vllm-index
 
 vllm-index-health: ## Kiểm tra vllm-index có sống không
 	curl -sf http://localhost:8881/v1/models && echo
-
-## --- Agent LLM (Qwen3.5-4B, port 8884; engine chọn theo phần cứng) ---
-agent-up: ## Khởi động agent LLM: vLLM nếu là DGX Spark/GB10, ngược lại llama.cpp
-	@if nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | grep -q GB10; then \
-		echo "GB10 detected -> vLLM (AWQ 4-bit)"; \
-		docker compose --profile vllm-agent up -d vllm-agent; \
-	else \
-		echo "Non-GB10 GPU -> llama.cpp (GGUF Q4_K_M)"; \
-		docker compose --profile llamacpp-agent up -d llamacpp-agent; \
-	fi
-
-agent-down: ## Dừng agent LLM (cả 2 engine)
-	docker compose stop vllm-agent llamacpp-agent 2>/dev/null || true
-	docker compose rm -f vllm-agent llamacpp-agent 2>/dev/null || true
-
-agent-health: ## Kiểm tra agent LLM có sống không
-	curl -sf http://localhost:8884/v1/models && echo
 
 ## --- Pipeline index offline ---
 ingest: ## Quét video (INPUT, EXP; RESUME=1 để dùng lại experiment đã có)

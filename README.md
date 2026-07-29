@@ -2,9 +2,7 @@
 
 Resumable video retrieval system: videos are split into shots, sampled into
 keyframes, embedded with **BEiT-3 large** (384px, dim 1024, COCO-retrieval
-fine-tune), and indexed in Qdrant. OCR/ASR text goes into Elasticsearch. An
-LLM agent (Qwen3.5-4B, Docker-served) answers VQA questions and drives an
-interactive narrowing-loop search chat.
+fine-tune), and indexed in Qdrant. OCR/ASR text goes into Elasticsearch.
 
 > 🇻🇳 Tài liệu tiếng Việt: [docs/vi/README.md](docs/vi/README.md)
 
@@ -24,10 +22,12 @@ ONLINE (retrieval)
     → [VQA] agent answer  /  [chat] interactive agent loop
 ```
 
-All generative models (LLM/VLM) are **Docker-served over OpenAI-compatible
-HTTP** — no model checkpoint is loaded inside the Python process for agent,
+Generative models (LLM/VLM) are **Docker-served over OpenAI-compatible
+HTTP** — no model checkpoint is loaded inside the Python process for
 captioning, OCR, or query processing. Embedders/rerankers (BEiT-3, SigLIP2,
-BLIP-2) run in-process as batch encoders.
+BLIP-2) run in-process as batch encoders. The agent LLM itself is not
+served by this repo's `docker-compose.yml` (point `.env` at whatever
+OpenAI-compatible endpoint you run for it).
 
 ## Models
 
@@ -38,18 +38,14 @@ BLIP-2) run in-process as batch encoders.
 | Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
 | Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
 | Captioning + OCR (indexing & agent tools) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **GB10 only**), port 8881 |
-| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | Docker port 8884 — vLLM (AWQ) on DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) elsewhere |
+| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | not served by this repo's docker-compose — point `.env` at your own OpenAI-compatible endpoint |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess into `external/gipformer/` |
 | Shot detection | TransNetV2 (PyTorch) | in-process |
 
-`vllm-agent` (4B, port 8884) and `vllm-index` (35B-A3B, port 8881) are two
-independent vLLM containers — separate ports so both run at once without
-evicting each other's weights/KV cache from GB10's unified memory pool.
-Captioning/OCR has **no non-GB10 fallback**: `vllm-index` needs GB10's
-Blackwell (SM121) GPU for its AWQ/Marlin kernel. `make agent-up` picks vLLM
-vs llama.cpp automatically from `nvidia-smi` (GB10 → vLLM) for the *agent*
-LLM only. Override models via `VLLM_AGENT_MODEL` / `LLAMACPP_MODEL` /
-`VLLM_INDEX_MODEL` in `.env`.
+`vllm-index` (35B-A3B, port 8881) is the only vLLM container this repo's
+`docker-compose.yml` runs. Captioning/OCR has **no non-GB10 fallback**:
+`vllm-index` needs GB10's Blackwell (SM121) GPU for its AWQ/Marlin kernel.
+Override its model via `VLLM_INDEX_MODEL` in `.env`.
 
 ### TensorRT-accelerated embedding
 
@@ -66,7 +62,7 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
 
 ## Agent
 
-Two agent paths, one LLM backend (port 8888):
+Two agent paths, one LLM backend (endpoint set via `.env`, not docker-compose):
 
 - **VQA answering** (`agent/react.py`): ReAct loop (max 5 steps) with
   `caption`/`ocr` tools that call the Docker VLM on port 8881. Cached
@@ -127,7 +123,6 @@ docs/vi/          # Vietnamese documentation
 uv sync                       # install dependencies
 cp .env.example .env          # configure endpoints (defaults work locally)
 make qdrant-up qdrant-health  # vector DB
-make agent-up agent-health    # agent LLM (auto-picks vLLM vs llama.cpp)
 ```
 
 ## Running the pipeline

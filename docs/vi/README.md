@@ -3,8 +3,7 @@
 Hệ thống truy hồi video chạy-tiếp-được (resumable): video được tách thành shot,
 lấy keyframe, embed bằng **BEiT-3 large** (384px, dim 1024, fine-tune
 COCO-retrieval) và index vào Qdrant. Chữ trên màn hình (OCR) và lời nói (ASR)
-được index vào Elasticsearch. Một agent LLM (Qwen3.5-4B, chạy qua Docker) trả
-lời câu hỏi VQA và điều khiển vòng chat thu hẹp kết quả tìm kiếm.
+được index vào Elasticsearch.
 
 > Bản tiếng Anh: [../../README.md](../../README.md)
 
@@ -24,10 +23,12 @@ ONLINE (truy hồi)
     → [VQA] agent trả lời  /  [chat] vòng lặp agent tương tác
 ```
 
-Mọi model sinh (LLM/VLM) đều **chạy qua Docker, giao tiếp bằng HTTP chuẩn
-OpenAI** — không load checkpoint nào trong process Python cho agent,
-captioning, OCR hay xử lý query. Các model embed/rerank (BEiT-3, SigLIP2,
-BLIP-2) chạy in-process vì là batch encoder.
+Các model sinh (LLM/VLM) dùng cho captioning/OCR/xử lý query đều **chạy qua
+Docker, giao tiếp bằng HTTP chuẩn OpenAI** — không load checkpoint nào trong
+process Python. Các model embed/rerank (BEiT-3, SigLIP2, BLIP-2) chạy
+in-process vì là batch encoder. Agent LLM không được serve bởi
+`docker-compose.yml` của repo này (trỏ `.env` tới endpoint OpenAI-compatible
+bạn tự chạy cho nó).
 
 ## Model
 
@@ -38,20 +39,14 @@ BLIP-2) chạy in-process vì là batch encoder.
 | Embed caption tiếng Việt (tùy chọn) | `AITeamVN/Vietnamese_Embedding_v2` trên caption do VLM sinh | caption qua Docker VLM; embed in-process |
 | Reranker (tùy chọn, khi chạy nhiều model) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
 | Captioning + OCR (index & tool agent) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **chỉ GB10**), cổng 8881 |
-| LLM agent (VQA, chat, mở rộng query) | **Qwen3.5-4B 4-bit** | Docker cổng 8884 — vLLM (AWQ) trên DGX Spark/GB10, llama.cpp (GGUF Q4_K_M) trên GPU khác |
+| LLM agent (VQA, chat, mở rộng query) | **Qwen3.5-4B 4-bit** | không được serve bởi docker-compose của repo này — trỏ `.env` tới endpoint OpenAI-compatible tự chạy |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess vào `external/gipformer/` |
 | Tách shot | TransNetV2 (PyTorch) | in-process |
 
-`vllm-agent` (4B, cổng 8884) và `vllm-index` (35B-A3B, cổng 8881) là 2
-container vLLM độc lập, cổng riêng để chạy đồng thời mà không tranh chấp bộ
-nhớ hợp nhất của GB10. Captioning/OCR **không có fallback cho máy khác GB10**
-— `vllm-index` cần GPU Blackwell (SM121) của GB10 cho kernel AWQ/Marlin.
-`make agent-up` chỉ tự chọn engine cho LLM agent (vLLM hay llama.cpp), không
-liên quan captioning/OCR.
-
-`make agent-up` tự chọn vLLM hay llama.cpp dựa vào `nvidia-smi` (GB10 →
-vLLM). Đổi model qua `VLLM_AGENT_MODEL` / `LLAMACPP_MODEL` / `VLLM_INDEX_MODEL`
-trong `.env`.
+`vllm-index` (35B-A3B, cổng 8881) là container vLLM duy nhất mà
+`docker-compose.yml` của repo này chạy. Captioning/OCR **không có fallback
+cho máy khác GB10** — `vllm-index` cần GPU Blackwell (SM121) của GB10 cho
+kernel AWQ/Marlin. Đổi model qua `VLLM_INDEX_MODEL` trong `.env`.
 
 ### Embedding tăng tốc bằng TensorRT
 
@@ -68,7 +63,7 @@ batch). Tắt riêng từng model bằng `BEIT3_USE_TENSORRT=0` /
 
 ## Agent
 
-Hai đường agent, chung một backend LLM (cổng 8888):
+Hai đường agent, chung một backend LLM (endpoint đặt qua `.env`, không qua docker-compose):
 
 - **Trả lời VQA** (`agent/react.py`): vòng ReAct (tối đa 5 bước) với tool
   `caption`/`ocr` gọi Docker VLM cổng 8881. Caption đã cache lúc index được
@@ -129,7 +124,6 @@ docs/vi/          # tài liệu tiếng Việt
 uv sync                       # cài dependency
 cp .env.example .env          # cấu hình endpoint (mặc định chạy được local)
 make qdrant-up qdrant-health  # vector DB
-make agent-up agent-health    # LLM agent (tự chọn vLLM hay llama.cpp)
 ```
 
 ## Chạy pipeline
