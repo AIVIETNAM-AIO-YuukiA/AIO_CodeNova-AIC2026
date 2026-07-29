@@ -133,6 +133,8 @@ def build_handler(experiment: Experiment, retriever, default_top_k: int):
                         experiment=experiment,
                         general=general,
                         specific=specific,
+                        general_weights=payload.get("general_weights"),
+                        specific_weights=payload.get("specific_weights"),
                     )
                     for r in result.get("results", []):
                         if r.get("frame_path"):
