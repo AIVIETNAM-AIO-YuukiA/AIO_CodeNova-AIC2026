@@ -1,7 +1,9 @@
-"""On-screen text extraction backed by the same VLM server used for
-captioning (see ``docker-compose.yml``'s ``vllm-index`` service), with a
-dedicated OCR-only prompt (see ``prompts/ocr.py`` for why this is kept
-separate from captioning).
+"""On-screen text extraction, with a dedicated OCR-only prompt (see
+``prompts/ocr.py`` for why this is kept separate from captioning).
+
+Uses the same ``VLLM_BASE_URL`` / ``VLLM_MODEL`` local vLLM engine as
+captioning, with the same OpenRouter fallback (see ``modules/_vllm_chat.py``)
+when that engine is unreachable.
 """
 
 from __future__ import annotations

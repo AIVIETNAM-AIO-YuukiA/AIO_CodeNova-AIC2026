@@ -23,7 +23,7 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "bitsandbytes>=0.46.1",
     "fairscale>=0.4.13",
-    "vllm",
+    "vllm; sys_platform == 'linux' or platform_machine == 'aarch64'",
     "sentence-transformers>=5.6.0",
 ]
 
