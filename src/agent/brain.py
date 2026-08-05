@@ -1,11 +1,12 @@
 """Agent brain — the Docker-hosted LLM behind every agent code path.
 
-One backend only: an OpenAI-compatible ``/v1/chat/completions`` server on
-port 8884, started by ``make agent-up`` (vLLM on DGX Spark/GB10, llama.cpp
-elsewhere — see ``agent/hardware.py``). The brain reasons over text (the
-served Qwen3.5-4B is text-only); anything visual reaches it through the
-caption/ocr tools in ``agent/tools.py``, which call the separate vLLM VLM
-service, or through captions cached at index time.
+One backend only: an OpenAI-compatible ``/v1/chat/completions`` server,
+not served by this repo's ``docker-compose.yml`` — point ``.env``'s
+``AGENT_LOCAL_ENGINE_URL`` at whatever OpenAI-compatible endpoint you run
+for it. The brain reasons over text (the served Qwen3.5-4B is text-only);
+anything visual reaches it through the caption/ocr tools in
+``agent/tools.py``, which call the separate vLLM VLM service, or through
+captions cached at index time.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from prompts.agent import VQA_SYSTEM_PROMPT
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "http://localhost:8884/v1"
+_DEFAULT_MODEL = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
 
 
 @dataclass
@@ -38,10 +40,10 @@ class AgentBrain:
     """ReAct reasoning via the Docker-hosted agent LLM (OpenAI-compatible)."""
 
     def __init__(self, model_name: str | None = None, base_url: str | None = None) -> None:
-        from agent.hardware import default_agent_model
-
         self.base_url = base_url or os.environ.get("AGENT_LOCAL_ENGINE_URL", _DEFAULT_BASE_URL)
-        self.model_name = model_name or default_agent_model()
+        self.model_name = (
+            model_name or os.environ.get("AGENT_LOCAL_ENGINE_MODEL") or _DEFAULT_MODEL
+        )
         self._client = None
 
     def reset(self) -> None:
@@ -73,7 +75,7 @@ class AgentBrain:
         except Exception as exc:
             LOGGER.exception("Brain reasoning failed")
             return BrainResponse(
-                answer=f"Agent LLM unavailable ({exc}). Run `make agent-up` to start it.",
+                answer=f"Agent LLM unavailable ({exc}). Check AGENT_LOCAL_ENGINE_URL in .env.",
                 finished=True,
             )
 

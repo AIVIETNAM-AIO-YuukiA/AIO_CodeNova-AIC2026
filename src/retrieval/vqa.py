@@ -14,7 +14,6 @@ import logging
 import numpy as np
 
 from config.settings import Experiment
-from modules.embedding import build_embedder
 from modules.reranker.base import Reranker
 from retrieval import build_retriever
 from retrieval.temporal_search import (
@@ -26,6 +25,21 @@ from retrieval.temporal_search import (
 from agent import create_agent
 
 LOGGER = logging.getLogger(__name__)
+
+# Retriever holds one embedder per configured model plus (for multi-model runs)
+# the BLIP-2 reranker — several GB of VRAM. Rebuilding it per request, and per
+# event within a multi-event TRAKE query, exhausts a small GPU within a couple
+# of searches, so keep one instance per experiment.
+_RETRIEVER_CACHE: dict[str, object] = {}
+
+
+def _get_retriever(experiment: Experiment):
+    """Return a cached retriever for ``experiment``, building it on first use."""
+    cached = _RETRIEVER_CACHE.get(experiment.name)
+    if cached is None:
+        cached = build_retriever(experiment)
+        _RETRIEVER_CACHE[experiment.name] = cached
+    return cached
 
 
 def _run_temporal_pipeline(
@@ -49,7 +63,7 @@ def _run_temporal_pipeline(
     pipeline_stages = {}
 
     # Stage 1: fast bi-encoder retrieval via SigLIP + Qdrant.
-    retriever = build_retriever(experiment)
+    retriever = _get_retriever(experiment)
     embed_results = retriever.search(query=query, top_k=top_k)
     pipeline_stages["embed_search"] = {
         "top_k": top_k,
@@ -126,10 +140,10 @@ def _run_temporal_pipeline(
     }
 
     # Query embedding cho shot validation — cùng model với load_temporal_data.
-    embedder = build_embedder(
-        model_name=experiment.config.embedding_models[0],
-        device=experiment.config.device,
-    )
+    # Reuse the cached retriever's embedder instead of building a fresh one:
+    # this runs once per event in a multi-event TRAKE query, and a second
+    # full model load per event exhausts a small GPU within a few searches.
+    embedder = _get_retriever(experiment).embedders[experiment.config.embedding_models[0]]
     query_embedding = embedder.embed_text(query)
 
     # Gather shot cho mỗi segment
@@ -492,3 +506,45 @@ def trake_search(
         "results": [r.to_dict() for r in unique_results[:10]],
         "pipeline": combined_pipeline_stages,
     }
+
+
+def enhanced_temporal_search(
+    experiment: Experiment,
+    query: str,
+    context: str = "",
+    top_k: int = 20,
+    max_events: int = 5,
+    reranker=None,
+    reranker_top_k: int = 10,
+) -> dict:
+    """TRAKE, but the event list is extracted from one sentence by an LLM.
+
+    Ported from the AIC_2025 reference project's ``/search/temporal/enhanced``:
+    the user types a single natural-language description of a sequence
+    ("a man walks out, then rides away") instead of filling in each event box,
+    and the LLM splits it into ordered events. Everything after that — per-event
+    retrieval, temporal expansion, sequence search — is exactly ``trake_search``.
+
+    Returns ``trake_search``'s payload plus ``extracted_events`` so the UI can
+    show what the query was split into. Falls back to searching the query as a
+    single event when the LLM is unavailable or finds no sequence.
+    """
+    retriever = _get_retriever(experiment)
+    events = retriever.query_processor.extract_temporal_events(query, max_events=max_events)
+
+    if len(events) >= 2:
+        trake_query = "\n".join(f"E{i}: {event}" for i, event in enumerate(events, start=1))
+    else:
+        # No sequence detected: let trake_search treat the whole query as one event.
+        trake_query = query
+
+    result = trake_search(
+        experiment=experiment,
+        query=trake_query,
+        context=context,
+        top_k=top_k,
+        reranker=reranker,
+        reranker_top_k=reranker_top_k,
+    )
+    result["extracted_events"] = events
+    return result

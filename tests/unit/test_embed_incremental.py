@@ -27,6 +27,9 @@ class FakeEmbedder:
         return vectors
 
 
+MODEL = PipelineConfig.embedding_models[0]
+
+
 def _experiment(tmp_path) -> Experiment:
     return Experiment(name="exp", run_dir=tmp_path, config=PipelineConfig(runs_dir=tmp_path))
 
@@ -61,8 +64,8 @@ def test_incremental_embeds_only_new_frames(tmp_path, monkeypatch) -> None:
     assert fake.calls[-1] == ["v1_s0_f3"]  # only the new frame was embedded
 
     # npz rows and frame_ids stay aligned and complete
-    ids = json.loads((tmp_path / "embeddings" / "frame_ids__beit3-large.json").read_text())
-    vecs = np.load(tmp_path / "embeddings" / "frames__beit3-large.npz")["embeddings"]
+    ids = json.loads((tmp_path / "embeddings" / f"frame_ids__{MODEL}.json").read_text())
+    vecs = np.load(tmp_path / "embeddings" / f"frames__{MODEL}.npz")["embeddings"]
     assert ids == ["v1_s0_f1", "v1_s0_f2", "v1_s0_f3"]
     assert vecs.shape == (3, 2)
 
@@ -79,7 +82,7 @@ def test_rerun_with_no_new_frames_is_noop(tmp_path, monkeypatch) -> None:
 
 def test_resumes_from_mid_model_checkpoint(tmp_path, monkeypatch) -> None:
     """Simulate a run killed mid-model: a checkpoint file exists (from a
-    prior process that flushed partial progress) but frames__beit3-large.npz does
+    prior process that flushed partial progress) but frames__<model>.npz does
     not. Re-running must skip the checkpointed frames and only embed the rest."""
     import numpy as np
 
@@ -94,9 +97,9 @@ def test_resumes_from_mid_model_checkpoint(tmp_path, monkeypatch) -> None:
     output_dir.mkdir(parents=True)
     # Hand-write a checkpoint as if a prior interrupted pass had flushed
     # after embedding only the first frame.
-    (output_dir / "frame_ids__beit3-large.checkpoint.json").write_text(json.dumps(["v1_s0_f1"]))
+    (output_dir / f"frame_ids__{MODEL}.checkpoint.json").write_text(json.dumps(["v1_s0_f1"]))
     np.savez_compressed(
-        output_dir / "frames__beit3-large.checkpoint.npz", embeddings=np.array([[8.0, 1.0]])
+        output_dir / f"frames__{MODEL}.checkpoint.npz", embeddings=np.array([[8.0, 1.0]])
     )
 
     added = embeddings.embed_frames(exp)
@@ -104,11 +107,11 @@ def test_resumes_from_mid_model_checkpoint(tmp_path, monkeypatch) -> None:
     assert added == 3  # 1 carried over from checkpoint + 2 freshly embedded
     assert fake.calls == [["v1_s0_f2", "v1_s0_f3"]]  # checkpointed frame skipped
 
-    ids = json.loads((output_dir / "frame_ids__beit3-large.json").read_text())
-    vecs = np.load(output_dir / "frames__beit3-large.npz")["embeddings"]
+    ids = json.loads((output_dir / f"frame_ids__{MODEL}.json").read_text())
+    vecs = np.load(output_dir / f"frames__{MODEL}.npz")["embeddings"]
     assert ids == ["v1_s0_f1", "v1_s0_f2", "v1_s0_f3"]
     assert vecs.shape == (3, 2)
 
     # checkpoint files are cleaned up once the model finishes
-    assert not (output_dir / "frame_ids__beit3-large.checkpoint.json").exists()
-    assert not (output_dir / "frames__beit3-large.checkpoint.npz").exists()
+    assert not (output_dir / f"frame_ids__{MODEL}.checkpoint.json").exists()
+    assert not (output_dir / f"frames__{MODEL}.checkpoint.npz").exists()

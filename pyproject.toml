@@ -11,9 +11,10 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
     "pre-commit>=4.6.0",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "transformers>=5.12.0",
+    "torch>=2.11.0,<2.12",
+    "torchvision>=0.26.0,<0.27",
+    # jina-clip-v2's remote code imports symbols removed in transformers 5.x.
+    "transformers>=4.55,<5",
     "google-genai>=2.8.0",
     "ollama>=0.6.2",
     "imageio-ffmpeg>=0.6.0",
@@ -23,7 +24,6 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "bitsandbytes>=0.46.1",
     "fairscale>=0.4.13",
-    "vllm; sys_platform == 'linux' or platform_machine == 'aarch64'",
     "sentence-transformers>=5.6.0",
 ]
 
@@ -48,19 +48,16 @@ dev = [
 ]
 
 [[tool.uv.index]]
+name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
-
-[[tool.uv.index]]
-name = "vllm-nightly"
-url = "https://wheels.vllm.ai/nightly"
 explicit = true
 
 [tool.uv.sources]
-vllm = { index = "vllm-nightly" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
-torch-backend = "auto"
 
 [tool.ruff]
 line-length = 100

@@ -48,12 +48,13 @@ class InteractiveAgent:
         if self._client is None:
             import os
 
-            from agent.hardware import default_agent_model
             from modules._vllm_chat import VllmChatClient
 
             self._client = VllmChatClient(
                 base_url=os.environ.get("AGENT_LOCAL_ENGINE_URL", "http://localhost:8884/v1"),
-                model_name=default_agent_model(),
+                model_name=os.environ.get(
+                    "AGENT_LOCAL_ENGINE_MODEL", "cyankiwi/Qwen3.5-4B-AWQ-4bit"
+                ),
             )
         return self._client
 
@@ -109,7 +110,7 @@ class InteractiveAgent:
             except Exception as exc:
                 LOGGER.exception("Interactive agent LLM call failed")
                 return _turn(
-                    f"Agent LLM chưa sẵn sàng ({exc}). Chạy `make agent-up` rồi thử lại.",
+                    f"Agent LLM chưa sẵn sàng ({exc}). Kiểm tra AGENT_LOCAL_ENGINE_URL trong .env.",
                     results,
                     actions,
                     done=True,

@@ -1,9 +1,9 @@
-"""Shared TensorRT export/build/inference for vision encoders.
+"""Export/build/chay inference TensorRT dung chung cho cac vision encoder.
 
-Exports a model's vision tower to ONNX, builds a TensorRT FP16 engine, and
-caches it under ``weights/<model>/``. First call builds; later calls just
-load the cached engine. Text encoding stays on PyTorch — queries are embedded
-one at a time, so there's no batching gain to capture.
+Export vision tower cua model ra ONNX, build engine TensorRT FP16, roi
+cache vao ``weights/<model>/``. Lan goi dau tien se build; cac lan sau chi
+nap engine da cache. Text encoding van chay PyTorch - query duoc embed
+tung cai mot nen khong co loi ich gi tu batching.
 """
 
 from __future__ import annotations
@@ -28,11 +28,11 @@ def weights_dir(model_key: str) -> Path:
 
 
 class TensorRTVisionEncoder:
-    """Builds (once) and runs a TensorRT FP16 engine for a vision encoder.
+    """Build (1 lan) va chay engine TensorRT FP16 cho 1 vision encoder.
 
-    ``export_onnx_fn(onnx_path)`` traces the model with ``torch.onnx.export``
-    and writes it to ``onnx_path`` — supplied by the caller since tracing a
-    dummy input and picking the output tensor name differs per model.
+    ``export_onnx_fn(onnx_path)`` trace model bang ``torch.onnx.export`` roi
+    ghi ra ``onnx_path`` - do noi goi truyen vao vi cach trace dummy input
+    va chon ten output tensor khac nhau tuy model.
     """
 
     def __init__(
@@ -66,7 +66,7 @@ class TensorRTVisionEncoder:
         return directory / "vision.onnx", directory / "vision_fp16.engine"
 
     def ensure_built(self) -> Path:
-        """Export + build if not already cached; a no-op otherwise."""
+        """Export + build neu chua cache; da co san thi khong lam gi."""
         onnx_path, engine_path = self._paths()
         if engine_path.exists():
             LOGGER.info("[%s] Using cached TensorRT engine: %s", self.model_key, engine_path)
@@ -113,10 +113,11 @@ class TensorRTVisionEncoder:
         return self._context
 
     def infer(self, pixel_values):
-        """Run the vision encoder on a batch of preprocessed CUDA pixel tensors.
+        """Chay vision encoder tren 1 batch pixel tensor CUDA da preprocess.
 
-        ``pixel_values``: contiguous ``(batch, 3, H, W)`` float32. Returns a
-        ``(batch, output_dim)`` float32 CUDA tensor.
+        ``pixel_values``: tensor float32 lien tuc dang ``(batch, 3, H, W)``.
+        Tra ve tensor CUDA dang ``(batch, output_dim)``, dtype theo dung
+        dtype ma engine khai bao (fp16 hoac fp32 tuy model).
         """
         import torch
 
@@ -132,13 +133,17 @@ class TensorRTVisionEncoder:
         if self._stream is None:
             self._stream = torch.cuda.Stream()
 
-        # Rebinding tensor addresses each call is measurable overhead at this
-        # scale; reuse the buffers when the batch size repeats (the common
-        # case — every call is full-size except the last, partial one).
+        # Gan lai dia chi tensor moi lan goi ton overhead do duoc o quy mo
+        # nay; tai su dung buffer khi batch size lap lai (truong hop pho
+        # bien - moi lan goi deu full-size, tru lan cuoi con du).
         if self._buffers is None or self._buffers_batch != batch:
             context.set_input_shape(self.input_name, tuple(pixel_values.shape))
+            # Buffer phai dung dung dtype engine khai bao: engine ghi fp16 vao
+            # buffer fp32 (hoac nguoc lai) se doc ra so rac hoan toan.
             output = torch.empty(
-                (batch, self.output_dim), dtype=torch.float32, device=pixel_values.device
+                (batch, self.output_dim),
+                dtype=self._torch_dtype(torch, self.output_name),
+                device=pixel_values.device,
             )
             scratch_tensors = {}
             for i in range(self._engine.num_io_tensors):
@@ -147,7 +152,7 @@ class TensorRTVisionEncoder:
                     continue
                 shape = tuple(context.get_tensor_shape(name))
                 scratch_tensors[name] = torch.empty(
-                    shape, dtype=torch.float32, device=pixel_values.device
+                    shape, dtype=self._torch_dtype(torch, name), device=pixel_values.device
                 )
                 context.set_tensor_address(name, scratch_tensors[name].data_ptr())
             context.set_tensor_address(self.output_name, output.data_ptr())
@@ -161,6 +166,25 @@ class TensorRTVisionEncoder:
         self._stream.synchronize()
         return output
 
+    def _torch_dtype(self, torch, tensor_name: str):
+        """Doi dtype TensorRT cua 1 tensor sang dtype torch tuong ung."""
+        import tensorrt as trt
+
+        mapping = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF: torch.float16,
+            trt.DataType.INT32: torch.int32,
+            trt.DataType.INT8: torch.int8,
+            trt.DataType.BOOL: torch.bool,
+        }
+        trt_dtype = self._engine.get_tensor_dtype(tensor_name)
+        if trt_dtype not in mapping:
+            raise EmbeddingError(
+                f"[{self.model_key}] Chua ho tro dtype TensorRT {trt_dtype} "
+                f"cho tensor '{tensor_name}'."
+            )
+        return mapping[trt_dtype]
+
 
 def _build_engine(
     onnx_path: Path,
@@ -170,7 +194,7 @@ def _build_engine(
     opt_batch: int,
     max_batch: int,
 ) -> None:
-    """Build a dynamic-batch FP16 TensorRT engine from an ONNX file."""
+    """Build engine TensorRT FP16 ho tro dynamic-batch tu 1 file ONNX."""
     try:
         import tensorrt as trt
     except ImportError as exc:
@@ -178,17 +202,28 @@ def _build_engine(
 
     logger = trt.Logger(trt.Logger.WARNING)
     builder = trt.Builder(logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    # TensorRT 10+ chi con che do explicit batch, bo EXPLICIT_BATCH;
+    # TensorRT 11 thay tiep BuilderFlag.FP16 bang strongly-typed network,
+    # do chinh xac lay tu ONNX graph. Ho tro ca 2 phien ban.
+    flags = 0
+    explicit_batch = getattr(trt.NetworkDefinitionCreationFlag, "EXPLICIT_BATCH", None)
+    if explicit_batch is not None:
+        flags |= 1 << int(explicit_batch)
+    strongly_typed = getattr(trt.NetworkDefinitionCreationFlag, "STRONGLY_TYPED", None)
+    if not hasattr(trt.BuilderFlag, "FP16") and strongly_typed is not None:
+        flags |= 1 << int(strongly_typed)
+    network = builder.create_network(flags)
     parser = trt.OnnxParser(network, logger)
 
-    # parse_from_file, not parse(bytes): resolves external-data files (e.g.
-    # "vision.onnx.data") relative to the ONNX file, not the cwd.
+    # Dung parse_from_file, khong dung parse(bytes): tim file external-data
+    # (vd "vision.onnx.data") tuong doi theo vi tri file ONNX, khong phai cwd.
     if not parser.parse_from_file(str(onnx_path)):
         errors = "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
         raise EmbeddingError(f"Failed to parse ONNX model {onnx_path}:\n{errors}")
 
     config = builder.create_builder_config()
-    config.set_flag(trt.BuilderFlag.FP16)
+    if hasattr(trt.BuilderFlag, "FP16"):
+        config.set_flag(trt.BuilderFlag.FP16)
 
     profile = builder.create_optimization_profile()
     chw = tuple(network.get_input(0).shape[1:])
@@ -199,8 +234,8 @@ def _build_engine(
     if serialized is None:
         raise EmbeddingError(f"TensorRT engine build failed for {onnx_path}")
 
-    # Temp file + rename so a killed build never leaves a corrupt engine that
-    # looks present on retry.
+    # Ghi ra file tam roi doi ten, de neu build bi ngat giua chung se khong
+    # de lai engine hong ma lan sau tuong da co san.
     tmp_path = engine_path.with_suffix(engine_path.suffix + ".tmp")
     tmp_path.write_bytes(serialized)
     tmp_path.replace(engine_path)

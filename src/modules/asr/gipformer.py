@@ -1,37 +1,11 @@
-"""Vietnamese ASR backed by g-group-ai-lab/gipformer-65M-rnnt (Zipformer Transducer).
+"""Vietnamese ASR via g-group-ai-lab/gipformer-65M-rnnt (Zipformer Transducer).
 
-Unlike the other model backends in this project, gipformer isn't a plain
-HuggingFace Transformers checkpoint — it runs through sherpa-onnx via its own
-CLI script (see ``external/gipformer/``), cloned as its own isolated
-repo+venv (same convention as ``external/TransNetV2``) because its
-sherpa-onnx pin doesn't need to coexist with the rest of this project's
-dependency stack.
-
-The published checkpoint is an *offline* (non-causal) transducer — confirmed
-by attempting to load it into sherpa-onnx's ``OnlineRecognizer``, which fails
-on missing streaming-only metadata — so true streaming decoding isn't
-available. Long audio is cut at speech boundaries using Silero-VAD
-(``modules/asr/vad.py``) rather than at fixed-time marks, then each speech
-segment is transcribed independently and the resulting texts are regrouped
-into semantic chunks of ~``target_words`` words (see ``_group_by_words``) —
-same two-stage approach (VAD segmentation + word-count regrouping) as the
-AIC 2025 reference project's ASR pipeline, adapted to gipformer instead of
-Whisper. A chunk boundary never lands mid-sentence because it only ever
-falls on a VAD-detected silence. Each chunk becomes its own ``Transcript``
-(never force-joined into one whole-video string) so an Elasticsearch
-document per chunk maps naturally to "nearest keyframe by timestamp", per
-``paper2_cascaded_system.md``'s ASR/keyframe alignment.
-
-All of a video's segments are transcribed via one (or a few, if there are
-100+) calls into ``external/gipformer/infer_json.py``, which decodes them
-with sherpa_onnx's ``decode_streams()`` — a real batched decode processed
-concurrently inside the engine, matching how the AIC 2025 reference
-project's Whisper pipeline batches its HF ``pipeline(..., batch_size=...)``
-call. An earlier version of this code called ``infer_json.py`` with the
-same batching but that script decoded one file at a time internally
-(looping ``decode_streams([1 stream])``); that's the actual reason a
-135-segment video OOM-killed its subprocess, not the batch size — see
-``infer_json.py``'s docstring for the fix.
+Runs through sherpa-onnx in its own isolated repo+venv under
+``external/gipformer/`` rather than as a Transformers checkpoint. Audio is cut
+at Silero-VAD speech boundaries, each segment transcribed, then regrouped into
+~``target_words`` chunks so a chunk boundary never lands mid-sentence. Each
+chunk becomes its own ``Transcript`` so one Elasticsearch document maps to the
+nearest keyframe by timestamp.
 """
 
 from __future__ import annotations
@@ -51,27 +25,22 @@ from modules.asr.vad import SileroVad
 LOGGER = logging.getLogger(__name__)
 
 _EXTERNAL_DIR = Path(__file__).resolve().parent.parent.parent.parent / "external" / "gipformer"
-_VENV_PYTHON = _EXTERNAL_DIR / ".venv" / "bin" / "python"
+_VENV_PYTHON = (
+    _EXTERNAL_DIR / ".venv" / "Scripts" / "python.exe"
+    if os.name == "nt"
+    else _EXTERNAL_DIR / ".venv" / "bin" / "python"
+)
 _SCRIPT = _EXTERNAL_DIR / "infer_json.py"
 
 _SAMPLE_RATE = 16000
 
-# Fallback fixed-window size when VAD is unavailable, and the cap on how long
-# a single VAD speech segment may run before being force-split — gipformer is
-# non-causal, so an unbounded segment (e.g. 2 minutes of continuous speech)
-# would blow up decode time/memory.
+# gipformer is non-causal, so an unbounded segment blows up decode time/memory.
 _MAX_SEGMENT_SECONDS = 30.0
-# Below this, a window is too few audio samples for sherpa-onnx's batched
-# decode_streams() to build a valid tensor from — see _speech_windows.
+# Below this, sherpa-onnx can't build a valid tensor from the window.
 _MIN_SEGMENT_SECONDS = 0.1
 _DEFAULT_TARGET_WORDS = 150
 
-# infer_json.py decodes all its --audio segments in one batched
-# sherpa_onnx.decode_streams() call, which loads every segment's audio into
-# memory before decoding — capping the batch bounds peak memory for videos
-# with unusually many VAD segments (100+ for a long/chatty news clip) without
-# giving up the real speedup decode_streams() gives over decoding one file
-# at a time (see infer_json.py's docstring).
+# Caps peak memory: infer_json.py loads every segment before decoding.
 _MAX_SEGMENTS_PER_INFERENCE_CALL = 100
 
 
@@ -199,11 +168,10 @@ class GipformerAsrModel(AsrModel):
     def _ensure_setup(self) -> None:
         if self._checked_setup:
             return
-        if not _VENV_PYTHON.exists():
-            raise CodeNovaError(
-                f"gipformer venv not found at {_VENV_PYTHON}. Run "
-                f"'cd {_EXTERNAL_DIR} && uv sync' to set it up."
-            )
+        if not (_VENV_PYTHON.exists() and _SCRIPT.exists()):
+            from core.external_setup import ensure_gipformer
+
+            ensure_gipformer()
         self._checked_setup = True
 
 

@@ -11,7 +11,7 @@ PORT        ?=
 TN2_DIR     ?= external/TransNetV2/inference-pytorch
 TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 
-.PHONY: help sync install-hooks lint format check test pre-commit precommit \
+.PHONY: help setup sync install-hooks lint format check test pre-commit precommit \
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
         vllm-index-up vllm-index-down vllm-index-health \
@@ -23,6 +23,19 @@ help: ## Hiện danh sách lệnh này
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
 
 ## --- Môi trường ---
+setup: sync ## Cài TẤT CẢ: dependency + GPU extras + external repo (TransNetV2, gipformer)
+	@echo "=== Optional GPU extras (onnxruntime, TensorRT) ==="
+	uv pip install onnxruntime onnx onnxscript tensorrt || \
+		echo "  (bỏ qua — pipeline vẫn chạy được với PyTorch)"
+	@echo "=== torchaudio (Silero-VAD cần; khớp index cu128 của torch) ==="
+	uv pip install torchaudio --index-url https://download.pytorch.org/whl/cu128 || \
+		echo "  (bỏ qua — ASR sẽ cắt cố định 30s thay vì theo câu nói)"
+	@echo "=== External repos + weights (một lần, vài phút) ==="
+	uv run python -c "import sys; sys.path.insert(0, 'src'); \
+		from core.external_setup import ensure_transnetv2, ensure_gipformer; \
+		print('TransNetV2:', ensure_transnetv2()); print('gipformer:', ensure_gipformer())"
+	@echo "=== Xong. Chạy 'make qdrant-up elasticsearch-up' rồi 'make pipeline EXP=... INPUT=...' ==="
+
 sync: ## Cài/đồng bộ dependency bằng uv
 	uv sync
 

@@ -1,25 +1,17 @@
 """OCR + ASR text extraction stage — offline, indexes into Elasticsearch.
 
 Two independent sub-stages sharing one job-state table (``EXTRACT_OCR`` /
-``EXTRACT_ASR``), each resumable on its own:
-
-- OCR runs per-keyframe (``modules/ocr/vllm.py``, same self-hosted VLM as
-  captioning, dedicated OCR-only prompt) — on-screen ticker/banner/program
-  name/logo text, the single most query-able detail in a news keyframe.
-- ASR runs per-video (``modules/asr/gipformer.py``) — the video's full audio
-  track, chunked and transcribed.
-
-Both write ``TextDocument`` records into the configured ``TextIndex``
-(Elasticsearch) via ``stores/text/factory.py``, keyed by the same
-``frame_id``/``video_id`` used everywhere else in the pipeline, so results
-here fuse naturally with vector search — this is the OCR/ASR branch the
-project's docs have described as "not yet wired in" until now.
+``EXTRACT_ASR``), each resumable on its own. Every document is also appended
+to ``manifests/text.jsonl`` as it is produced, so losing the Elasticsearch
+volume never means re-running OCR/ASR — ``import-text`` reloads from there.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 import os
+import threading
 
 from core.errors import CodeNovaError
 from core.logging import get_logger
@@ -35,38 +27,71 @@ LOGGER = get_logger(__name__)
 
 _DEFAULT_OCR_WORKERS = 8
 
+# Set OCR_ONE_FRAME_PER_SHOT=1 to OCR a single representative frame per shot
+# instead of every keyframe. On-screen text is usually static within a shot, so
+# this cuts VLM calls (and cost) by ~2/3 at the risk of missing text that
+# appears only mid-shot, such as a moving ticker.
+_ONE_FRAME_PER_SHOT = os.environ.get("OCR_ONE_FRAME_PER_SHOT", "0").lower() not in ("0", "false", "")
+
+
+def _pick_one_frame_per_shot(frames: list[FrameRecord]) -> list[FrameRecord]:
+    """Keep the middle frame of each shot, which is furthest from cut boundaries."""
+    by_shot: dict[str, list[FrameRecord]] = {}
+    for frame in frames:
+        by_shot.setdefault(frame.shot_id, []).append(frame)
+    picked = []
+    for shot_frames in by_shot.values():
+        shot_frames.sort(key=lambda f: f.timestamp_sec)
+        picked.append(shot_frames[len(shot_frames) // 2])
+    picked.sort(key=lambda f: (f.video_id, f.timestamp_sec))
+    return picked
+
+
+class _TextSink:
+    """Writes documents to the text index and mirrors them into text.jsonl."""
+
+    def __init__(self, experiment) -> None:
+        self._index = build_text_index(experiment)
+        self._manifest = JsonlManifest(experiment.run_dir / "manifests" / "text.jsonl")
+        self._lock = threading.Lock()
+
+    def write(self, documents: list[TextDocument]) -> None:
+        if not documents:
+            return
+        self._index.index_documents(documents)
+        with self._lock:
+            for doc in documents:
+                self._manifest.append(asdict(doc))
+
 
 def extract_ocr(experiment, force: bool = False) -> int:
-    """Run OCR on every keyframe and index the results into Elasticsearch.
+    """Run OCR on every keyframe, indexing results and mirroring them to JSONL.
 
-    Returns the number of frames newly indexed (frames with no on-screen text
-    are still marked completed, so they aren't retried every run, but produce
-    no document — an empty Elasticsearch document would just be noise).
-
-    Runs concurrently across keyframes (CAPTION_WORKERS threads, shared with
-    the captioning branch's default) since each call is a slow vLLM round
-    trip — see VietnameseEmbedder.embed_images for the same rationale.
-    JobState.mark and the Elasticsearch client are each safe to call from
-    multiple threads (SQLite serializes writes per-connection; the ES client
-    is a standard pooled HTTP client), so no extra locking is needed here.
+    Frames with no on-screen text are still marked completed so they aren't
+    retried, but produce no document. Runs CAPTION_WORKERS threads since each
+    call is a slow VLM round trip.
     """
     frames_manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
     state = JobState(experiment.run_dir / "jobs.sqlite")
     frames = [FrameRecord.from_dict(row) for row in frames_manifest.read_all()]
     frames = [f for f in frames if not state.should_skip(f.frame_id, "EXTRACT_OCR", force=force)]
+    if _ONE_FRAME_PER_SHOT:
+        before = len(frames)
+        frames = _pick_one_frame_per_shot(frames)
+        LOGGER.info("OCR one-frame-per-shot: %s frames -> %s shots", before, len(frames))
     if not frames:
         LOGGER.warning("No frames to OCR (all done, or none found)")
         return 0
 
     ocr_model = VllmOcrModel()
-    text_index = build_text_index(experiment)
+    sink = _TextSink(experiment)
     workers = int(os.environ.get("CAPTION_WORKERS", _DEFAULT_OCR_WORKERS))
 
     def _process(frame: FrameRecord) -> bool:
         try:
             text = ocr_model.recognize(frame.frame_path)
             if text:
-                text_index.index_documents(
+                sink.write(
                     [
                         TextDocument(
                             doc_id=f"{frame.frame_id}__ocr",
@@ -108,7 +133,7 @@ def extract_asr(experiment, force: bool = False) -> int:
         return 0
 
     asr_model = GipformerAsrModel()
-    text_index = build_text_index(experiment)
+    sink = _TextSink(experiment)
     indexed = 0
 
     for video in videos:
@@ -129,7 +154,7 @@ def extract_asr(experiment, force: bool = False) -> int:
                 if t.text
             ]
             if documents:
-                text_index.index_documents(documents)
+                sink.write(documents)
                 indexed += len(documents)
             state.mark(video.video_id, "EXTRACT_ASR", "COMPLETED")
         except Exception as exc:
@@ -141,12 +166,10 @@ def extract_asr(experiment, force: bool = False) -> int:
 
 
 def export_text(experiment) -> int:
-    """Dump every OCR/ASR document from Elasticsearch to ``manifests/text.jsonl``.
+    """Re-dump every OCR/ASR document from Elasticsearch to ``manifests/text.jsonl``.
 
-    Elasticsearch (a Docker-managed volume, not a project directory) is the
-    system of record for OCR/ASR text — this just makes a local JSONL copy
-    for backup/inspection without needing to query Elasticsearch directly,
-    mirroring how ``captions.jsonl`` mirrors the Vietnamese embedder's captions.
+    Extraction already mirrors documents there as they are produced; this
+    rebuilds the file from Elasticsearch when it has drifted or been deleted.
     """
     text_index = build_text_index(experiment)
     output_path = experiment.run_dir / "manifests" / "text.jsonl"

@@ -1,4 +1,4 @@
-"""Embedding interface and shared helpers for all backends."""
+"""Interface embedding va cac ham dung chung cho moi backend."""
 
 from __future__ import annotations
 
@@ -9,36 +9,35 @@ import time
 from core.errors import EmbeddingError
 from core.types import FrameRecord
 
-# Called after each internal batch with (batch_frames, batch_vectors) so the
-# caller can checkpoint progress to disk without waiting for the whole
-# embed_images() call (which can cover hundreds of thousands of frames) to
-# return. Optional — backends must accept it but callers may pass None.
+# Duoc goi sau moi batch noi bo voi (batch_frames, batch_vectors) de noi
+# goi co the checkpoint tien do ra dia ma khong phai cho ca ham
+# embed_images() (co the xu ly hang tram nghin frame) tra ve. La optional -
+# backend phai chap nhan tham so nay nhung noi goi co the truyen None.
 BatchCallback = Callable[[list[FrameRecord], list[list[float]]], None]
 
 
 class Embedder:
-    """Interface for image/text embedding backends."""
+    """Interface cho cac backend embedding anh/text."""
 
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
     ) -> list[list[float]]:
-        """Embed image frames, optionally reporting each internal batch via ``on_batch``."""
+        """Embed cac frame anh, co the bao tien do tung batch qua ``on_batch``."""
         raise NotImplementedError
 
     def embed_text(self, query: str) -> list[float]:
-        """Embed a text query."""
+        """Embed 1 cau query text."""
         raise NotImplementedError
 
 
 class BatchProgressLogger:
-    """Logs periodic progress through a large batch loop.
+    """Log tien do dinh ky trong 1 vong lap batch lon.
 
-    ``embed_images()`` is called once with the full frame list (hundreds of
-    thousands for a real dataset) and the caller (indexing/embeddings.py)
-    only logs once the whole call returns — so without this, a run can sit
-    silent for hours even while actively processing on GPU. Logs at most
-    every ``min_interval_seconds`` to avoid flooding the log for small batch
-    sizes.
+    ``embed_images()`` duoc goi 1 lan voi toan bo danh sach frame (hang
+    tram nghin frame voi du lieu that), va noi goi (indexing/embeddings.py)
+    chi log khi ca lan goi tra ve xong - nen neu khong co class nay, 1 lan
+    chay co the im lang hang gio du dang xu ly that tren GPU. Chi log toi
+    da moi ``min_interval_seconds`` de tranh log qua nhieu khi batch nho.
     """
 
     def __init__(
@@ -65,11 +64,11 @@ class BatchProgressLogger:
 
 
 def projected_features(features):
-    """Return the projected embedding tensor across Transformers versions.
+    """Tra ve tensor embedding da projected, dung duoc voi moi ban Transformers.
 
-    Transformers 4.x returned tensors from ``get_image_features`` and
-    ``get_text_features``. Transformers 5.x returns ``BaseModelOutputWithPooling``
-    and stores the projected embedding in ``pooler_output``.
+    Transformers 4.x tra thang tensor tu ``get_image_features`` va
+    ``get_text_features``. Transformers 5.x tra ve
+    ``BaseModelOutputWithPooling``, embedding nam trong ``pooler_output``.
     """
     if hasattr(features, "pooler_output"):
         return features.pooler_output
@@ -77,7 +76,7 @@ def projected_features(features):
 
 
 def resolve_torch_device(torch, requested: str):
-    """Resolve a torch device and require CUDA for auto/cuda modes."""
+    """Xac dinh torch device; bat buoc phai co CUDA voi che do auto/cuda."""
     if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")

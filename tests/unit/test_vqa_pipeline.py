@@ -23,6 +23,19 @@ def mock_experiment(tmp_path: Path) -> Experiment:
     return Experiment(name="test", run_dir=run_dir, config=config)
 
 
+@pytest.fixture(autouse=True)
+def clear_retriever_cache():
+    """``_get_retriever`` caches by experiment name across calls (real usage:
+    one retriever per running server). Tests share the same mock experiment
+    name, so without clearing this cache a retriever mocked in one test would
+    leak into the next and mask the real assertion under test."""
+    from retrieval import vqa
+
+    vqa._RETRIEVER_CACHE.clear()
+    yield
+    vqa._RETRIEVER_CACHE.clear()
+
+
 @pytest.fixture
 def mock_search_results() -> list[SearchResult]:
     return [
@@ -48,9 +61,8 @@ class TestVqaSearch:
         from retrieval.temporal_search import ShotInput
 
         with (
-            patch("retrieval.vqa.build_retriever") as mock_build_retriever,
+            patch("retrieval.vqa._get_retriever") as mock_get_retriever,
             patch("retrieval.vqa.load_temporal_data") as mock_load,
-            patch("retrieval.vqa.build_embedder") as mock_build_embedder,
             patch("retrieval.vqa.find_segments") as mock_find_seg,
             patch("retrieval.vqa.gather_frame_s") as mock_gather,
             patch("retrieval.vqa.create_agent") as mock_create_agent,
@@ -69,13 +81,13 @@ class TestVqaSearch:
             ]
             mock_load.return_value = (mock_embeddings, mock_records)
 
-            mock_retriever = MagicMock()
-            mock_retriever.search.return_value = mock_search_results
-            mock_build_retriever.return_value = mock_retriever
-
             mock_embedder = MagicMock()
             mock_embedder.embed_text.return_value = [0.1] * 512
-            mock_build_embedder.return_value = mock_embedder
+
+            mock_retriever = MagicMock()
+            mock_retriever.search.return_value = mock_search_results
+            mock_retriever.embedders = {"siglip2-large": mock_embedder}
+            mock_get_retriever.return_value = mock_retriever
 
             mock_find_seg.return_value = [
                 {"start_pos": 2, "end_pos": 6, "length": 5, "center_idx": 4}
@@ -121,10 +133,10 @@ class TestVqaSearch:
     def test_vqa_search_no_results(self, mock_experiment):
         from retrieval.vqa import vqa_search
 
-        with patch("retrieval.vqa.build_retriever") as mock_build:
+        with patch("retrieval.vqa._get_retriever") as mock_get_retriever:
             mock_retriever = MagicMock()
             mock_retriever.search.return_value = []
-            mock_build.return_value = mock_retriever
+            mock_get_retriever.return_value = mock_retriever
 
             result = vqa_search(
                 experiment=mock_experiment,
@@ -140,12 +152,12 @@ class TestVqaSearch:
         from retrieval.vqa import vqa_search
 
         with (
-            patch("retrieval.vqa.build_retriever") as mock_build,
+            patch("retrieval.vqa._get_retriever") as mock_get_retriever,
             patch("retrieval.vqa.load_temporal_data", side_effect=FileNotFoundError("Missing")),
         ):
             mock_retriever = MagicMock()
             mock_retriever.search.return_value = mock_search_results
-            mock_build.return_value = mock_retriever
+            mock_get_retriever.return_value = mock_retriever
 
             result = vqa_search(
                 experiment=mock_experiment,

@@ -1,27 +1,28 @@
-"""BEiT-3 large embedder (image-text retrieval, COCO fine-tune).
+"""Embedder BEiT-3 large (image-text retrieval, fine-tune tren COCO).
 
-BEiT-3 has no HuggingFace ``transformers`` port, so this backend loads the
-original Microsoft implementation vendored under ``_beit3_vendor/`` (source:
-github.com/microsoft/unilm/tree/master/beit3, MIT license) together with a
-vendored copy of ``torchscale`` (its only non-stdlib dependency besides
-``timm``/``fairscale``, copied because upstream ``torchscale`` pins
-``timm==0.4.12`` which conflicts with the rest of this project).
+BEiT-3 khong co ban port HuggingFace ``transformers``, nen backend nay nap
+truc tiep code goc cua Microsoft dat trong ``_beit3_vendor/`` (nguon:
+github.com/microsoft/unilm/tree/master/beit3, giay phep MIT) kem theo ban
+sao ``torchscale`` (dependency duy nhat ngoai stdlib cung voi
+``timm``/``fairscale``, phai copy vi ``torchscale`` ban goc pin cung
+``timm==0.4.12``, xung dot voi phan con lai cua du an).
 
-The vendor source uses flat, non-relative imports (``import utils``,
-``import torchscale.xxx``) exactly as in the upstream repo, so it is loaded by
-adding its directory to ``sys.path`` rather than as a regular Python package.
+Code vendor dung import phang, khong tuong doi (``import utils``,
+``import torchscale.xxx``) dung y het repo goc, nen phai nap bang cach them
+thu muc cua no vao ``sys.path`` thay vi coi nhu 1 package Python binh
+thuong.
 
-Uses ``beit3_large_patch16_384_retrieval`` with the COCO-retrieval checkpoint
-(dim 1024, 384px, ImageNet-default normalization, bilinear resize).
+Dung ``beit3_large_patch16_384_retrieval`` voi checkpoint COCO-retrieval
+(dim 1024, anh 384px, chuan hoa kieu ImageNet mac dinh, resize bilinear).
 
-Checkpoint and tokenizer (``beit3_large_patch16_384_coco_retrieval.pth``,
-``beit3.spm``, not committed — see ``external/BEiT3/checkpoints/``) are
-downloaded automatically on first use from
+Checkpoint va tokenizer (``beit3_large_patch16_384_coco_retrieval.pth``,
+``beit3.spm``, khong commit vao repo - xem ``external/BEiT3/checkpoints/``)
+duoc tu dong tai ve khi dung lan dau tu
 https://github.com/addf400/files/releases/download/beit3/.
 
-Image embedding runs through a TensorRT engine (auto-exported/built on first
-use, see ``tensorrt_runtime.py``) unless ``BEIT3_USE_TENSORRT=0``. Text
-embedding always uses PyTorch.
+Embedding anh chay qua engine TensorRT (tu dong export/build khi dung lan
+dau, xem ``tensorrt_runtime.py``) tru khi dat ``BEIT3_USE_TENSORRT=0``.
+Embedding text luon dung PyTorch.
 """
 
 from __future__ import annotations
@@ -44,11 +45,13 @@ from modules.embedding.tensorrt_runtime import TensorRTVisionEncoder
 
 LOGGER = logging.getLogger(__name__)
 
-# Parallel image decode workers.
+# So luong thread giai ma anh song song.
 _DECODE_WORKERS = int(os.environ.get("BEIT3_DECODE_WORKERS", "8"))
 
-# Set BEIT3_USE_TENSORRT=0 to force PyTorch instead of the TensorRT engine.
+# Dat BEIT3_USE_TENSORRT=0 de ep dung PyTorch thay vi engine TensorRT.
 _USE_TENSORRT = os.environ.get("BEIT3_USE_TENSORRT", "1").lower() not in ("0", "false")
+
+_DEFAULT_MODEL_NAME = "beit3-large"
 
 _VENDOR_DIR = Path(__file__).resolve().parent / "_beit3_vendor"
 _DEFAULT_CHECKPOINT_DIR = Path(__file__).resolve().parents[3] / "external" / "BEiT3" / "checkpoints"
@@ -71,10 +74,11 @@ def _spm_file() -> str:
 
 
 def _ensure_downloaded(path: Path) -> None:
-    """Download ``path`` from the BEiT-3 release assets if it doesn't exist yet.
+    """Tai ``path`` tu release assets cua BEiT-3 neu chua co san.
 
-    Streams to a temp file first and renames on success, so a killed/failed
-    download never leaves a corrupt file that looks present on retry.
+    Tai ra file tam truoc, thanh cong moi doi ten, de neu tai bi ngat
+    giua chung thi khong de lai file loi trong nhung lan sau tuong da
+    tai xong.
     """
     if path.exists():
         return
@@ -100,8 +104,8 @@ def _ensure_downloaded(path: Path) -> None:
     LOGGER.info("Downloaded %s (%.1f MB)", path.name, path.stat().st_size / 1024 / 1024)
 
 
-# XLM-R sentencepiece convention: piece ids are offset by +1, wrapped with
-# <s>=0 ... </s>=2. Matches microsoft/unilm's XLMRobertaTokenizer usage.
+# Quy uoc sentencepiece cua XLM-R: piece id cong them 1, boc trong
+# <s>=0 ... </s>=2. Khop cach XLMRobertaTokenizer cua microsoft/unilm dung.
 _BOS_ID, _PAD_ID, _EOS_ID = 0, 1, 2
 _MAX_TEXT_LEN = 64
 _IMAGE_SIZE = 384
@@ -109,10 +113,12 @@ _EMBED_DIM = 1024
 
 
 class Beit3Embedder(Embedder):
-    """BEiT3-large-384 COCO-retrieval image/text embeddings (dim 1024)."""
+    """Embedding anh/text BEiT3-large-384 COCO-retrieval (dim 1024)."""
 
-    def __init__(self, model_name: str, device: str = "auto", batch_size: int = 32) -> None:
-        self.model_name = model_name
+    def __init__(
+        self, model_name: str | None = None, device: str = "auto", batch_size: int = 32
+    ) -> None:
+        self.model_name = model_name or _DEFAULT_MODEL_NAME
         self.device = device
         self.batch_size = batch_size
         self._model = None
@@ -136,7 +142,7 @@ class Beit3Embedder(Embedder):
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
     ) -> list[list[float]]:
-        """Embed frames with BEiT-3 vision features."""
+        """Embed frame bang BEiT-3 vision features."""
         if not frames:
             return []
         try:
@@ -176,7 +182,7 @@ class Beit3Embedder(Embedder):
         return vectors
 
     def _export_onnx(self, onnx_path: Path) -> None:
-        """Trace the BEiT-3 vision-only forward path and export it to ONNX."""
+        """Trace duong forward chi phan vision cua BEiT-3 va xuat ra ONNX."""
         model, _, _, torch, device = self._load()
 
         class _VisionOnly(torch.nn.Module):
@@ -202,7 +208,7 @@ class Beit3Embedder(Embedder):
         )
 
     def embed_text(self, query: str) -> list[float]:
-        """Embed a text query with BEiT-3 language features."""
+        """Embed 1 cau query bang BEiT-3 language features."""
         model, sp, _, torch, device = self._load()
         input_ids, padding_mask = _tokenize(sp, query, torch)
         input_ids = input_ids.to(device)
@@ -214,7 +220,7 @@ class Beit3Embedder(Embedder):
         return language_cls.squeeze(0).detach().cpu().numpy().astype("float32").tolist()
 
     def _load_preprocessing(self):
-        """Return (transform, torch, device) without loading the PyTorch model."""
+        """Tra ve (transform, torch, device) ma khong nap model PyTorch."""
         if self._transform is not None:
             return self._transform, self._torch, self._torch_device
 
@@ -301,7 +307,7 @@ class Beit3Embedder(Embedder):
 
 
 def _autocast(torch, device):
-    """fp16 autocast on CUDA (PyTorch fallback path only), no-op elsewhere."""
+    """Bat autocast fp16 khi chay tren CUDA (chi o duong PyTorch du phong), khong lam gi o noi khac."""
     if getattr(device, "type", str(device)) == "cuda" or str(device).startswith("cuda"):
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     import contextlib
@@ -310,7 +316,7 @@ def _autocast(torch, device):
 
 
 def _tokenize(sp, text: str, torch):
-    """XLM-R style tokenization: <s> piece_ids+1 ... </s> <pad>*, plus a padding mask."""
+    """Token hoa kieu XLM-R: <s> piece_ids+1 ... </s> <pad>*, kem padding mask."""
     pieces = sp.encode(text, out_type=int)
     ids = [_BOS_ID, *(piece + 1 for piece in pieces), _EOS_ID][:_MAX_TEXT_LEN]
     pad_len = _MAX_TEXT_LEN - len(ids)

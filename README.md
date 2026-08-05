@@ -33,8 +33,8 @@ OpenAI-compatible endpoint you run for it).
 
 | Role | Model | Where it runs |
 |------|-------|---------------|
-| Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x vs PyTorch on GB10) |
-| Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x vs PyTorch on GB10) |
+| Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x vs PyTorch, benchmarked on GB10) |
+| Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x vs PyTorch, benchmarked on GB10) |
 | Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
 | Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
 | Captioning + OCR (indexing & agent tools) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **GB10 only**), port 8881 |
@@ -50,8 +50,9 @@ Override its model via `VLLM_INDEX_MODEL` in `.env`.
 ### TensorRT-accelerated embedding
 
 BEiT-3 and SigLIP2 spend nearly all their time in the vision tower's forward
-pass — measured on GB10, PyTorch eager mode takes ~400-860ms/image, which
-would put a 283K-frame corpus at 1-2 days. `modules/embedding/tensorrt_runtime.py`
+pass — measured on this project's GB10 dev machine, PyTorch eager mode takes
+~400-860ms/image, which would put a 283K-frame corpus at 1-2 days on that
+hardware (actual timing varies by GPU). `modules/embedding/tensorrt_runtime.py`
 exports each model's vision tower to ONNX and builds a TensorRT FP16 engine
 the first time `embed-frames` runs (a few minutes, one-time), caching it
 under `weights/<model>/`. Every later run just loads the cached engine —
@@ -106,8 +107,8 @@ docs/vi/          # Vietnamese documentation
 - Python ≥ 3.13, managed with [uv](https://docs.astral.sh/uv/)
 - NVIDIA GPU + CUDA (embedders + TransNetV2 need CUDA when `--device auto`)
 - Docker (Qdrant, Elasticsearch, all LLM/VLM serving)
-- TransNetV2 PyTorch weights at
-  `external/TransNetV2/inference-pytorch/transnetv2-pytorch-weights.pth`
+- `git` and `uv` on PATH — `detect-shots` uses them to fetch and convert the
+  TransNetV2 weights on first run (see [TransNetV2 weights](#transnetv2-weights))
 - For ASR: one-time `cd external/gipformer && uv sync` (isolated repo+venv),
   and `uv pip install onnxruntime` (deliberately NOT in `pyproject.toml` —
   adding it there silently downgrades the pinned `+cu128` torch build)
@@ -120,10 +121,30 @@ docs/vi/          # Vietnamese documentation
 ## Setup
 
 ```bash
-uv sync                       # install dependencies
+make setup                    # deps + GPU extras + external repos/weights
 cp .env.example .env          # configure endpoints (defaults work locally)
 make qdrant-up qdrant-health  # vector DB
+make elasticsearch-up         # OCR/ASR
 ```
+
+`make setup` runs `uv sync`, installs the optional GPU extras (onnxruntime,
+onnx, TensorRT — skipped without failing the build if they don't resolve on
+this platform), and provisions the two external repos: TransNetV2 (clone +
+weight conversion) and gipformer (clone + isolated venv). Each step is
+idempotent, so re-running it is cheap. `uv sync` alone still works — the
+external repos are then provisioned lazily on first use.
+
+### TransNetV2 weights
+
+`make detect-shots` provisions these itself on first run: it clones
+[soCzech/TransNetV2](https://github.com/soCzech/TransNetV2) into `external/`
+and converts the bundled TensorFlow SavedModel into
+`external/TransNetV2/inference-pytorch/transnetv2-pytorch-weights.pth`.
+
+The conversion runs in a throwaway `uv` venv (`tensorflow==2.16.*` + `torch`)
+that is deleted afterwards, so its pins never touch the project's own
+`.venv` and its `torch==2.11.0+cu128` build. Requires `git` and `uv` on PATH.
+Pass `--transnetv2-weights` to point at an existing `.pth` and skip all of it.
 
 ## Running the pipeline
 

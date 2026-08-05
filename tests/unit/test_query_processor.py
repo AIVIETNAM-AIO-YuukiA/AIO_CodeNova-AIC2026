@@ -6,6 +6,7 @@ from retrieval.query_processor import (
     LlmQueryProcessor,
     PassThroughQueryProcessor,
     ProcessedQuery,
+    _normalize_weights,
     get_query_processor,
 )
 
@@ -20,6 +21,7 @@ def test_pass_through_query_processor() -> None:
     assert processed.ocr_keywords == []
     assert processed.asr_keywords == []
     assert processed.metadata == {}
+    assert processed.weights == {"kis": 1.0, "ocr": 0.0, "asr": 0.0}
 
 
 def test_get_query_processor_returns_llm_processor() -> None:
@@ -66,3 +68,50 @@ def test_llm_processor_falls_back_on_garbage_output() -> None:
 
     processed = processor.process("cảnh nấu ăn")
     assert processed.visual_prompt == "cảnh nấu ăn"
+
+
+def test_llm_processor_parses_weights() -> None:
+    processor = LlmQueryProcessor(model_name="test-model")
+    client = MagicMock()
+    client.complete_text.return_value = (
+        '{"visual_prompt": "a red car on a highway", "ocr_keywords": [],'
+        ' "asr_keywords": [], "metadata": {}, "weights": {"kis": 0.9, "ocr": 0.0, "asr": 0.1}}'
+    )
+    processor._client = client
+
+    processed = processor.process("xe hơi đỏ trên cao tốc")
+    assert processed.weights == {"kis": 0.9, "ocr": 0.0, "asr": 0.1}
+
+
+def test_llm_processor_defaults_weights_when_missing() -> None:
+    processor = LlmQueryProcessor(model_name="test-model")
+    client = MagicMock()
+    client.complete_text.return_value = (
+        '{"visual_prompt": "a cooking scene", "ocr_keywords": [], "asr_keywords": [], "metadata": {}}'
+    )
+    processor._client = client
+
+    processed = processor.process("cảnh nấu ăn")
+    assert processed.weights == {"kis": 1.0, "ocr": 0.0, "asr": 0.0}
+
+
+def test_normalize_weights_sums_to_one() -> None:
+    result = _normalize_weights({"kis": 0.7, "ocr": 0.2, "asr": 0.1})
+    assert result == {"kis": 0.7, "ocr": 0.2, "asr": 0.1}
+
+
+def test_normalize_weights_rescales_when_not_summing_to_one() -> None:
+    result = _normalize_weights({"kis": 1.4, "ocr": 0.4, "asr": 0.2})
+    assert abs(sum(result.values()) - 1.0) < 1e-9
+    assert result["kis"] == 0.7
+
+
+def test_normalize_weights_falls_back_when_all_zero() -> None:
+    assert _normalize_weights({"kis": 0.0, "ocr": 0.0, "asr": 0.0}) == {
+        "kis": 1.0, "ocr": 0.0, "asr": 0.0,
+    }
+
+
+def test_normalize_weights_ignores_bad_types() -> None:
+    result = _normalize_weights({"kis": "not-a-number", "ocr": 0.5, "asr": 0.5})
+    assert result == {"kis": 0.0, "ocr": 0.5, "asr": 0.5}

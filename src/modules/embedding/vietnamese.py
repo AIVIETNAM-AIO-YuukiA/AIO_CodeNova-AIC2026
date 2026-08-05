@@ -1,15 +1,13 @@
-"""Vietnamese caption embedder: VLM caption -> sentence-transformers text vector.
+"""Embedder Vietnamese: VLM sinh caption -> sentence-transformers embed thanh vector.
 
-Unlike SigLIP2/BEiT-3, this backend embeds *text*, not pixels — it exists to
-cover what CLIP-style visual embedders miss (on-screen text, named entities,
-long free-form Vietnamese queries), per the design in
-``.claude/references/``. To stay a drop-in for the ``Embedder`` interface
-(which is shape ``images -> vectors`` everywhere else, so ``indexing/embeddings.py``
-needs no changes), ``embed_images`` internally captions each frame with a VLM
-first, then embeds the caption text. Captions are cached to
-``runs/<exp>/manifests/captions.jsonl`` (looked up by ``frame_id``) so re-runs
-and retries don't re-call the (slow, network-bound) VLM for frames already
-captioned.
+Khac voi SigLIP2/BEiT-3, backend nay embed *text*, khong phai pixel - dung
+de bu cho nhung thu CLIP-style bo sot (chu tren man hinh, ten rieng, cau
+query tieng Viet dai). De van khop interface ``Embedder`` (dang
+``images -> vectors`` giong cac backend khac, ``indexing/embeddings.py``
+khong can sua gi), ``embed_images`` se tu goi VLM caption tung frame truoc,
+roi embed noi dung caption do. Caption duoc cache vao
+``runs/<exp>/manifests/captions.jsonl`` (tra theo ``frame_id``) de chay lai
+khong phai goi VLM (cham, qua mang) cho nhung frame da co caption roi.
 """
 
 from __future__ import annotations
@@ -33,8 +31,8 @@ _DEFAULT_CAPTION_WORKERS = 8
 
 
 class VietnameseEmbedder(Embedder):
-    """Caption keyframes with a VLM, then embed the caption with a Vietnamese
-    sentence-transformers model (BGE-M3 based, dot-product similarity)."""
+    """Caption keyframe bang VLM, roi embed caption bang model sentence-transformers
+    tieng Viet (nen tang BGE-M3, do tuong dong bang dot-product)."""
 
     def __init__(
         self,
@@ -61,39 +59,51 @@ class VietnameseEmbedder(Embedder):
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
     ) -> list[list[float]]:
-        """Caption each frame (cached, in parallel) then embed the captions as text.
+        """Caption tung frame (co cache, chay song song) roi embed caption thanh vector.
 
-        Captioning is a network round trip to vLLM (~2-3s each) — calling it
-        sequentially for hundreds of thousands of keyframes would take days.
-        vLLM's continuous batching handles many in-flight requests efficiently,
-        so a thread pool (I/O-bound wait, not CPU-bound work) is enough to get
-        real throughput without any change to vLLM itself. Submitting futures
-        indexed by position (rather than ``executor.map``) lets us log
-        progress as each caption completes, in whatever order threads finish,
-        while still writing results back in the original frame order for the
-        embed_texts() call below.
+        Goi caption la 1 luot goi mang toi vLLM (~2-3s moi lan) - goi tuan
+        tu cho hang tram nghin keyframe se mat hang ngay. vLLM ho tro
+        continuous batching xu ly nhieu request cung luc rat hieu qua, nen
+        chi can thread pool (cho I/O, khong ton CPU) la du de dat toc do
+        thuc te, khong can sua gi ben vLLM. Dung future danh so theo vi
+        tri (thay vi ``executor.map``) de log tien do ngay khi tung
+        caption xong bat ke thread nao hoan thanh truoc, nhung van ghi
+        ket qua ve dung thu tu frame ban dau cho ham embed_texts() ben
+        duoi.
         """
         if not frames:
             return []
         self._load_caption_cache()
         progress = BatchProgressLogger(LOGGER, f"{self.model_name} (captioning)", len(frames))
         captions: list[str | None] = [None] * len(frames)
+        failed = 0
         with ThreadPoolExecutor(max_workers=self.caption_workers) as executor:
             future_to_index = {
                 executor.submit(self._caption_for, frame): i for i, frame in enumerate(frames)
             }
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
-                captions[index] = future.result()
+                try:
+                    captions[index] = future.result()
+                except Exception:
+                    # One frame the VLM refuses (a 400 from a content filter, a
+                    # transient upstream fault) must not discard the whole
+                    # batch's captions. Embed it as empty text and move on; a
+                    # later run retries it, since it never reaches captions.jsonl.
+                    LOGGER.exception("Captioning failed for %s", frames[index].frame_path)
+                    captions[index] = ""
+                    failed += 1
                 progress.advance(1)
+        if failed:
+            LOGGER.warning("%s/%s frames could not be captioned this pass", failed, len(frames))
         return self._embed_texts(captions, frames=frames, on_batch=on_batch)
 
     def embed_text(self, query: str) -> list[float]:
-        """Embed a single text query."""
+        """Embed 1 cau query."""
         return self._embed_texts([query])[0]
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """Embed a batch of text strings (captions or queries)."""
+        """Embed nhieu chuoi text cung luc (caption hoac query)."""
         return self._embed_texts(texts)
 
     def _embed_texts(
@@ -102,9 +112,9 @@ class VietnameseEmbedder(Embedder):
         frames: list[FrameRecord] | None = None,
         on_batch: BatchCallback | None = None,
     ) -> list[list[float]]:
-        """Shared text-embedding loop; reports each batch via ``on_batch`` when
-        ``frames`` (same length/order as ``texts``) is given, so embed_images()
-        can checkpoint progress the same way SigLIP/BEiT-3 do."""
+        """Vong lap embed text dung chung; bao tien do qua ``on_batch`` khi co
+        ``frames`` (cung do dai/thu tu voi ``texts``), de embed_images() checkpoint
+        tien do giong cach SigLIP/BEiT-3 lam."""
         model = self._load_model()
         progress = (
             BatchProgressLogger(LOGGER, f"{self.model_name} (encoding)", len(texts))
@@ -126,13 +136,13 @@ class VietnameseEmbedder(Embedder):
         return vectors
 
     def _caption_for(self, frame: FrameRecord) -> str:
-        """Return the (cached or freshly generated) caption for one frame.
+        """Tra ve caption cua 1 frame (lay tu cache neu co, khong thi tao moi).
 
-        Called concurrently from multiple threads (see embed_images); the
-        cache read above is lock-free (dict reads are safe under the GIL),
-        but writing the new caption to both the manifest file and the
-        in-memory cache is serialized so concurrent appends never interleave
-        mid-line in captions.jsonl.
+        Ham nay duoc goi dong thoi tu nhieu thread (xem embed_images);
+        doc cache khong can lock (doc dict an toan duoi GIL), nhung ghi
+        caption moi vao ca file manifest lan cache trong bo nho thi phai
+        khoa lai de cac lan ghi dong thoi khong bi dan xen giua dong
+        trong captions.jsonl.
         """
         cache = self._caption_cache
         if cache is not None and frame.frame_id in cache:
@@ -163,10 +173,10 @@ class VietnameseEmbedder(Embedder):
         return self._manifest
 
     def _load_caption_cache(self) -> dict[str, str]:
-        """Load ``captions.jsonl`` into memory once, keyed by ``frame_id``.
+        """Nap ``captions.jsonl`` vao bo nho 1 lan, tra theo ``frame_id``.
 
-        Reading the whole manifest per-frame would be O(N^2) over hundreds of
-        thousands of keyframes; loading it once up front keeps lookups O(1).
+        Doc lai toan bo manifest cho tung frame se thanh O(N^2) voi hang
+        tram nghin keyframe; nap 1 lan tu dau giu tra cuu la O(1).
         """
         if self._caption_cache is not None:
             return self._caption_cache
@@ -207,6 +217,12 @@ class VietnameseEmbedder(Embedder):
 
 
 def _resolve_device(requested: str) -> str:
+    # Dat VIETNAMESE_EMBEDDING_DEVICE=cpu de text encoder nay khong dung GPU.
+    # Voi GPU it VRAM, no se tranh cho voi cac image embedder va reranker;
+    # chay tren CPU van du nhe, khong anh huong toi do tre.
+    override = os.environ.get("VIETNAMESE_EMBEDDING_DEVICE")
+    if override:
+        return override
     if requested == "auto":
         try:
             import torch

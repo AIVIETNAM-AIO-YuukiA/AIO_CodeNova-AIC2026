@@ -1,10 +1,4 @@
-"""On-screen text extraction, with a dedicated OCR-only prompt (see
-``prompts/ocr.py`` for why this is kept separate from captioning).
-
-Uses the same ``VLLM_BASE_URL`` / ``VLLM_MODEL`` local vLLM engine as
-captioning, with the same OpenRouter fallback (see ``modules/_vllm_chat.py``)
-when that engine is unreachable.
-"""
+"""On-screen text extraction over the shared VLM client (see modules/_vllm_chat.py)."""
 
 from __future__ import annotations
 
@@ -17,13 +11,12 @@ from prompts.ocr import NO_TEXT_MARKER, build_ocr_prompt
 
 LOGGER = logging.getLogger(__name__)
 
-# temperature=0 (greedy decoding) — deterministic transcription, not prose.
-# Same rationale as captioning (see modules/captioning/vllm.py), but OCR text
-# is shorter and doesn't need few-shot examples: the task ("copy the text you
-# see") is unambiguous without style anchoring.
+# Greedy decoding: transcription must be deterministic, not creative.
+# Measured over sampled news keyframes: the busiest (full ticker + station
+# logo + clock + captions) needed 80 tokens, so 200 leaves plenty of headroom.
 _GENERATION_PARAMS = {
     "temperature": 0.0,
-    "top_p": 0.9,
+    "top_p": 0.1,
     "max_tokens": 200,
     "seed": 42,
 }

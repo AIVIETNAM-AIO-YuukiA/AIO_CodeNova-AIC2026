@@ -60,7 +60,7 @@ class TestBrain:
         brain._client = client
         response = brain.reason(question="q", shot_info="s", frame_count=1)
         assert response.finished is True
-        assert "agent-up" in response.answer
+        assert "AGENT_LOCAL_ENGINE_URL" in response.answer
 
 
 class TestTools:

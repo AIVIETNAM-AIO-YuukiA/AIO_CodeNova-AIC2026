@@ -49,7 +49,11 @@ def build_parser() -> ArgumentParser:
 
     shots_parser = subparsers.add_parser("detect-shots", help="Detect shots with TransNetV2")
     add_run_args(shots_parser)
-    shots_parser.add_argument("--transnetv2-weights", required=True, type=Path)
+    shots_parser.add_argument(
+        "--transnetv2-weights",
+        type=Path,
+        help="Converted PyTorch weights; downloaded and converted automatically if missing.",
+    )
     shots_parser.add_argument("--transnetv2-module-dir", type=Path)
     shots_parser.add_argument("--force", action="store_true")
 
@@ -63,6 +67,14 @@ def build_parser() -> ArgumentParser:
     add_run_args(embed_parser)
     embed_parser.add_argument("--batch-size", default=32, type=int)
     embed_parser.add_argument("--force", action="store_true")
+    embed_parser.add_argument(
+        "--caption-missing",
+        action="store_true",
+        help=(
+            "vietnamese-embedding: caption frames that have none yet instead of "
+            "skipping them. Without it, only frames already in captions.jsonl are embedded."
+        ),
+    )
 
     index_parser = subparsers.add_parser("build-index", help="Build the Qdrant vector index")
     add_run_args(index_parser)
@@ -123,10 +135,10 @@ def add_config_args(parser: ArgumentParser) -> None:
     parser.add_argument("--runs-dir", default=Path("runs"), type=Path)
     parser.add_argument(
         "--embedding-models",
-        default=os.environ.get("EMBEDDING_MODELS", "beit3-large"),
+        default=os.environ.get("EMBEDDING_MODELS", "jina-clip-v2"),
         help=(
-            "Comma-separated embedding models. BEiT-3 large only by default; "
-            "add siglip2/vietnamese-embedding for SRRF fusion + rerank. "
+            "Comma-separated embedding models. Jina CLIP v2 only by default; "
+            "add beit3-large/siglip2/vietnamese-embedding for SRRF fusion + rerank. "
             "Defaults to $EMBEDDING_MODELS."
         ),
     )
@@ -215,11 +227,13 @@ def load_experiment(args: Namespace) -> Experiment:
 
 def handle_detect_shots(args: Namespace) -> int:
     """Run TransNetV2 shot detection."""
+    from core.external_setup import TRANSNETV2_PYTORCH_DIR
+
     experiment = load_experiment(args)
     count = detect_shots(
         experiment=experiment,
         weights_path=args.transnetv2_weights,
-        module_dir=args.transnetv2_module_dir,
+        module_dir=args.transnetv2_module_dir or TRANSNETV2_PYTORCH_DIR,
         force=args.force,
     )
     print(json.dumps({"experiment": experiment.name, "shots": count}))
@@ -241,6 +255,7 @@ def handle_embed_frames(args: Namespace) -> int:
         experiment=experiment,
         batch_size=args.batch_size,
         force=args.force,
+        caption_missing=args.caption_missing,
     )
     print(json.dumps({"experiment": experiment.name, "embeddings": count}))
     return 0

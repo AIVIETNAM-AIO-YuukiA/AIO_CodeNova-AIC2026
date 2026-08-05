@@ -22,10 +22,13 @@ LOGGER = logging.getLogger(__name__)
 # embedding model, not a creative-writing task, so we optimize for zero
 # lexical variance over near-duplicate keyframes rather than fluency. See
 # prompts/captioning.py.
+# Headroom, not a target: sampled news keyframes finish at ~150 tokens (max
+# 162 measured), all with finish_reason=stop, so the cap never truncates a
+# caption even on unusually text-dense frames.
 _GENERATION_PARAMS = {
     "temperature": 0.0,
-    "top_p": 0.9,
-    "max_tokens": 220,
+    "top_p": 0.1,
+    "max_tokens": 2048,
     "seed": 42,
 }
 

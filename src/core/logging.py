@@ -2,8 +2,19 @@
 
 from __future__ import annotations
 
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import logging
+
+# Cap each log file so a long captioning/OCR run can't fill the disk: those
+# stages emit one line per HTTP request, which reached 380MB over a 60k-frame
+# pass and took the whole pipeline down with ENOSPC.
+_MAX_LOG_BYTES = 32 * 1024 * 1024
+_LOG_BACKUPS = 2
+
+# Third-party loggers that emit one DEBUG/INFO line per network call. Their
+# detail belongs on the console when debugging, not in a multi-hour log file.
+_CHATTY_LOGGERS = ("httpx", "httpcore", "urllib3", "elastic_transport", "elasticsearch")
 
 
 def configure_logging(log_dir: Path, verbose: bool = False) -> None:
@@ -26,17 +37,30 @@ def configure_logging(log_dir: Path, verbose: bool = False) -> None:
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     console.setFormatter(formatter)
 
-    pipeline_file = logging.FileHandler(log_dir / "pipeline.log", encoding="utf-8")
-    pipeline_file.setLevel(logging.DEBUG)
+    pipeline_file = RotatingFileHandler(
+        log_dir / "pipeline.log",
+        encoding="utf-8",
+        maxBytes=_MAX_LOG_BYTES,
+        backupCount=_LOG_BACKUPS,
+    )
+    pipeline_file.setLevel(logging.DEBUG if verbose else logging.INFO)
     pipeline_file.setFormatter(formatter)
 
-    error_file = logging.FileHandler(log_dir / "errors.log", encoding="utf-8")
+    error_file = RotatingFileHandler(
+        log_dir / "errors.log",
+        encoding="utf-8",
+        maxBytes=_MAX_LOG_BYTES,
+        backupCount=_LOG_BACKUPS,
+    )
     error_file.setLevel(logging.ERROR)
     error_file.setFormatter(formatter)
 
     root.addHandler(console)
     root.addHandler(pipeline_file)
     root.addHandler(error_file)
+
+    for name in _CHATTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.DEBUG if verbose else logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

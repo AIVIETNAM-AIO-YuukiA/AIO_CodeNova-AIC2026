@@ -16,9 +16,9 @@ import logging
 import numpy as np
 
 from config.settings import Experiment
-from modules.embedding import build_embedder
 from retrieval.temporal_search import load_temporal_data
 from retrieval.hydrator import ResultHydrator
+from retrieval.vqa import _get_retriever
 from stores.vector.base import frame_result
 
 LOGGER = logging.getLogger(__name__)
@@ -56,10 +56,10 @@ def kis_detail_search(
         return {"results": [], "total": 0}
 
     # 2. Embed từng subquery
-    embedder = build_embedder(
-        model_name=experiment.config.embedding_model,
-        device=experiment.config.device,
-    )
+    # Reuse the cached retriever's embedder rather than building a fresh one —
+    # this function runs twice per request (general + specific stages), and a
+    # fresh full model load each time exhausts a small GPU within a few calls.
+    embedder = _get_retriever(experiment).embedders[experiment.config.embedding_models[0]]
     query_embs = np.stack(
         [np.asarray(embedder.embed_text(q), dtype="float32").flatten() for q in clean]
     )
@@ -196,17 +196,17 @@ def kis_detail_2stage_search(
 
     # 1. Load data
     try:
-        frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+        frame_embeddings, frame_records = load_temporal_data(experiment)
     except FileNotFoundError as exc:
         return {"error": str(exc), "results": [], "total": 0}
 
     if frame_embeddings.shape[0] == 0 or not frame_records:
         return {"results": [], "total": 0}
 
-    embedder = build_embedder(
-        model_name=experiment.config.embedding_model,
-        device=experiment.config.device,
-    )
+    # Reuse the cached retriever's embedder rather than building a fresh one —
+    # this function runs twice per request (general + specific stages), and a
+    # fresh full model load each time exhausts a small GPU within a few calls.
+    embedder = _get_retriever(experiment).embedders[experiment.config.embedding_models[0]]
 
     # ── Stage 1: general weighted normalized sum fusion ─────────────
     gen_embs = np.stack(

@@ -12,54 +12,45 @@ import mimetypes
 
 from config.settings import Experiment
 from core.types import SearchResult
-from retrieval.vqa import vqa_search, trake_search
+from retrieval.vqa import vqa_search, trake_search, enhanced_temporal_search
 from retrieval.kis_detail_search import kis_detail_2stage_search
-from retrieval import build_retriever
+from retrieval.intelligent_search import intelligent_search
 from retrieval.temporal_search import load_temporal_data
+from retrieval.text_search import text_search
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 import numpy as np
 
 LOGGER = get_logger(__name__)
 
 
-def _warmup_models(reranker, experiment: Experiment) -> None:
-    """Pre-load heavy models in background so the first request doesn't block.
+def _warmup_models(reranker, experiment: Experiment, retriever=None) -> None:
+    """Pre-load heavy models before the server starts accepting requests.
 
-    Called in a daemon thread right after the server starts listening.
-    The lazy-loaded models (BLIP-2 reranker, SigLIP embedder) can take
-    3-4 minutes to download/load on Colab T4. By triggering loading here,
-    models are ready before the user makes their first request.
+    The lazy-loaded models (BLIP-2 reranker, the embedders) can take minutes to
+    download and place on the GPU. Loading them up front keeps the first query
+    from paying that cost, and — because this runs to completion before the
+    listener starts — no two threads can race to initialize the same model.
     """
-    import threading
+    LOGGER.info("[warmup] Pre-loading models...")
+    try:
+        if reranker is not None and hasattr(reranker, "_load"):
+            LOGGER.info("[warmup] Loading BLIP-2 reranker...")
+            reranker._load()
+            LOGGER.info("[warmup] BLIP-2 reranker ready.")
+    except Exception as exc:
+        LOGGER.warning("[warmup] Reranker pre-load failed (non-fatal): %s", exc)
 
-    def _load():
-        LOGGER.info("[warmup] Starting background model pre-loading...")
-        try:
-            # Pre-load the reranker (BLIP-2) if one is configured.
-            if reranker is not None and hasattr(reranker, "_load"):
-                LOGGER.info("[warmup] Loading BLIP-2 reranker...")
-                reranker._load()
-                LOGGER.info("[warmup] BLIP-2 reranker ready.")
-        except Exception as exc:
-            LOGGER.warning("[warmup] Reranker pre-load failed (non-fatal): %s", exc)
+    try:
+        # Warm every embedder the retriever will actually use, via the same
+        # instances, so the first query finds them already resident.
+        if retriever is not None:
+            for model_name, embedder in retriever.embedders.items():
+                embedder.embed_text("warmup query")
+                LOGGER.info("[warmup] Embedder ready: %s", model_name)
+    except Exception as exc:
+        LOGGER.warning("[warmup] Embedder pre-load failed (non-fatal): %s", exc)
 
-        try:
-            # Pre-load the embedder (SigLIP) — also used by the retriever.
-            from modules.embedding import build_embedder
-
-            embedder = build_embedder(
-                model_name=experiment.config.embedding_model,
-                device=experiment.config.device,
-            )
-            embedder.embed_text("warmup query")
-            LOGGER.info("[warmup] Embedder ready.")
-        except Exception as exc:
-            LOGGER.warning("[warmup] Embedder pre-load failed (non-fatal): %s", exc)
-
-        LOGGER.info("[warmup] All models pre-loaded and ready.")
-
-    t = threading.Thread(target=_load, daemon=True, name="model-warmup")
-    t.start()
+    LOGGER.info("[warmup] All models pre-loaded and ready.")
 
 
 def serve_ui(
@@ -73,11 +64,19 @@ def serve_ui(
     """Serve the local retrieval UI until interrupted."""
     from core.paths import set_project_root
 
-    # experiment.run_dir is typically runs/<experiment_name>
-    # so its parent is the runs/ directory, and its parent is the project root
-    set_project_root(experiment.run_dir.parent.parent)
+    # frame_path values in manifests are relative to the working directory the
+    # pipeline was run from, not to experiment.run_dir (which can live outside
+    # the project entirely, e.g. --runs-dir on another drive). Resolve against
+    # cwd so /frame lookups work regardless of where runs are stored.
+    set_project_root(Path.cwd())
 
-    retriever = build_retriever(experiment)
+    # Share one retriever (and its embedders) with the TRAKE / VQA / KIS Detail
+    # code paths' own cache — two independently-built retrievers would each
+    # hold a full copy of every configured embedder, which is what exhausted
+    # VRAM here (two 3-model retrievers on a 4 GB GPU).
+    from retrieval.vqa import _get_retriever
+
+    retriever = _get_retriever(experiment)
     handler = build_handler(
         experiment=experiment,
         retriever=retriever,
@@ -85,17 +84,46 @@ def serve_ui(
         reranker=reranker,
         reranker_top_k=reranker_top_k,
     )
+    # Warm the models up before serving. Doing this on a background thread
+    # races the first request: two threads then load the same embedder at once
+    # and the loser hits "Cannot copy out of meta tensor".
+    _warmup_models(reranker, experiment, retriever)
+
     server = ThreadingHTTPServer((host, port), handler)
     LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
-    # Kick off background model loading immediately so the first user request
-    # doesn't have to wait 3-4 minutes for BLIP-2 / SigLIP to load.
-    _warmup_models(reranker, experiment)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         LOGGER.info("Stopping retrieval UI")
     finally:
         server.server_close()
+
+
+def _events_to_query(payload: dict) -> str:
+    """Build a ``trake_search`` query string from a TRAKE payload.
+
+    The UI posts ``events`` as a list of ``{text, sub_details}`` objects, while
+    ``trake_search`` parses a multi-line ``E1: ...`` / ``E2: ...`` string. Fall
+    back to a plain ``query`` field so direct API callers still work.
+    """
+    events = payload.get("events")
+    if not isinstance(events, list) or not events:
+        return str(payload.get("query", ""))
+
+    lines = []
+    for index, event in enumerate(events, start=1):
+        if isinstance(event, dict):
+            text = str(event.get("text", "")).strip()
+            details = [str(d).strip() for d in event.get("sub_details") or [] if str(d).strip()]
+        else:
+            text = str(event).strip()
+            details = []
+        if not text:
+            continue
+        if details:
+            text = f"{text} {' '.join(details)}"
+        lines.append(f"E{index}: {text}")
+    return "\n".join(lines)
 
 
 def build_handler(
@@ -126,22 +154,31 @@ def build_handler(
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
 
-            # TRAKE track: Embedding search → Rerank (optional) → Temporal → event segments
-            if parsed.path == "/api/trake-search":
+            # TRAKE: caller supplies each event. Enhanced: an LLM splits one
+            # sentence into events first, then runs the identical pipeline.
+            if parsed.path in ("/api/trake-search", "/api/enhanced-temporal-search"):
                 try:
                     payload = self._read_json()
                     top_k = int(payload.get("top_k") or default_top_k)
                     req_reranker_top_k = payload.get("reranker_top_k")
                     req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+                    shared = {
+                        "experiment": experiment,
+                        "context": str(payload.get("context", "")),
+                        "top_k": top_k,
+                        "reranker": reranker if req_reranker_top_k else None,
+                        "reranker_top_k": req_reranker_top_k or reranker_top_k,
+                    }
 
-                    result = trake_search(
-                        experiment=experiment,
-                        query=str(payload.get("query", "")),
-                        context=str(payload.get("context", "")),
-                        top_k=top_k,
-                        reranker=reranker if req_reranker_top_k else None,
-                        reranker_top_k=req_reranker_top_k or reranker_top_k,
-                    )
+                    if parsed.path == "/api/enhanced-temporal-search":
+                        result = enhanced_temporal_search(
+                            query=str(payload.get("query", "")),
+                            max_events=int(payload.get("max_events") or 5),
+                            **shared,
+                        )
+                    else:
+                        result = trake_search(query=_events_to_query(payload), **shared)
+
                     for r in result.get("results", []):
                         if r.get("frame_path"):
                             r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
@@ -151,7 +188,7 @@ def build_handler(
                         ]
                     self._send_json(result)
                 except Exception as exc:
-                    LOGGER.exception("KIS Detail search failed")
+                    LOGGER.exception("Temporal search failed (%s)", parsed.path)
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -201,6 +238,46 @@ def build_handler(
                     self._send_json(result)
                 except Exception as exc:
                     LOGGER.exception("Agent chat failed")
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # ASR / OCR: direct BM25 text search, no embedding model involved.
+            if parsed.path in ("/api/asr-search", "/api/ocr-search"):
+                try:
+                    payload = self._read_json()
+                    query = str(payload.get("query", ""))
+                    top_k = int(payload.get("top_k") or default_top_k)
+                    source = "asr" if parsed.path == "/api/asr-search" else "ocr"
+
+                    result = text_search(experiment, query=query, source=source, top_k=top_k)
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("Text search failed (%s)", parsed.path)
+                    self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+
+            # Intelligent: LLM splits the query into KIS/OCR/ASR + weights,
+            # each enabled modality searches independently, fused by weighted SRRF.
+            if parsed.path == "/api/intelligent-search":
+                try:
+                    payload = self._read_json()
+                    result = intelligent_search(
+                        experiment,
+                        query=str(payload.get("query", "")),
+                        top_k=int(payload.get("top_k") or default_top_k),
+                        enable_kis=bool(payload.get("enable_kis", True)),
+                        enable_ocr=bool(payload.get("enable_ocr", True)),
+                        enable_asr=bool(payload.get("enable_asr", True)),
+                    )
+                    for r in result.get("results", []):
+                        if r.get("frame_path"):
+                            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+                    self._send_json(result)
+                except Exception as exc:
+                    LOGGER.exception("Intelligent search failed")
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
 
@@ -280,16 +357,18 @@ def build_handler(
                     context=str(payload.get("context", "")),
                 )
                 top_k = int(payload.get("top_k") or default_top_k)
-                req_reranker_top_k = payload.get("reranker_top_k")
-                req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+                enabled_models = payload.get("enabled_models") or None
+                use_reranker = payload.get("use_reranker")
+                if use_reranker is not None:
+                    use_reranker = bool(use_reranker)
 
                 retrieval_text = build_retrieval_text(request)
-                results = retriever.search(query=retrieval_text, top_k=top_k)
-
-                if reranker and req_reranker_top_k:
-                    results = reranker.rerank(query=retrieval_text, results=results)[
-                        :req_reranker_top_k
-                    ]
+                results = retriever.search(
+                    query=retrieval_text,
+                    top_k=top_k,
+                    enabled_models=enabled_models,
+                    use_reranker=use_reranker,
+                )
 
                 self._send_json(
                     {
@@ -332,10 +411,14 @@ def build_handler(
             self.wfile.write(encoded)
 
         def _send_frame(self, raw_path: str) -> None:
-            raw_path = unquote(raw_path).replace("\\", "/")
-            frame_path = Path(raw_path).resolve()
-            frames_root = (experiment.run_dir / "frames").resolve()
-            if not frame_path.is_file() or not frame_path.is_relative_to(frames_root):
+            from core.paths import resolve_frame_path
+
+            raw_path = unquote(raw_path)
+            if Path(raw_path).suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+                self.send_error(HTTPStatus.NOT_FOUND, "Frame not found")
+                return
+            frame_path = resolve_frame_path(raw_path)
+            if not frame_path.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND, "Frame not found")
                 return
 
@@ -443,7 +526,10 @@ INDEX_HTML = r"""<!doctype html>
     }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: var(--text); background: var(--bg); }
-    header { padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
+    header { padding: 18px 24px 12px; border-bottom: 1px solid var(--line); background: var(--panel); display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+    #mode-switch { display: flex; gap: 6px; }
+    .mode-btn { width: auto; margin: 0; padding: 6px 14px; font-size: 13px; background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; cursor: pointer; }
+    .mode-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
     h1 { margin: 0; font-size: 20px; }
     main { display: grid; grid-template-columns: minmax(320px, 420px) 1fr; min-height: calc(100vh - 61px); }
     aside { padding: 18px; border-right: 1px solid var(--line); background: var(--panel); }
@@ -471,6 +557,24 @@ INDEX_HTML = r"""<!doctype html>
       resize: vertical;
       line-height: 1.45;
     }
+    label.check {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin: 6px 0;
+      color: var(--text);
+      font-weight: 500;
+      cursor: pointer;
+    }
+    label.check input { width: auto; margin: 0; }
+    #model-config {
+      margin: 10px 0 4px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fafafa;
+    }
+    #model-config > label:first-child { margin-top: 0; }
     .row {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -566,7 +670,13 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-<header><h1>CodeNova Retrieval UI</h1></header>
+<header>
+  <h1>CodeNova Retrieval UI</h1>
+  <div id="mode-switch">
+    <button type="button" class="mode-btn active" data-mode="manual">🛠 Thủ công</button>
+    <button type="button" class="mode-btn" data-mode="agent">🤖 Agent</button>
+  </div>
+</header>
 <main>
   <aside>
     <form id="search-form">
@@ -574,12 +684,24 @@ INDEX_HTML = r"""<!doctype html>
       <select id="track" name="track">
         <optgroup label="KIS">
           <option value="textual_kis">KIS Basic</option>
-          <option value="kis_multi_scene">KIS Multi-Scene</option>
           <option value="kis_detail_2stage">KIS Detail 2-Stage</option>
         </optgroup>
+        <optgroup label="Text search">
+          <option value="asr_search">ASR Search</option>
+          <option value="ocr_search">OCR Search</option>
+        </optgroup>
+        <option value="intelligent">Intelligent (KIS+OCR+ASR)</option>
         <option value="vqa">VQA</option>
         <option value="trake">TRAKE</option>
+        <option value="temporal_enhanced">Temporal Enhanced (LLM tách event)</option>
       </select>
+      <div id="model-config">
+        <label>Embedding models</label>
+        <label class="check"><input type="checkbox" name="model_jina-clip-v2" checked> Jina-CLIP-v2</label>
+        <label class="check"><input type="checkbox" name="model_siglip2-so400m" checked> SigLIP2</label>
+        <label class="check"><input type="checkbox" name="model_vietnamese-embedding" checked> Vietnamese-Embedding</label>
+        <label class="check"><input type="checkbox" id="use-reranker" checked> Rerank BLIP-2</label>
+      </div>
       <label for="query">Query</label>
       <textarea id="query" name="query">a person riding a motorbike</textarea>
       <label for="context">Scene / Context</label>
@@ -587,7 +709,7 @@ INDEX_HTML = r"""<!doctype html>
       <label for="question">Question</label>
       <textarea id="question" name="question" placeholder="Use this for VQA or QA tracks"></textarea>
       <div id="events-section" style="display:none;">
-        <label>Events / Scenes / Subqueries <span style="font-weight:400;color:var(--muted);">(mỗi mục được search độc lập)</span></label>
+        <label>Events / Scenes / Subqueries</label>
         <div id="events-list"></div>
         <button type="button" id="add-event-btn" style="width:auto;padding:6px 14px;margin-top:6px;font-size:13px;">+ Add</button>
         <div id="window-control" style="margin-top:10px;display:none;">
@@ -597,10 +719,10 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       </div>
       <div id="kis-2stage-section" style="display:none;">
-        <label>General Subqueries <span style="font-weight:400;color:var(--muted);">(stage 1 — chung)</span></label>
+        <label>General Subqueries</label>
         <div id="general-events-list"></div>
         <button type="button" id="add-general-btn" style="width:auto;padding:6px 14px;margin-top:6px;font-size:13px;">+ Add general</button>
-        <label style="margin-top:14px;">Specific Subqueries <span style="font-weight:400;color:var(--muted);">(stage 2 — chi tiết)</span></label>
+        <label style="margin-top:14px;">Specific Subqueries</label>
         <div id="specific-events-list"></div>
         <button type="button" id="add-specific-btn" style="width:auto;padding:6px 14px;margin-top:6px;font-size:13px;">+ Add specific</button>
       </div>
@@ -615,8 +737,7 @@ INDEX_HTML = r"""<!doctype html>
           <div id="sidebar-answer-text" style="margin-top: 4px; font-size: 15px; font-weight: 700; color: var(--accent-strong); line-height: 1.4;"></div>
         </div>
       </form>
-      <p class="hint">VQA: 3-stage pipeline (Embedding search → Temporal → Agent). TRAKE: temporal search + event grouping. Textual/Video KIS: embedding search only.</p>
-      <div id="agent-chat" style="margin-top: 16px; border-top: 1px solid #ddd; padding-top: 12px;">
+      <div id="agent-chat" style="display:none; margin-top: 16px; border-top: 1px solid #ddd; padding-top: 12px;">
         <div style="font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);">Agent Chat</div>
         <div id="chat-messages" style="max-height: 220px; overflow-y: auto; font-size: 13px; margin: 8px 0; line-height: 1.45;"></div>
         <div id="chat-suggestions" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px;"></div>
@@ -635,6 +756,22 @@ INDEX_HTML = r"""<!doctype html>
     </section>
   </main>
   <script>
+    function eid(id) { return document.getElementById(id); }
+    function esc(s) { return escapeHtml(s == null ? "" : String(s)); }
+    function escapeHtml(s) {
+      return String(s == null ? "" : s).replace(/[&<>"']/g, c => (
+        { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+      ));
+    }
+    function formatTime(seconds) {
+      const s = Math.max(0, Number(seconds) || 0);
+      const mm = Math.floor(s / 60);
+      const ss = Math.floor(s % 60);
+      return `${mm}:${String(ss).padStart(2, "0")}`;
+    }
+    function fmtTime(seconds) { return formatTime(seconds); }
+    function formatNumber(n) { return Number(n).toLocaleString(); }
+
     const form = document.getElementById("search-form");
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
@@ -644,6 +781,8 @@ INDEX_HTML = r"""<!doctype html>
     const submitEl = document.getElementById("submit");
     const sidebarAnswer = document.getElementById("sidebar-answer");
     const sidebarAnswerText = document.getElementById("sidebar-answer-text");
+    const EVENTS_LIST = eid("events-list");
+    const EVENTS_SEC = eid("events-section");
 
     // ─── TRAKE event inputs ───────────────────────────────────────────────────────
     function eventCount() { return EVENTS_LIST.children.length; }
@@ -727,215 +866,171 @@ INDEX_HTML = r"""<!doctype html>
     return { general, specific };
   }
 
+  // ─── Model picker (checkboxes named "model_<embedding-model-name>") ───────────
+  function getEnabledModels() {
+    return Array.from(document.querySelectorAll('#model-config input[name^="model_"]'))
+      .filter(cb => cb.checked)
+      .map(cb => cb.name.slice("model_".length));
+  }
+
   // ─── Track selector ───────────────────────────────────────────────────────────
-  FORM.track.addEventListener("change", () => {
-    const t = FORM.track.value;
+  form.track.addEventListener("change", () => {
+    const t = form.track.value;
     const isBasic = t === "textual_kis";
-    const isMulti = t === "kis_multi_scene";
     const is2Stage = t === "kis_detail_2stage";
     const isT = t === "trake";
     const isV = t === "vqa";
-    const isKis = isBasic || isMulti || is2Stage;
-    const usesEvents = isMulti || isT;
-    const showWindow = isMulti || isT;
+    const isTextSearch = t === "asr_search" || t === "ocr_search";
+    const isIntelligent = t === "intelligent";
+    const isEnhanced = t === "temporal_enhanced";
+    const usesEvents = isT;
+    // Enhanced temporal derives its own events from one sentence, so it keeps
+    // the temporal window control but not the manual event list.
+    const showWindow = isT || isEnhanced;
+    // Only tracks that actually route through Retriever.search() (i.e. embed
+    // the query with one or more configured models) show the model picker.
+    const usesEmbedders = isBasic || isT || isV || isIntelligent || isEnhanced;
 
     eid("query").style.display = usesEvents || is2Stage ? "none" : "";
-    FORM.querySelector("label[for=query]").style.display = usesEvents || is2Stage ? "none" : "";
-    eid("context").style.display = isT || is2Stage ? "none" : "";
-    FORM.querySelector("label[for=context]").style.display = isT || is2Stage ? "none" : "";
+    form.querySelector("label[for=query]").style.display = usesEvents || is2Stage ? "none" : "";
+    eid("context").style.display = isT || is2Stage || isTextSearch ? "none" : "";
+    form.querySelector("label[for=context]").style.display = isT || is2Stage || isTextSearch ? "none" : "";
     eid("question").style.display = isV ? "" : "none";
-    FORM.querySelector("label[for=question]").style.display = isV ? "" : "none";
+    form.querySelector("label[for=question]").style.display = isV ? "" : "none";
     eid("top-k").style.display = isT || is2Stage ? "none" : "";
-    FORM.querySelector("label[for=top-k]").style.display = isT || is2Stage ? "none" : "";
+    form.querySelector("label[for=top-k]").style.display = isT || is2Stage ? "none" : "";
     EVENTS_SEC.style.display = usesEvents ? "" : "none";
     eid("window-control").style.display = showWindow ? "" : "none";
     eid("kis-2stage-section").style.display = is2Stage ? "" : "none";
+    eid("model-config").style.display = usesEmbedders ? "" : "none";
     if (isT && eventCount()===0) { addEvent("a person riding a motorbike"); addEvent("a person falling off"); }
-    if (isMulti && eventCount()===0) { addEvent("Scene 1 description"); addEvent("Scene 2 description"); }
   });
-  FORM.track.dispatchEvent(new Event("change"));
+  form.track.dispatchEvent(new Event("change"));
 
-  // Last submitted events for TRAKE / Multi-Scene (carries sub-details)
+  // Last submitted events for TRAKE (carries sub-details)
   let lastTrakeInput = null;
 
   // ─── Search submit ────────────────────────────────────────────────────────────
-  FORM.addEventListener("submit", async e => {
+  form.addEventListener("submit", async e => {
     e.preventDefault();
-    SUBMIT.disabled = true;
-    STATUS.className = "status"; STATUS.textContent = "Searching...";
-    RESULTS.innerHTML = ""; ANSWER_BOX.innerHTML = ""; PIPELINE_BOX.innerHTML = "";
-    SIDEBAR_ANS.style.display = "none";
-    const track = FORM.track.value;
+    submitEl.disabled = true;
+    statusEl.className = "status"; statusEl.textContent = "Searching...";
+    resultsEl.innerHTML = ""; answerBox.innerHTML = ""; pipelineBox.innerHTML = ""; eventsEl.innerHTML = "";
+    sidebarAnswer.style.display = "none";
+    const track = form.track.value;
     let endpoint, payload;
     if (track === "trake") {
       const events = getEvents();
-      if (events.length < 2) { STATUS.className="status warn"; STATUS.textContent="Need at least 2 events."; SUBMIT.disabled=false; return; }
+      if (events.length < 2) { statusEl.className="status warn"; statusEl.textContent="Need at least 2 events."; submitEl.disabled=false; return; }
       lastTrakeInput = events;
       endpoint = "/api/trake-search"; payload = { events, top_k: 300, window: Number(eid("window-slider").value) };
-    } else if (track === "kis_multi_scene") {
-      const events = getEvents();
-      if (events.length < 2) { STATUS.className="status warn"; STATUS.textContent="Need at least 2 scenes."; SUBMIT.disabled=false; return; }
-      lastTrakeInput = events;
-      endpoint = "/api/kis-multi-scene"; payload = { events, top_k: 300, window: Number(eid("window-slider").value) };
     } else if (track === "kis_detail_2stage") {
       const { general, specific } = get2StageEvents();
-      if (general.length < 1) { STATUS.className="status warn"; STATUS.textContent="Need at least 1 general subquery."; SUBMIT.disabled=false; return; }
-      if (specific.length < 1) { STATUS.className="status warn"; STATUS.textContent="Need at least 1 specific subquery."; SUBMIT.disabled=false; return; }
+      if (general.length < 1) { statusEl.className="status warn"; statusEl.textContent="Need at least 1 general subquery."; submitEl.disabled=false; return; }
+      if (specific.length < 1) { statusEl.className="status warn"; statusEl.textContent="Need at least 1 specific subquery."; submitEl.disabled=false; return; }
       endpoint = "/api/kis-detail-2stage"; payload = { general, specific };
     } else if (track === "vqa") {
       endpoint = "/api/vqa-search";
-      payload = { query: FORM.query.value, context: FORM.context.value, question: FORM.question.value, top_k: Number(FORM.top_k.value||20) };
+      payload = { query: form.query.value, context: form.context.value, question: form.question.value, top_k: Number(form["top_k"].value||20) };
+    } else if (track === "asr_search" || track === "ocr_search") {
+      endpoint = track === "asr_search" ? "/api/asr-search" : "/api/ocr-search";
+      payload = { query: form.query.value, top_k: 300 };
+    } else if (track === "intelligent") {
+      endpoint = "/api/intelligent-search";
+      payload = { query: form.query.value, top_k: Number(form["top_k"].value||20) };
+    } else if (track === "temporal_enhanced") {
+      endpoint = "/api/enhanced-temporal-search";
+      payload = {
+        query: form.query.value, context: form.context.value,
+        top_k: Number(form["top_k"].value||20), max_events: 5,
+      };
     } else {
       endpoint = "/api/search";
-      payload = { track, query: FORM.query.value, context: FORM.context.value, question: FORM.question.value, top_k: 300 };
+      payload = {
+        track, query: form.query.value, context: form.context.value, question: form.question.value,
+        top_k: 300, enabled_models: getEnabledModels(), use_reranker: eid("use-reranker").checked,
+      };
     }
+
     try {
-      const res = await fetch(endpoint, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
-      const data = await res.json();
-      if (!res.ok || data.error) throw new Error(data.error || "Search failed");
-      if (track === "trake") {
-        const chains = data.videos || [];
-        const uniqueVideos = new Set(chains.map(v => v.video_id)).size;
-        STATUS.innerHTML = `<strong>${chains.length}</strong> chain(s) from <strong>${uniqueVideos}</strong> video(s) match all events <span class="pill">TRAKE</span>`;
-        renderTrake(data);
-      } else if (track === "kis_multi_scene") {
-        const chains = data.videos || [];
-        const uniqueVideos = new Set(chains.map(v => v.video_id)).size;
-        STATUS.innerHTML = `<strong>${chains.length}</strong> chain(s) from <strong>${uniqueVideos}</strong> video(s) match all scenes <span class="pill">KIS Multi-Scene</span>`;
-        renderTrake(data);
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "Search failed");
+      }
+
+      if (track === "vqa" && data.agent_error) {
+        statusEl.className = "status warn";
+        statusEl.textContent = "Agent failed (see error below)";
+        answerBox.innerHTML = `<div class="answer-box" style="border-color:#e55;background:#fff5f5">
+          <div class="label" style="color:#c00">Agent Error</div>
+          <div class="answer-text" style="color:#c00;font-size:13px;font-family:monospace">${escapeHtml(data.agent_error)}</div>
+        </div>`;
+        renderPipeline(data);
+        renderResults(data.results || []);
+        return;
+      }
+
+      if (track === "vqa" && data.answer) {
+        statusEl.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
+        renderAnswer(data.answer);
+        renderPipeline(data);
+        renderResults(data.results || []);
+        sidebarAnswer.style.display = "block";
+        sidebarAnswerText.textContent = data.answer;
+      } else if (track === "trake" || track === "temporal_enhanced") {
+        const eventCount = (data.events || []).length;
+        const extracted = data.extracted_events || [];
+        const label = track === "trake" ? "TRAKE" : "Temporal Enhanced";
+        const extractedNote = extracted.length
+          ? ` · LLM tách: ${extracted.map(escapeHtml).join(" → ")}`
+          : "";
+        statusEl.innerHTML = `<strong>${eventCount}</strong> event(s) found <span class="pill">${label}</span>${extractedNote}`;
+        renderTrakeEvents(data.events || []);
+        renderPipeline(data);
+        renderResults(data.results || []);
       } else if (track === "kis_detail_2stage") {
         const results = data.results || [];
-        STATUS.innerHTML = `<strong>${results.length}</strong> frames match all details <span class="pill">KIS Detail 2-Stage</span>`;
-        renderDetailCards(results);
-      } else if (track === "vqa" && data.answer) {
-        STATUS.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
-        ANSWER_BOX.innerHTML = `<div class="answer-box"><div class="label">Answer</div><div class="answer-text">${esc(data.answer)}</div></div>`;
-        renderPipeline(data);
-        renderCards(data.results||[]);
-        SIDEBAR_ANS.style.display = "block"; SIDEBAR_TEXT.textContent = data.answer;
+        statusEl.innerHTML = `<strong>${results.length}</strong> frames match all details <span class="pill">KIS Detail 2-Stage</span>`;
+        renderResults(results);
+      } else if (track === "intelligent") {
+        const results = data.results || [];
+        const a = data.analysis || {};
+        const w = a.weights || {};
+        const counts = data.component_counts || {};
+        const parts = ["kis", "ocr", "asr"]
+          .filter(k => (w[k] || 0) > 0)
+          .map(k => `${k.toUpperCase()} ${(w[k]).toFixed(2)} (${counts[k] || 0} hit)`);
+        statusEl.innerHTML = `<strong>${results.length}</strong> results <span class="pill">Intelligent</span>`
+          + (parts.length ? ` · ${escapeHtml(parts.join(" + "))}` : "");
+        renderResults(results);
       } else {
-        STATUS.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${track==="textual_kis"?"KIS Basic":"Video KIS"}</span>`;
-        renderCards(data.results);
+        const trackLabels = {
+          textual_kis: "Textual KIS", asr_search: "ASR Search", ocr_search: "OCR Search",
+        };
+        const trackLabel = trackLabels[track] || track;
+        statusEl.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${trackLabel}</span>`;
+        renderResults(data.results);
       }
-
-      function stopCountdown() {
-        if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
-      }
-
-      async function fetchWithRetry(endpoint, payload, maxRetries) {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
-          startCountdown(TIMEOUT_MS, attempt, maxRetries);
-
-          try {
-            const response = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Bypass-Tunnel-Reminder": "true"
-              },
-              body: JSON.stringify(payload),
-              signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            stopCountdown();
-
-            const text = await response.text();
-            let data;
-            try {
-              data = JSON.parse(text);
-            } catch (parseError) {
-              // If it's not JSON (like "Bad Gateway" HTML), treat it as a server error
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${text.substring(0, 100).replace(/<[^>]*>?/gm, '')}`);
-              }
-              throw parseError;
-            }
-
-            // Treat 502/503/504 as retryable server errors (e.g. ngrok/colab gateway timeouts)
-            if ([502, 503, 504].includes(response.status)) {
-               throw new Error(`Gateway Error ${response.status}`);
-            }
-
-            return { response, data };
-          } catch (err) {
-            clearTimeout(timeoutId);
-            stopCountdown();
-            const isRetryable = err.name === "AbortError" ||
-                                err.name === "TypeError" ||
-                                err.message.includes("HTTP 502") ||
-                                err.message.includes("HTTP 503") ||
-                                err.message.includes("HTTP 504") ||
-                                err.message.includes("Gateway Error");
-
-            if (isRetryable && attempt < maxRetries) {
-              statusEl.className = "status warn";
-              statusEl.textContent = `Attempt ${attempt} failed (${err.message.substring(0, 40)}). Retrying automatically (${attempt}/${maxRetries})\u2026`;
-              await new Promise(r => setTimeout(r, 2000)); // 2s pause before retry
-              continue;
-            }
-            throw err; // final attempt or non-retryable error
-          }
-        }
-      }
-
-      try {
-        const { response, data } = await fetchWithRetry(endpoint, payload, MAX_RETRIES);
-        if (!response.ok || data.error) {
-          throw new Error(data.error || "Search failed");
-        }
-
-        // Agent error: show dedicated error banner (separate from HTTP errors)
-        if (track === "vqa" && data.agent_error) {
-          statusEl.className = "status warn";
-          statusEl.textContent = "Agent failed (see error below)";
-          answerBox.innerHTML = `<div class="answer-box" style="border-color:#e55;background:#fff5f5">
-            <div class="label" style="color:#c00">Agent Error</div>
-            <div class="answer-text" style="color:#c00;font-size:13px;font-family:monospace">${escapeHtml(data.agent_error)}</div>
-          </div>`;
-          renderPipeline(data);
-          renderResults(data.results || []);
-          return;
-        }
-
-        if (track === "vqa" && data.answer) {
-          statusEl.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
-          renderAnswer(data.answer);
-          renderPipeline(data);
-          renderResults(data.results || []);
-          sidebarAnswer.style.display = "block";
-          sidebarAnswerText.textContent = data.answer;
-        } else if (track === "trake") {
-          const eventCount = (data.events || []).length;
-          statusEl.innerHTML = `<strong>${eventCount}</strong> event(s) found <span class="pill">TRAKE</span>`;
-          renderTrakeEvents(data.events || []);
-          renderPipeline(data);
-          renderResults(data.results || []);
-        } else {
-          const trackLabel = track === "textual_kis" ? "Textual KIS" : "Video KIS";
-          statusEl.innerHTML = `<strong>${data.results.length}</strong> results for <span class="pill">${trackLabel}</span>`;
-          renderResults(data.results);
-        }
-      } catch (error) {
-        stopCountdown();
-        statusEl.className = "status warn";
-        statusEl.textContent = (error.name === "AbortError" || error.name === "TypeError")
-          ? `All ${MAX_RETRIES} attempts timed out. The server is still loading models — please wait a minute and try again.`
-          : error.message;
-      } finally {
-        submitEl.disabled = false;
-      }
-    });
+    } catch (error) {
+      statusEl.className = "status warn";
+      statusEl.textContent = error.message;
+    } finally {
+      submitEl.disabled = false;
+    }
+  });
 
     function renderAnswer(answer) {
       answerBox.innerHTML = `
         <div class="answer-box">
           <div class="label">Answer</div>
           <div class="answer-text">${escapeHtml(answer)}</div>
-        </div>
-      </article>`).join("");
-  }
+        </div>`;
+    }
 
     function renderPipeline(data) {
       const pipeline = data.pipeline || {};
@@ -1000,11 +1095,10 @@ INDEX_HTML = r"""<!doctype html>
             <div>frame ${formatNumber(result.frame_index)} · shot ${escapeHtml(result.shot_id || "")}</div>
             <code>${escapeHtml(result.video_path || "")}</code>
             <code>${escapeHtml(result.frame_id || "")}</code>
+            ${result.text ? `<div style="margin-top:4px;font-size:12px;color:var(--muted);">${escapeHtml(result.text.slice(0, 140))}</div>` : ""}
           </div>
-          <div class="event-grid" style="grid-template-columns:repeat(${cols},1fr)">${evHtml}</div>
-        </div>`;
-    }).join("");
-  }
+        </article>`).join("");
+    }
 
   function revertCard(videoId, chainIdx, eventIdx) {
     const key = trakeKey(videoId, chainIdx, eventIdx);
@@ -1014,7 +1108,7 @@ INDEX_HTML = r"""<!doctype html>
     st.currentTimestamp = st.originalTimestamp;
     st.currentFrameId = st.originalFrameId;
     refreshCard(videoId, chainIdx, eventIdx);
-    STATUS.innerHTML = `<strong>Reverted</strong> Event ${eventIdx+1} to original <span class="pill">ORIGINAL</span>`;
+    statusEl.innerHTML = `<strong>Reverted</strong> Event ${eventIdx+1} to original <span class="pill">ORIGINAL</span>`;
     // sync modal if it's open on this card
     if (modal.open && modal.videoId===videoId && modal.chainIdx===chainIdx && modal.eventIdx===eventIdx) {
       eid("btn-revert-modal").style.display = "none";
@@ -1162,15 +1256,31 @@ INDEX_HTML = r"""<!doctype html>
       eid("btn-setthumb").textContent = isCustom ? "Cập nhật thumbnail" : "Làm thumbnail";
       eid("btn-revert-modal").style.display = isCustom ? "inline-block" : "none";
     }
+  }
 
-    // Toggle VQA settings visibility
-    form.track.addEventListener('change', (e) => {
+  // Toggle VQA settings visibility
+  form.track.addEventListener('change', (e) => {
       document.getElementById('vqa-settings').style.display = e.target.value === 'vqa' ? 'block' : 'none';
     });
     // Trigger initially
     if (form.track.value === 'vqa') {
         document.getElementById('vqa-settings').style.display = 'block';
     }
+
+    // --- Mode switch: manual search vs agent chat ---
+    function setMode(mode) {
+      const isAgent = mode === "agent";
+      document.getElementById("agent-chat").style.display = isAgent ? "" : "none";
+      document.getElementById("search-form").style.display = isAgent ? "none" : "";
+      document.querySelectorAll(".mode-btn").forEach(btn => {
+        btn.classList.toggle("active", btn.dataset.mode === mode);
+      });
+      localStorage.setItem("ui_mode", mode);
+    }
+    document.querySelectorAll(".mode-btn").forEach(btn => {
+      btn.addEventListener("click", () => setMode(btn.dataset.mode));
+    });
+    setMode(localStorage.getItem("ui_mode") || "manual");
 
     // --- Interactive agent chat (stateless server: we keep the history) ---
     const chatMessages = [];

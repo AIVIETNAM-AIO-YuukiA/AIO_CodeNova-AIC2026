@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+
 
 from config.settings import Experiment
 from core.logging import get_logger
@@ -51,29 +53,64 @@ class Retriever:
         self.reranker = reranker
         self.fusion_pool_size = fusion_pool_size
 
-    def search(self, query: str, top_k: int) -> list[SearchResult]:
-        """Return ranked, metadata-enriched frame results for a text query."""
+    def search(
+        self,
+        query: str,
+        top_k: int,
+        enabled_models: list[str] | None = None,
+        model_weights: dict[str, float] | None = None,
+        use_reranker: bool | None = None,
+    ) -> list[SearchResult]:
+        """Return ranked, metadata-enriched frame results for a text query.
+
+        ``enabled_models`` restricts the search to a subset of the retriever's
+        configured embedders (e.g. from a UI checkbox) without rebuilding
+        anything — every embedder is already loaded, this just picks which
+        ones vote. ``None`` uses all of them, matching prior behavior.
+        ``use_reranker=False`` skips the BLIP-2 rerank step even if one is
+        configured; ``None`` defers to whatever the retriever was built with.
+        """
         processed = self.query_processor.process(query)
         _log_processed_query(processed)
 
-        if len(self.embedders) == 1:
-            ((model_name, embedder),) = self.embedders.items()
+        active = self._select_embedders(enabled_models)
+        apply_reranker = self.reranker is not None and use_reranker is not False
+
+        if len(active) == 1:
+            ((model_name, embedder),) = active.items()
             query_embedding = embedder.embed_text(processed.visual_prompt)
             raw_results = self.index.search(query_embedding, top_k=top_k, model_name=model_name)
-            return self.hydrator.hydrate(raw_results)
+            # Hydrate before reranking: the index returns frame ids only, and
+            # the cross-encoder needs each result's frame_path to load its image.
+            hydrated = self.hydrator.hydrate(raw_results)
+            if apply_reranker:
+                hydrated = self.reranker.rerank(query=processed.visual_prompt, results=hydrated)
+            return hydrated[:top_k]
 
         pool_size = max(top_k, self.fusion_pool_size)
-        per_model_results = []
-        for model_name, embedder in self.embedders.items():
+        results_by_model = {}
+        for model_name, embedder in active.items():
             query_embedding = embedder.embed_text(processed.visual_prompt)
-            per_model_results.append(
-                self.index.search(query_embedding, top_k=pool_size, model_name=model_name)
+            results_by_model[model_name] = self.index.search(
+                query_embedding, top_k=pool_size, model_name=model_name
             )
 
-        fused = srrf_fuse(per_model_results, top_k=pool_size)
-        if self.reranker is not None:
-            fused = self.reranker.rerank(query=processed.visual_prompt, results=fused)
-        return self.hydrator.hydrate(fused[:top_k])
+        fused = srrf_fuse(results_by_model, top_k=pool_size, weights=model_weights)
+        hydrated = self.hydrator.hydrate(fused)
+        if apply_reranker:
+            hydrated = self.reranker.rerank(query=processed.visual_prompt, results=hydrated)
+        return hydrated[:top_k]
+
+    def _select_embedders(self, enabled_models: list[str] | None) -> dict[str, Embedder]:
+        if enabled_models is None:
+            return self.embedders
+        active = {name: emb for name, emb in self.embedders.items() if name in enabled_models}
+        if not active:
+            raise ValueError(
+                f"None of {enabled_models} match configured models {list(self.embedders)}."
+            )
+        return active
+
 
 
 def _log_processed_query(processed) -> None:
@@ -104,7 +141,8 @@ def build_retriever(experiment: Experiment) -> Retriever:
 
     Builds one embedder per configured model. When more than one model is
     configured, also builds the default reranker (BLIP-2 ITM) to score fused
-    SRRF candidates.
+    SRRF candidates — set ``DISABLE_RERANKER=1`` to skip it, which frees the
+    ~1.5 GB of VRAM it holds so several embedders fit on a small GPU.
     """
     embedders = {
         model_name: build_embedder(model_name=model_name, device=experiment.config.device)
@@ -112,7 +150,10 @@ def build_retriever(experiment: Experiment) -> Retriever:
     }
     index = build_vector_index(experiment)
     hydrator = ResultHydrator(experiment)
+    disable_reranker = os.environ.get("DISABLE_RERANKER", "0").lower() not in ("0", "false", "")
     reranker = (
-        build_reranker("blip2-itm", device=experiment.config.device) if len(embedders) > 1 else None
+        build_reranker("blip2-itm", device=experiment.config.device)
+        if len(embedders) > 1 and not disable_reranker
+        else None
     )
     return Retriever(embedders=embedders, index=index, hydrator=hydrator, reranker=reranker)

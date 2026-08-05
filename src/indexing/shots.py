@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from core.logging import get_logger
 
@@ -10,7 +11,7 @@ from config.settings import Experiment
 from core.types import ShotRecord, VideoRecord
 from indexing.manifest import JsonlManifest
 from indexing.state import JobState
-from video.shots import TransNetV2ShotDetector
+from video.shots import TransNetV2ShotDetector, decode_video
 
 LOGGER = get_logger(__name__)
 
@@ -33,6 +34,7 @@ def detect_shots(
     existing_by_video = _existing_shot_video_ids(shots_manifest)
     recorded = 0
 
+    pending = []
     for row in videos_manifest.read_all():
         video = VideoRecord.from_dict(row)
         if (
@@ -41,15 +43,36 @@ def detect_shots(
         ):
             LOGGER.info("Skipping shot detection video_id=%s", video.video_id)
             continue
-        try:
-            shots = detector.detect(video)
-            shots_manifest.extend(shot.to_dict() for shot in shots)
-            state.mark(video.video_id, "SHOT_DETECT", "COMPLETED")
-            recorded += len(shots)
-            LOGGER.info("Detected shots video_id=%s count=%s", video.video_id, len(shots))
-        except Exception as exc:
-            LOGGER.exception("Shot detection failed video_id=%s", video.video_id)
-            state.mark(video.video_id, "SHOT_DETECT", "FAILED", error=str(exc))
+        pending.append(video)
+
+    if not pending:
+        LOGGER.info("No videos need shot detection")
+        return 0
+
+    # Decoding is CPU-only and inference is GPU-only, so decode the next video
+    # while the current one is on the GPU. One worker is enough to hide it.
+    with ThreadPoolExecutor(max_workers=1) as decoder:
+        upcoming = decoder.submit(decode_video, pending[0].path)
+        for index, video in enumerate(pending):
+            try:
+                decoded = upcoming.result()
+            except Exception as exc:
+                LOGGER.exception("Video decode failed video_id=%s", video.video_id)
+                state.mark(video.video_id, "SHOT_DETECT", "FAILED", error=str(exc))
+                decoded = None
+            if index + 1 < len(pending):
+                upcoming = decoder.submit(decode_video, pending[index + 1].path)
+            if decoded is None:
+                continue
+            try:
+                shots = detector.detect_decoded(video, decoded)
+                shots_manifest.extend(shot.to_dict() for shot in shots)
+                state.mark(video.video_id, "SHOT_DETECT", "COMPLETED")
+                recorded += len(shots)
+                LOGGER.info("Detected shots video_id=%s count=%s", video.video_id, len(shots))
+            except Exception as exc:
+                LOGGER.exception("Shot detection failed video_id=%s", video.video_id)
+                state.mark(video.video_id, "SHOT_DETECT", "FAILED", error=str(exc))
     return recorded
 
 

@@ -34,8 +34,8 @@ bạn tự chạy cho nó).
 
 | Vai trò | Model | Chạy ở đâu |
 |---------|-------|------------|
-| Embed ảnh (mặc định) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x so với PyTorch trên GB10) |
-| Embed ảnh (tùy chọn) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x so với PyTorch trên GB10) |
+| Embed ảnh (mặc định) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x so với PyTorch, đo trên GB10) |
+| Embed ảnh (tùy chọn) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x so với PyTorch, đo trên GB10) |
 | Embed caption tiếng Việt (tùy chọn) | `AITeamVN/Vietnamese_Embedding_v2` trên caption do VLM sinh | caption qua Docker VLM; embed in-process |
 | Reranker (tùy chọn, khi chạy nhiều model) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
 | Captioning + OCR (index & tool agent) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **chỉ GB10**), cổng 8881 |
@@ -51,8 +51,9 @@ kernel AWQ/Marlin. Đổi model qua `VLLM_INDEX_MODEL` trong `.env`.
 ### Embedding tăng tốc bằng TensorRT
 
 BEiT-3 và SigLIP2 tốn gần như toàn bộ thời gian ở forward pass của vision
-tower — đo trên GB10, PyTorch eager mode mất ~400-860ms/ảnh, tức là 283K
-keyframe sẽ mất 1-2 ngày. `modules/embedding/tensorrt_runtime.py` tự động
+tower — đo trên máy GB10 dùng để phát triển repo này, PyTorch eager mode mất
+~400-860ms/ảnh, tức là 283K keyframe sẽ mất 1-2 ngày trên phần cứng đó (thời
+gian thực tế tùy GPU). `modules/embedding/tensorrt_runtime.py` tự động
 export vision tower sang ONNX rồi build TensorRT engine FP16 ngay lần đầu
 `embed-frames` chạy (vài phút, chỉ 1 lần), cache tại `weights/<model>/`. Các
 lần chạy sau chỉ load engine đã cache — đã kiểm chứng cosine similarity
@@ -107,8 +108,8 @@ docs/vi/          # tài liệu tiếng Việt
 - Python ≥ 3.13, quản lý bằng [uv](https://docs.astral.sh/uv/)
 - GPU NVIDIA + CUDA (embedder + TransNetV2 cần CUDA khi `--device auto`)
 - Docker (Qdrant, Elasticsearch, toàn bộ LLM/VLM serving)
-- Trọng số TransNetV2 tại
-  `external/TransNetV2/inference-pytorch/transnetv2-pytorch-weights.pth`
+- `git` và `uv` trong PATH — `detect-shots` dùng chúng để tải và convert
+  trọng số TransNetV2 ở lần chạy đầu (xem [Trọng số TransNetV2](#trọng-số-transnetv2))
 - Cho ASR: chạy 1 lần `cd external/gipformer && uv sync` (repo+venv cô lập),
   và `uv pip install onnxruntime` (cố ý KHÔNG đưa vào `pyproject.toml` — thêm
   vào đó sẽ âm thầm hạ cấp bản torch `+cu128` đã pin)
@@ -125,6 +126,18 @@ uv sync                       # cài dependency
 cp .env.example .env          # cấu hình endpoint (mặc định chạy được local)
 make qdrant-up qdrant-health  # vector DB
 ```
+
+### Trọng số TransNetV2
+
+`make detect-shots` tự lo phần này ở lần chạy đầu: clone
+[soCzech/TransNetV2](https://github.com/soCzech/TransNetV2) vào `external/`
+rồi convert SavedModel TensorFlow kèm theo thành
+`external/TransNetV2/inference-pytorch/transnetv2-pytorch-weights.pth`.
+
+Bước convert chạy trong một venv `uv` tạm (`tensorflow==2.16.*` + `torch`),
+xoá ngay sau khi xong, nên không đụng tới `.venv` của project và bản
+`torch==2.11.0+cu128` trong đó. Cần có `git` và `uv` trong PATH. Truyền
+`--transnetv2-weights` nếu đã có sẵn file `.pth` và muốn bỏ qua toàn bộ.
 
 ## Chạy pipeline
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from core.logging import get_logger
 
@@ -25,6 +26,10 @@ LOGGER = get_logger(__name__)
 # checkpointing lets a killed/interrupted run resume mid-model instead of
 # redoing all of it, at the cost of a small periodic disk write.
 _CHECKPOINT_INTERVAL_SECONDS = 30.0
+
+# Frames handed to embed_images() per call. Caps the embedder's peak memory
+# (see the chunked loop in embed_frames) without changing what gets embedded.
+_EMBED_CHUNK_SIZE = int(os.environ.get("EMBED_CHUNK_SIZE", "2000"))
 
 
 class _CheckpointWriter:
@@ -83,13 +88,19 @@ def _captioned_frame_ids(captions_path) -> set[str]:
     return {row["frame_id"] for row in manifest.read_all() if row.get("frame_id")}
 
 
-def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = False) -> int:
+def embed_frames(
+    experiment: Experiment,
+    batch_size: int = 32,
+    force: bool = False,
+    caption_missing: bool = False,
+) -> int:
     """Embed extracted frames for every configured embedding model.
 
     Incremental per model: only frames not already embedded by a given model are
     processed and appended, so re-running after more frames are extracted embeds
     just the new ones. ``force`` discards existing embeddings and re-embeds
-    everything.
+    everything. ``caption_missing`` lets vietnamese-embedding caption frames
+    that have none yet (see the skip below) instead of passing over them.
 
     Every model always gets its own ``frames__<model>.npz`` /
     ``frame_ids__<model>.json`` — even with one model configured — so two
@@ -153,7 +164,7 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
         # and would otherwise trigger a live captioning call. Skip them here
         # so a captioning-only outage doesn't block embedding what's already
         # captioned — they'll be picked up on a later run once captioned.
-        if model_name == "vietnamese-embedding":
+        if model_name == "vietnamese-embedding" and not caption_missing:
             captioned_ids = _captioned_frame_ids(
                 experiment.run_dir / "manifests" / "captions.jsonl"
             )
@@ -161,38 +172,53 @@ def embed_frames(experiment: Experiment, batch_size: int = 32, force: bool = Fal
             new_frames = [frame for frame in new_frames if frame.frame_id in captioned_ids]
             if skipped:
                 LOGGER.info(
-                    "[%s] Skipping %s frames with no caption yet (will pick up later)",
+                    "[%s] Skipping %s frames with no caption yet "
+                    "(pass --caption-missing to caption them now)",
                     model_name,
                     len(skipped),
                 )
 
+        # Khong con frame moi de embed. Neu checkpoint dang giu vector chua
+        # ghi vao file hoan chinh (vd: vietnamese-embedding bi chan boi thieu
+        # caption) thi phai ghi ra truoc, tuyet doi khong duoc xoa truoc khi
+        # ghi - xoa truoc se mat trang vector da tinh.
         if not new_frames:
-            _discard_checkpoint(model_checkpoint_vectors_path, model_checkpoint_ids_path)
-            LOGGER.info(
-                "[%s] All %s frames already embedded; nothing to do", model_name, len(frames)
+            if not checkpoint_ids:
+                LOGGER.info(
+                    "[%s] All %s frames already embedded; nothing to do", model_name, len(frames)
+                )
+                continue
+            new_ids = checkpoint_ids
+            new_vectors = np.asarray(checkpoint_vectors, dtype="float32")
+        else:
+            embedder = build_embedder(
+                model_name=model_name,
+                device=experiment.config.device,
+                batch_size=batch_size,
+                captions_path=experiment.run_dir / "manifests" / "captions.jsonl",
             )
-            continue
+            checkpoint_writer = _CheckpointWriter(
+                np,
+                model_checkpoint_vectors_path,
+                model_checkpoint_ids_path,
+                checkpoint_ids,
+                checkpoint_vectors,
+            )
+            # Chia nho theo _EMBED_CHUNK_SIZE de RAM khong phinh to: vietnamese-embedding
+            # giu ca future + caption + vector cho tung frame dang xu ly, voi 60k frame
+            # trong 1 lan goi tung len ~4GB va lam doi GPU embedder khac chay cung.
+            # Van checkpoint theo tung batch nen khong anh huong toi viec resume.
+            fresh_vectors: list = []
+            for start in range(0, len(new_frames), _EMBED_CHUNK_SIZE):
+                chunk = new_frames[start : start + _EMBED_CHUNK_SIZE]
+                fresh_vectors.extend(
+                    embedder.embed_images(chunk, on_batch=checkpoint_writer.add_batch)
+                )
 
-        embedder = build_embedder(
-            model_name=model_name,
-            device=experiment.config.device,
-            batch_size=batch_size,
-            captions_path=experiment.run_dir / "manifests" / "captions.jsonl",
-        )
-        checkpoint_writer = _CheckpointWriter(
-            np,
-            model_checkpoint_vectors_path,
-            model_checkpoint_ids_path,
-            checkpoint_ids,
-            checkpoint_vectors,
-        )
-        fresh_vectors = embedder.embed_images(new_frames, on_batch=checkpoint_writer.add_batch)
-
-        # new_frames already excludes anything the checkpoint covered, so the
-        # final per-model result is checkpoint carry-over + this pass's
-        # output, in that order (matches how the checkpoint buffer accumulated).
-        new_ids = checkpoint_ids + [frame.frame_id for frame in new_frames]
-        new_vectors = np.asarray(checkpoint_vectors + list(fresh_vectors), dtype="float32")
+            # new_frames da loai tru phan checkpoint cover roi, nen ket qua cuoi
+            # cua model = checkpoint mang sang + ket qua lan chay nay.
+            new_ids = checkpoint_ids + [frame.frame_id for frame in new_frames]
+            new_vectors = np.asarray(checkpoint_vectors + list(fresh_vectors), dtype="float32")
 
         if existing_vectors is not None and len(existing_vectors):
             vectors = np.concatenate([existing_vectors, new_vectors], axis=0)

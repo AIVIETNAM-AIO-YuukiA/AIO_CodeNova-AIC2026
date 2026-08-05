@@ -1,10 +1,10 @@
-"""Transformers-backed SigLIP 2 embedder.
+"""Embedder SigLIP 2, chay qua Hugging Face Transformers.
 
-SigLIP 2 is a strong multilingual vision-language encoder. The API mirrors CLIP
-(``get_image_features`` / ``get_text_features``), with two specifics: a unified
-``AutoProcessor`` and text padding to a fixed length (SigLIP was trained with
-``padding="max_length"``). The model is loaded via ``AutoModel`` so the correct
-backend class is picked per checkpoint.
+SigLIP 2 la vision-language encoder da ngon ngu. API giong CLIP
+(``get_image_features`` / ``get_text_features``), khac o 2 diem: dung chung
+``AutoProcessor`` va text duoc pad ve do dai co dinh (SigLIP duoc train voi
+``padding="max_length"``). Model duoc nap qua ``AutoModel`` de tu chon dung
+class backend theo tung checkpoint.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 from pathlib import Path
+import time
 
 from core.errors import EmbeddingError
 from core.types import FrameRecord
@@ -27,32 +28,37 @@ from modules.embedding.tensorrt_runtime import TensorRTVisionEncoder
 
 LOGGER = logging.getLogger(__name__)
 
-# SigLIP 2's text tower has a 64-token context. Longer queries are split into
-# windows (stride 48) and mean-pooled instead of being truncated.
+# Text tower cua SigLIP 2 chi nhan toi da 64 token. Query dai hon se duoc
+# cat thanh nhieu doan (stride 48) roi mean-pool thay vi bi cat cut.
 _MAX_TEXT_TOKENS = 64
 _WINDOW_STRIDE = 48
 
-# Downscale oversized source images before the processor.
+# Giam kich thuoc anh dau vao truoc khi dua qua processor.
 _MAX_SOURCE_SIDE = 512
 
 _IMAGE_SIZE = 384
 _EMBED_DIM = 1152
 
-# Parallel image decode workers.
+_DEFAULT_MODEL = "google/siglip2-so400m-patch14-384"
+
+# So luong thread giai ma anh song song.
 _DECODE_WORKERS = int(os.environ.get("SIGLIP2_DECODE_WORKERS", "8"))
 
-# Set SIGLIP2_USE_TENSORRT=0 to force PyTorch instead of the TensorRT engine.
+# Dat SIGLIP2_USE_TENSORRT=0 de ep dung PyTorch thay vi engine TensorRT.
 _USE_TENSORRT = os.environ.get("SIGLIP2_USE_TENSORRT", "1").lower() not in ("0", "false")
+
+# So giay nghi giua cac batch. Voi GPU laptop de nong, nghi ngan giua batch
+# giup GPU khong bi throttle nhiet, tong throughput co the tang len.
+_BATCH_COOLDOWN = float(os.environ.get("SIGLIP2_BATCH_COOLDOWN", "0"))
 
 
 class SiglipEmbedder(Embedder):
-    """SigLIP 2 image/text embeddings backed by Hugging Face Transformers."""
+    """Embedding anh/text SigLIP 2, chay qua Hugging Face Transformers."""
 
     def __init__(
         self, model_name: str | None = None, device: str = "auto", batch_size: int = 32
     ) -> None:
-        resolved = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", "siglip2-so400m")
-        self.model_name = normalize_siglip_model_name(resolved)
+        self.model_name = model_name or os.environ.get("SIGLIP2_EMBEDDING_MODEL", _DEFAULT_MODEL)
         self.device = device
         self.batch_size = batch_size
         self._model = None
@@ -74,11 +80,11 @@ class SiglipEmbedder(Embedder):
     def embed_images(
         self, frames: list[FrameRecord], on_batch: BatchCallback | None = None
     ) -> list[list[float]]:
-        """Embed frames with SigLIP image features."""
+        """Embed frame bang SigLIP image features."""
         if not frames:
             return []
         try:
-            from PIL import Image
+            import PIL.Image  # noqa: F401  (import de kiem tra Pillow co san)
         except ImportError as exc:
             raise EmbeddingError("Install Pillow before embedding images.") from exc
 
@@ -90,7 +96,7 @@ class SiglipEmbedder(Embedder):
             model, processor, torch, device = self._load()
 
         def _load_image(frame: FrameRecord):
-            return _downscale(Image.open(Path(frame.frame_path)).convert("RGB"))
+            return _open_downscaled(Path(frame.frame_path))
 
         vectors: list[list[float]] = []
         progress = BatchProgressLogger(LOGGER, self.model_name, len(frames))
@@ -115,10 +121,12 @@ class SiglipEmbedder(Embedder):
                 progress.advance(len(batch))
                 if on_batch is not None:
                     on_batch(batch, batch_vectors)
+                if _BATCH_COOLDOWN:
+                    time.sleep(_BATCH_COOLDOWN)
         return vectors
 
     def _export_onnx(self, onnx_path: Path) -> None:
-        """Trace the SigLIP2 vision tower and export it to ONNX."""
+        """Trace vision tower cua SigLIP2 va xuat ra file ONNX."""
         model, _, torch, device = self._load()
         dummy = torch.randn(1, 3, _IMAGE_SIZE, _IMAGE_SIZE, device=device)
         torch.onnx.export(
@@ -133,7 +141,7 @@ class SiglipEmbedder(Embedder):
         )
 
     def embed_text(self, query: str) -> list[float]:
-        """Embed a text query with SigLIP text features."""
+        """Embed 1 cau query bang SigLIP text features."""
         model, processor, torch, device = self._load()
         text = query.lower().strip()
         windows = _text_windows(processor.tokenizer, text)
@@ -151,7 +159,7 @@ class SiglipEmbedder(Embedder):
         return pooled.detach().cpu().numpy().astype("float32").tolist()
 
     def _load_preprocessing(self):
-        """Return (processor, torch, device) without loading the PyTorch model."""
+        """Tra ve (processor, torch, device) ma khong nap model PyTorch."""
         if self._processor is not None:
             return self._processor, self._torch, self._device
 
@@ -184,7 +192,14 @@ class SiglipEmbedder(Embedder):
 
         device = resolve_torch_device(torch, self.device)
         processor = AutoProcessor.from_pretrained(self.model_name)
-        model = AutoModel.from_pretrained(self.model_name).eval().to(device)
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+        # Nap model roi chuyen thang sang device bang .to(). Checkpoint lon
+        # co the bi transformers dat tam len "meta device"; goi .to(device)
+        # sau do se bao loi "Cannot copy out of meta tensor" - da kiem tra
+        # cach nay khong dinh loi do.
+        model = AutoModel.from_pretrained(
+            self.model_name, dtype=dtype
+        ).to(device).eval()
         self._model = model
         self._processor = processor
         self._torch = torch
@@ -192,8 +207,26 @@ class SiglipEmbedder(Embedder):
         return model, processor, torch, device
 
 
+def _open_downscaled(path):
+    """Mo anh va giam kich thuoc ve gan ``_MAX_SOURCE_SIDE``.
+
+    ``draft()`` cho phep JPEG decoder xuat anh ty le 1/2, 1/4 hoac 1/8 ngay
+    luc giai ma, re hon nhieu so voi giai ma full 1280x720 roi moi chay
+    LANCZOS resize - khi dung TensorRT tren GPU, buoc resize nay chinh la
+    nut that co chai (GPU chi dung ~10% memory vi phai cho). Phan resize
+    con lai van dung LANCZOS nen chat luong dau ra khong doi voi input
+    384px cua model.
+    """
+    from PIL import Image
+
+    image = Image.open(path)
+    if image.format == "JPEG":
+        image.draft("RGB", (_MAX_SOURCE_SIDE, _MAX_SOURCE_SIDE))
+    return _downscale(image.convert("RGB"))
+
+
 def _downscale(image):
-    """Shrink an image so its longest side is at most 512px (LANCZOS)."""
+    """Thu nho anh sao cho canh dai nhat toi da 512px (dung LANCZOS)."""
     from PIL import Image
 
     if max(image.size) <= _MAX_SOURCE_SIDE:
@@ -206,7 +239,7 @@ def _downscale(image):
 
 
 def _autocast(torch, device):
-    """fp16 autocast on CUDA, no-op elsewhere."""
+    """Bat autocast fp16 khi chay tren CUDA, khong lam gi o device khac."""
     if getattr(device, "type", str(device)) == "cuda" or str(device).startswith("cuda"):
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     import contextlib
@@ -215,7 +248,7 @@ def _autocast(torch, device):
 
 
 def _text_windows(tokenizer, text: str) -> list[str]:
-    """Split ``text`` into <=64-token windows (stride 48); short text passes through."""
+    """Chia ``text`` thanh cac doan toi da 64 token (stride 48); text ngan giu nguyen."""
     token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     if len(token_ids) <= _MAX_TEXT_TOKENS:
         return [text]
@@ -228,19 +261,3 @@ def _text_windows(tokenizer, text: str) -> list[str]:
             break
         start += _WINDOW_STRIDE
     return windows
-
-
-def normalize_siglip_model_name(model_name: str) -> str:
-    """Map local short names to Hugging Face model IDs.
-
-    ``siglip2`` / ``siglip2-so400m`` resolve to the fixed-resolution
-    so400m-patch14-384 checkpoint (dim 1152), not the NaFlex variant, whose
-    variable-resolution input path behaves differently under AutoModel.
-    """
-    aliases = {
-        "siglip2": "google/siglip2-so400m-patch14-384",
-        "siglip2-base": "google/siglip2-base-patch16-256",
-        "siglip2-large": "google/siglip2-large-patch16-256",
-        "siglip2-so400m": "google/siglip2-so400m-patch14-384",
-    }
-    return aliases.get(model_name.lower(), model_name)
