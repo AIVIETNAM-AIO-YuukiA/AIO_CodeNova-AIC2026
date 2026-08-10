@@ -160,26 +160,21 @@ class Blip2ItmReranker(Reranker):
                 img = ImageEnhance.Contrast(img).enhance(1.3)
                 images.append(img)
 
-            # Score each (image, text) pair individually to avoid cross-image
-            # padding artifacts — BLIP-2 processor pads vision tokens to the
-            # longest image in the batch, which corrupts shorter-image embeddings.
-            scores: list[float] = []
-            for image in images:
-                inputs = processor(
-                    images=image,
-                    text=expanded_query,
-                    return_tensors="pt",
-                    truncation=True,
-                ).to(device)
+            inputs = processor(
+                images=images,
+                text=[expanded_query] * len(images),
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+            ).to(device)
 
-                if hasattr(inputs, "pixel_values") and inputs.pixel_values.dtype != model.dtype:
-                    inputs["pixel_values"] = inputs.pixel_values.to(model.dtype)
+            if hasattr(inputs, "pixel_values") and inputs.pixel_values.dtype != model.dtype:
+                inputs["pixel_values"] = inputs.pixel_values.to(model.dtype)
 
-                with torch.no_grad():
-                    outputs = model(**inputs, use_image_text_matching_head=True)
-                    # logits_per_image shape: [1, 2] — index 1 is the "match" logit.
-                    prob = torch.softmax(outputs.logits_per_image, dim=-1)
-                    scores.append(prob[0, 1].item())
+            with torch.no_grad():
+                outputs = model(**inputs, use_image_text_matching_head=True)
+                probs = torch.softmax(outputs.logits_per_image, dim=-1)
+                scores = probs[:, 1].tolist()
 
             return scores
 
@@ -210,18 +205,17 @@ class Blip2ItmReranker(Reranker):
 
         processor = AutoProcessor.from_pretrained(self.model_name)
 
-        # Load model using accelerate's device_map to offload to RAM if VRAM is insufficient (e.g. RTX 2050 4GB)
         kwargs = {}
         if resolved == "cuda":
-            kwargs["device_map"] = "auto"
             kwargs["torch_dtype"] = torch.float16
         else:
             kwargs["torch_dtype"] = torch.float32
 
-        model = Blip2ForImageTextRetrieval.from_pretrained(self.model_name, **kwargs).eval()
-
-        if resolved != "cuda":
-            model = model.to(resolved)
+        model = (
+            Blip2ForImageTextRetrieval.from_pretrained(self.model_name, **kwargs)
+            .to(resolved)
+            .eval()
+        )
 
         self._model = model
         self._processor = processor

@@ -8,10 +8,11 @@ import sys
 
 from config.settings import Experiment
 from core.logging import get_logger
-from core.types import SearchResult
+from core.types import SearchResult, RetrievalQuery
 from modules.embedding import Embedder, build_embedder
 from modules.reranker.base import Reranker, build_reranker
-from retrieval.fusion import srrf_fuse
+from retrieval.fusion import wsf_fuse
+import numpy as np
 from retrieval.hydrator import ResultHydrator
 from retrieval.query_processor import QueryProcessor, get_query_processor
 from stores.vector.base import VectorIndex
@@ -37,6 +38,7 @@ class Retriever:
 
     def __init__(
         self,
+        experiment: Experiment,
         embedders: dict[str, Embedder],
         index: VectorIndex,
         hydrator: ResultHydrator,
@@ -46,20 +48,30 @@ class Retriever:
     ) -> None:
         if not embedders:
             raise ValueError("Retriever requires at least one embedder.")
+        self.experiment = experiment
         self.embedders = embedders
         self.index = index
         self.hydrator = hydrator
         self.query_processor = query_processor or get_query_processor()
         self.reranker = reranker
         self.fusion_pool_size = fusion_pool_size
+        self._frame_cache: dict[str, tuple[np.ndarray, list[dict]]] = {}
+
+    def _load_frame_embeddings(self, model_name: str) -> tuple[np.ndarray, list[dict]]:
+        if model_name not in self._frame_cache:
+            from retrieval.temporal_search import load_temporal_data
+
+            self._frame_cache[model_name] = load_temporal_data(self.experiment, model_name)
+        return self._frame_cache[model_name]
 
     def search(
         self,
-        query: str,
-        top_k: int,
+        query: str | RetrievalQuery,
+        top_k: int = 300,
         enabled_models: list[str] | None = None,
         model_weights: dict[str, float] | None = None,
         use_reranker: bool | None = None,
+        use_llm: bool = True,
     ) -> list[SearchResult]:
         """Return ranked, metadata-enriched frame results for a text query.
 
@@ -70,36 +82,49 @@ class Retriever:
         ``use_reranker=False`` skips the BLIP-2 rerank step even if one is
         configured; ``None`` defers to whatever the retriever was built with.
         """
-        processed = self.query_processor.process(query)
+        if not isinstance(query, str):
+            query = query.to_search_string()
+
+        processed = self.query_processor.process(
+            query, enabled_models=enabled_models, use_llm=use_llm
+        )
         _log_processed_query(processed)
 
         active = self._select_embedders(enabled_models)
         apply_reranker = self.reranker is not None and use_reranker is not False
 
-        if len(active) == 1:
-            ((model_name, embedder),) = active.items()
-            query_embedding = embedder.embed_text(processed.visual_prompt)
-            raw_results = self.index.search(query_embedding, top_k=top_k, model_name=model_name)
-            # Hydrate before reranking: the index returns frame ids only, and
-            # the cross-encoder needs each result's frame_path to load its image.
-            hydrated = self.hydrator.hydrate(raw_results)
-            if apply_reranker:
-                hydrated = self.reranker.rerank(query=processed.visual_prompt, results=hydrated)
-            return hydrated[:top_k]
-
-        pool_size = max(top_k, self.fusion_pool_size)
-        results_by_model = {}
+        pool_size = max(top_k, self.fusion_pool_size) if len(active) > 1 else top_k
+        model_data = {}
         for model_name, embedder in active.items():
-            query_embedding = embedder.embed_text(processed.visual_prompt)
-            results_by_model[model_name] = self.index.search(
-                query_embedding, top_k=pool_size, model_name=model_name
-            )
+            if "vietnamese" in model_name.lower() or "vism" in model_name.lower():
+                visual_query = processed.visual_prompt_vi
+            else:
+                visual_query = processed.visual_prompt
 
-        fused = srrf_fuse(results_by_model, top_k=pool_size, weights=model_weights)
+            query_embedding = embedder.embed_text(visual_query)
+            frame_embs, frame_recs = self._load_frame_embeddings(model_name)
+            model_data[model_name] = (frame_embs, frame_recs, query_embedding)
+
+        fused = wsf_fuse(model_data, top_k=pool_size, weights=model_weights)
         hydrated = self.hydrator.hydrate(fused)
+
+        # Filter out results where frame_path is missing or file does not exist on disk
+        from pathlib import Path
+
+        valid_hydrated = []
+        for r in hydrated:
+            if r.frame_path:
+                norm_p = r.frame_path.replace("\\", "/")
+                if Path(norm_p).exists():
+                    valid_hydrated.append(r)
+
         if apply_reranker:
-            hydrated = self.reranker.rerank(query=processed.visual_prompt, results=hydrated)
-        return hydrated[:top_k]
+            rerank_limit = min(50, len(valid_hydrated))
+            reranked_top = self.reranker.rerank(
+                query=processed.visual_prompt, results=valid_hydrated[:rerank_limit]
+            )
+            valid_hydrated = reranked_top + valid_hydrated[rerank_limit:]
+        return valid_hydrated[:top_k]
 
     def _select_embedders(self, enabled_models: list[str] | None) -> dict[str, Embedder]:
         if enabled_models is None:
@@ -110,7 +135,6 @@ class Retriever:
                 f"None of {enabled_models} match configured models {list(self.embedders)}."
             )
         return active
-
 
 
 def _log_processed_query(processed) -> None:
@@ -156,4 +180,10 @@ def build_retriever(experiment: Experiment) -> Retriever:
         if len(embedders) > 1 and not disable_reranker
         else None
     )
-    return Retriever(embedders=embedders, index=index, hydrator=hydrator, reranker=reranker)
+    return Retriever(
+        experiment=experiment,
+        embedders=embedders,
+        index=index,
+        hydrator=hydrator,
+        reranker=reranker,
+    )

@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import json
+import re
 from core.logging import get_logger
 import mimetypes
 
@@ -53,6 +54,111 @@ def _warmup_models(reranker, experiment: Experiment, retriever=None) -> None:
     LOGGER.info("[warmup] All models pre-loaded and ready.")
 
 
+def _ensure_manifests(experiment: Experiment) -> None:
+    """Auto-recover manifests/frames.jsonl and videos.jsonl if missing or empty."""
+    manifests_dir = experiment.run_dir / "manifests"
+    frames_jsonl = manifests_dir / "frames.jsonl"
+    videos_jsonl = manifests_dir / "videos.jsonl"
+
+    if frames_jsonl.exists() and frames_jsonl.stat().st_size > 0:
+        return
+
+    LOGGER.info("[manifests] Missing or empty frames.jsonl detected. Generating automatically...")
+    manifests_dir.mkdir(parents=True, exist_ok=True)
+
+    embeddings_dir = experiment.run_dir / "embeddings"
+    json_ids_files = list(embeddings_dir.glob("frame_ids*.json")) if embeddings_dir.exists() else []
+
+    frames_records = []
+    videos_records = set()
+
+    if json_ids_files:
+        json_ids_file = json_ids_files[0]
+        LOGGER.info("[manifests] Reading frame IDs from %s...", json_ids_file.name)
+        try:
+            with open(json_ids_file, encoding="utf-8") as f:
+                frame_ids = json.load(f)
+
+            for fid in frame_ids:
+                parts = fid.split("_")
+                video_id = parts[0]
+                videos_records.add(video_id)
+                img_name = fid + ".jpg" if not fid.endswith(".jpg") else fid
+                expected_path = experiment.run_dir / "frames" / video_id / img_name
+                rel_path = (
+                    expected_path.relative_to(Path.cwd())
+                    if expected_path.is_relative_to(Path.cwd())
+                    else expected_path
+                )
+
+                match = re.search(r"_f(\d+)", fid)
+                f_num = int(match.group(1)) if match else 0
+                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
+
+                frames_records.append(
+                    {
+                        "frame_id": fid,
+                        "video_id": video_id,
+                        "shot_id": parts[1] if len(parts) > 2 else f"{video_id}_s0",
+                        "frame_index": f_num,
+                        "timestamp_sec": ts,
+                        "frame_path": str(rel_path).replace("\\", "/"),
+                    }
+                )
+        except Exception as exc:
+            LOGGER.warning("[manifests] Failed to parse %s: %s", json_ids_file, exc)
+
+    if not frames_records:
+        frames_dir = experiment.run_dir / "frames"
+        if frames_dir.exists():
+            LOGGER.info("[manifests] Scanning frames directory %s...", frames_dir)
+            for img_path in frames_dir.glob("*/*.jpg"):
+                video_id = img_path.parent.name
+                videos_records.add(video_id)
+                frame_id = f"{video_id}_{img_path.stem}"
+                match = re.search(r"_f(\d+)", frame_id)
+                f_num = int(match.group(1)) if match else 0
+                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
+
+                frames_records.append(
+                    {
+                        "frame_id": frame_id,
+                        "video_id": video_id,
+                        "shot_id": f"{video_id}_s0",
+                        "frame_index": f_num,
+                        "timestamp_sec": ts,
+                        "frame_path": str(img_path).replace("\\", "/"),
+                    }
+                )
+
+    if frames_records:
+        with open(frames_jsonl, "w", encoding="utf-8") as f:
+            for r in frames_records:
+                f.write(json.dumps(r) + "\n")
+
+        with open(videos_jsonl, "w", encoding="utf-8") as f:
+            for v_id in videos_records:
+                f.write(
+                    json.dumps(
+                        {
+                            "video_id": v_id,
+                            "path": f"data/videos/{v_id}.mp4",
+                            "checksum": "dummy_checksum",
+                            "size_bytes": 0,
+                        }
+                    )
+                    + "\n"
+                )
+
+        LOGGER.info(
+            "[manifests] Auto-generated %d frame records into %s", len(frames_records), frames_jsonl
+        )
+    else:
+        LOGGER.warning(
+            "[manifests] Could not auto-generate manifests (no frame_ids*.json or frames/ directory found)."
+        )
+
+
 def serve_ui(
     experiment: Experiment,
     host: str = "127.0.0.1",
@@ -63,6 +169,9 @@ def serve_ui(
 ) -> None:
     """Serve the local retrieval UI until interrupted."""
     from core.paths import set_project_root
+
+    # Ensure manifests exist so UI never has broken frame_path lookups
+    _ensure_manifests(experiment)
 
     # frame_path values in manifests are relative to the working directory the
     # pipeline was run from, not to experiment.run_dir (which can live outside
@@ -160,25 +269,55 @@ def build_handler(
                 try:
                     payload = self._read_json()
                     top_k = int(payload.get("top_k") or default_top_k)
-                    req_reranker_top_k = payload.get("reranker_top_k")
-                    req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
-                    shared = {
-                        "experiment": experiment,
-                        "context": str(payload.get("context", "")),
-                        "top_k": top_k,
-                        "reranker": reranker if req_reranker_top_k else None,
-                        "reranker_top_k": req_reranker_top_k or reranker_top_k,
-                    }
+                    window = int(payload.get("window", 15))
+                    events_raw = payload.get("events")
+                    if (
+                        parsed.path == "/api/trake-search"
+                        and isinstance(events_raw, list)
+                        and len(events_raw) >= 2
+                    ):
+                        from retrieval.trake_search import trake_bpj_search
 
-                    if parsed.path == "/api/enhanced-temporal-search":
-                        result = enhanced_temporal_search(
-                            query=str(payload.get("query", "")),
-                            max_events=int(payload.get("max_events") or 5),
-                            **shared,
+                        enabled_models = payload.get("enabled_models") or None
+                        use_reranker = payload.get("use_reranker")
+                        if use_reranker is not None:
+                            use_reranker = bool(use_reranker)
+                        use_llm = payload.get("use_llm")
+                        if use_llm is not None:
+                            use_llm = bool(use_llm)
+
+                        result = trake_bpj_search(
+                            experiment=experiment,
+                            events=events_raw,
+                            top_k=300,
+                            window=window,
+                            enabled_models=enabled_models,
+                            use_reranker=use_reranker,
+                            use_llm=use_llm,
                         )
                     else:
-                        result = trake_search(query=_events_to_query(payload), **shared)
+                        req_reranker_top_k = payload.get("reranker_top_k")
+                        req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+                        shared = {
+                            "experiment": experiment,
+                            "context": str(payload.get("context", "")),
+                            "top_k": top_k,
+                            "reranker": reranker if req_reranker_top_k else None,
+                            "reranker_top_k": req_reranker_top_k or reranker_top_k,
+                        }
+                        if parsed.path == "/api/enhanced-temporal-search":
+                            result = enhanced_temporal_search(
+                                query=str(payload.get("query", "")),
+                                max_events=int(payload.get("max_events") or 5),
+                                **shared,
+                            )
+                        else:
+                            result = trake_search(query=_events_to_query(payload), **shared)
 
+                    for video in result.get("videos", []):
+                        for ev in video.get("events", []):
+                            if ev.get("frame_path"):
+                                ev["image_url"] = f"/frame?path={quote(ev['frame_path'])}"
                     for r in result.get("results", []):
                         if r.get("frame_path"):
                             r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
@@ -361,6 +500,9 @@ def build_handler(
                 use_reranker = payload.get("use_reranker")
                 if use_reranker is not None:
                     use_reranker = bool(use_reranker)
+                use_llm = payload.get("use_llm")
+                if use_llm is not None:
+                    use_llm = bool(use_llm)
 
                 retrieval_text = build_retrieval_text(request)
                 results = retriever.search(
@@ -368,6 +510,7 @@ def build_handler(
                     top_k=top_k,
                     enabled_models=enabled_models,
                     use_reranker=use_reranker,
+                    use_llm=use_llm,
                 )
 
                 self._send_json(
@@ -436,62 +579,62 @@ def build_handler(
                 self._send_json({"error": "video_id required"}, status=HTTPStatus.BAD_REQUEST)
                 return
 
-            shots_path = experiment.run_dir / "manifests" / "shots.jsonl"
             frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
+            experiment.run_dir / "manifests" / "shots.jsonl"
 
             try:
-                # Parse shots for this video
-                shots = []
-                with open(shots_path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        shot = json.loads(line)
-                        if shot.get("video_id") == video_id:
-                            shots.append(shot)
-
-                # Parse frames for this video, grouped by shot_id
+                # Group frames by shot_id from frames.jsonl
                 frames_by_shot: dict[str, list[dict]] = {}
-                with open(frames_path, encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        frame = json.loads(line)
-                        if frame.get("video_id") == video_id:
-                            sid = frame.get("shot_id")
-                            if sid:
-                                frames_by_shot.setdefault(sid, []).append(frame)
+                shot_order: list[str] = []
+
+                if frames_path.is_file():
+                    with open(frames_path, encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            frame = json.loads(line)
+                            if frame.get("video_id") == video_id:
+                                sid = frame.get("shot_id") or "s0"
+                                if sid not in frames_by_shot:
+                                    frames_by_shot[sid] = []
+                                    shot_order.append(sid)
+
+                                ts = frame.get("timestamp_sec")
+                                idx = frame.get("frame_index")
+                                fid = frame.get("frame_id", "")
+                                match = re.search(r"_f(\d+)", fid)
+                                if match:
+                                    f_num = int(match.group(1))
+                                    ts = round(f_num / 25.0, 2)
+                                    if idx is None or idx == 0:
+                                        idx = f_num
+
+                                frame_copy = dict(frame)
+                                frame_copy["timestamp_sec"] = ts if ts is not None else 0.0
+                                frame_copy["frame_index"] = idx if idx is not None else 0
+                                frames_by_shot[sid].append(frame_copy)
 
                 shot_list = []
-                for shot in shots:
-                    sid = shot.get("shot_id")
-                    shot_frames = frames_by_shot.get(sid, [])
+                for sid in shot_order:
+                    shot_frames = frames_by_shot[sid]
                     shot_frames.sort(key=lambda x: x.get("frame_index", 0))
-
-                    # Pick 3 frames evenly distributed (or fewer if less available)
-                    if len(shot_frames) > 3:
-                        indices = [0, len(shot_frames) // 2, len(shot_frames) - 1]
-                        picked = [shot_frames[i] for i in indices]
-                    else:
-                        picked = shot_frames
 
                     shot_data = {
                         "shot_id": sid,
-                        "start_frame": shot.get("start_frame"),
-                        "end_frame": shot.get("end_frame"),
-                        "start_time_sec": shot.get("start_time_sec"),
-                        "end_time_sec": shot.get("end_time_sec"),
+                        "start_frame": shot_frames[0].get("frame_index", 0),
+                        "end_frame": shot_frames[-1].get("frame_index", 0),
+                        "start_time_sec": shot_frames[0].get("timestamp_sec", 0.0),
+                        "end_time_sec": shot_frames[-1].get("timestamp_sec", 0.0),
                         "frames": [
                             {
                                 "frame_id": f.get("frame_id"),
-                                "frame_index": f.get("frame_index"),
-                                "timestamp_sec": f.get("timestamp_sec"),
+                                "frame_index": f.get("frame_index", 0),
+                                "timestamp_sec": f.get("timestamp_sec", 0.0),
                                 "frame_path": f.get("frame_path"),
                                 "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
                             }
-                            for f in picked
+                            for f in shot_frames
                         ],
                     }
                     shot_list.append(shot_data)
@@ -701,6 +844,7 @@ INDEX_HTML = r"""<!doctype html>
         <label class="check"><input type="checkbox" name="model_siglip2-so400m" checked> SigLIP2</label>
         <label class="check"><input type="checkbox" name="model_vietnamese-embedding" checked> Vietnamese-Embedding</label>
         <label class="check"><input type="checkbox" id="use-reranker" checked> Rerank BLIP-2</label>
+        <label class="check"><input type="checkbox" id="use-llm" checked> Enhance bằng Qwen</label>
       </div>
       <label for="query">Query</label>
       <textarea id="query" name="query">a person riding a motorbike</textarea>
@@ -753,6 +897,32 @@ INDEX_HTML = r"""<!doctype html>
       <div id="events-box"></div>
       <div id="pipeline-box"></div>
       <div id="results" class="results"></div>
+      <!-- Modal -->
+      <div id="frame-modal">
+        <div class="modal-box" id="modal-box">
+          <div class="modal-top">
+            <span id="modal-title">Loading...</span>
+            <span id="modal-time" class="time-badge"></span>
+            <button class="close-x" id="modal-close-x">&times;</button>
+          </div>
+          <div class="modal-mid">
+            <button class="modal-nav" id="modal-prev" title="Shot trước (←)">&#9664;</button>
+            <div class="img-area">
+              <img id="modal-img" src="" alt="Frame preview">
+            </div>
+            <button class="modal-nav" id="modal-next" title="Shot tiếp (→)">&#9654;</button>
+          </div>
+          <div class="modal-strip" id="modal-strip"></div>
+          <div class="modal-bot">
+            <span id="modal-footer"></span>
+            <div class="actions">
+              <button class="btn-setthumb" id="btn-setthumb">Làm thumbnail</button>
+              <button class="btn-revert-modal" id="btn-revert-modal" style="display:none">Revert</button>
+              <button class="btn-close-modal" id="btn-close-modal">Đóng (Esc)</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
   </main>
   <script>
@@ -923,7 +1093,15 @@ INDEX_HTML = r"""<!doctype html>
       const events = getEvents();
       if (events.length < 2) { statusEl.className="status warn"; statusEl.textContent="Need at least 2 events."; submitEl.disabled=false; return; }
       lastTrakeInput = events;
-      endpoint = "/api/trake-search"; payload = { events, top_k: 300, window: Number(eid("window-slider").value) };
+      endpoint = "/api/trake-search";
+      payload = {
+        events,
+        top_k: 300,
+        window: Number(eid("window-slider").value),
+        enabled_models: getEnabledModels(),
+        use_reranker: eid("use-reranker").checked,
+        use_llm: eid("use-llm").checked,
+      };
     } else if (track === "kis_detail_2stage") {
       const { general, specific } = get2StageEvents();
       if (general.length < 1) { statusEl.className="status warn"; statusEl.textContent="Need at least 1 general subquery."; submitEl.disabled=false; return; }
@@ -949,6 +1127,7 @@ INDEX_HTML = r"""<!doctype html>
       payload = {
         track, query: form.query.value, context: form.context.value, question: form.question.value,
         top_k: 300, enabled_models: getEnabledModels(), use_reranker: eid("use-reranker").checked,
+        use_llm: eid("use-llm").checked,
       };
     }
 
@@ -983,16 +1162,23 @@ INDEX_HTML = r"""<!doctype html>
         sidebarAnswer.style.display = "block";
         sidebarAnswerText.textContent = data.answer;
       } else if (track === "trake" || track === "temporal_enhanced") {
-        const eventCount = (data.events || []).length;
-        const extracted = data.extracted_events || [];
-        const label = track === "trake" ? "TRAKE" : "Temporal Enhanced";
-        const extractedNote = extracted.length
-          ? ` · LLM tách: ${extracted.map(escapeHtml).join(" → ")}`
-          : "";
-        statusEl.innerHTML = `<strong>${eventCount}</strong> event(s) found <span class="pill">${label}</span>${extractedNote}`;
-        renderTrakeEvents(data.events || []);
-        renderPipeline(data);
-        renderResults(data.results || []);
+        if (data.videos) {
+          const chains = data.videos || [];
+          const uniqueVideos = new Set(chains.map(v => v.video_id)).size;
+          statusEl.innerHTML = `<strong>${chains.length}</strong> chain(s) from <strong>${uniqueVideos}</strong> video(s) match all events <span class="pill">TRAKE</span>`;
+          renderTrake(data);
+        } else {
+          const eventCount = (data.events || []).length;
+          const extracted = data.extracted_events || [];
+          const label = track === "trake" ? "TRAKE" : "Temporal Enhanced";
+          const extractedNote = extracted.length
+            ? ` · LLM tách: ${extracted.map(escapeHtml).join(" → ")}`
+            : "";
+          statusEl.innerHTML = `<strong>${eventCount}</strong> event(s) found <span class="pill">${label}</span>${extractedNote}`;
+          renderTrakeEvents(data.events || []);
+          renderPipeline(data);
+          renderResults(data.results || []);
+        }
       } else if (track === "kis_detail_2stage") {
         const results = data.results || [];
         statusEl.innerHTML = `<strong>${results.length}</strong> frames match all details <span class="pill">KIS Detail 2-Stage</span>`;
@@ -1060,6 +1246,59 @@ INDEX_HTML = r"""<!doctype html>
       `;
     }
 
+  const thumbState = {};
+  function trakeKey(videoId, chainIdx, eventIdx) { return videoId + "::" + chainIdx + "::" + eventIdx; }
+
+  function renderTrake(data) {
+    const videos = data.videos || [];
+    if (!videos.length) {
+      resultsEl.innerHTML = `<div class="hint" style="padding:20px;text-align:center;">No video found matching all events.</div>`;
+      return;
+    }
+    resultsEl.innerHTML = videos.map((video, vi) => {
+      const cols = Math.min(video.events.length, 5);
+      const evHtml = (video.events||[]).map((ev, ei) => {
+        const key = trakeKey(video.video_id, vi, ei);
+        if (!thumbState[key]) {
+          thumbState[key] = {
+            originalUrl: ev.image_url||"", originalFrameId: ev.frame_id||"",
+            originalTimestamp: ev.timestamp_sec,
+            currentUrl: ev.image_url||"", currentTimestamp: ev.timestamp_sec,
+            currentFrameId: ev.frame_id||"",
+            rank: ev.rank,
+            videoId: video.video_id,
+            chainIdx: vi,
+            eventIdx: ei,
+          };
+        }
+        const st = thumbState[key];
+        const url = st.currentUrl;
+        const isCustom = url !== st.originalUrl;
+        const safeKey = key.replaceAll("::","__");
+
+        return `
+          <div class="ev-card${isCustom?" has-custom":""}" id="evcard-${safeKey}">
+            <img src="${escapeHtml(url)}" alt="Event ${ei+1}" loading="lazy"
+              id="evimg-${safeKey}"
+              onclick="openModalFromCard('${safeKey}')">
+            <button class="revert-badge" onclick="revertCard('${escapeHtml(video.video_id)}',${vi},${ei})">&#x21a9; Revert</button>
+            <div class="ev-info">
+              <span id="evinfo-text-${safeKey}"><strong>Event ${ei+1}</strong> &middot; rank ${st.rank} &middot; ${formatTime(st.currentTimestamp)}</span>
+              ${isCustom?`<span class="pill" style="font-size:10px">CUSTOM</span>`:""}
+            </div>
+          </div>`;
+      }).join("");
+      return `
+        <div class="video-block">
+          <div class="video-block-header">
+            <strong style="font-size:15px">#${vi+1} ${escapeHtml(video.video_name||video.video_id)}</strong>
+            <span class="pill">Score: ${video.score} ${video.temporal_order_valid?"✓ temporal":"✗ temporal"}</span>
+          </div>
+          <div class="event-grid" style="grid-template-columns:repeat(${cols},1fr)">${evHtml}</div>
+        </div>`;
+    }).join("");
+  }
+
     function renderTrakeEvents(events) {
       if (!events.length) return;
       const html = events.map((ev, i) => `
@@ -1085,19 +1324,54 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function renderResults(results) {
-      resultsEl.innerHTML = results.map((result, index) => `
+      if (!results || !results.length) {
+        resultsEl.innerHTML = `<div class="hint" style="padding:20px;text-align:center;">No matching results found.</div>`;
+        return;
+      }
+      resultsEl.innerHTML = results.map((result, index) => {
+        // Sub-scores for 2-stage or multi-query
+        const subs = result.sub_scores || result.subquery_scores || {};
+        const subKeys = Object.keys(subs);
+        const subBadgesHtml = subKeys.length > 0
+          ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">${subKeys.map(k => `<span class="pill" style="font-size:10px;background:#eef2ff;color:#4338ca;">${escapeHtml(k.replace('sub_',''))}: ${Number(subs[k]).toFixed(3)}</span>`).join('')}</div>`
+          : "";
+
+        // Component scores for Intelligent fusion
+        const compHtml = (result.kis_score || result.ocr_score || result.asr_score)
+          ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">
+              ${result.kis_score ? `<span class="pill" style="font-size:10px;background:#e0f2fe;color:#0369a1;">KIS ${Number(result.kis_score).toFixed(3)}</span>` : ""}
+              ${result.ocr_score ? `<span class="pill" style="font-size:10px;background:#fef3c7;color:#b45309;">OCR ${Number(result.ocr_score).toFixed(3)}</span>` : ""}
+              ${result.asr_score ? `<span class="pill" style="font-size:10px;background:#f3e8ff;color:#6b21a8;">ASR ${Number(result.asr_score).toFixed(3)}</span>` : ""}
+            </div>`
+          : "";
+
+        // Source badge
+        const srcBadge = result.source
+          ? `<span class="pill" style="font-size:10px;margin-left:6px;">${escapeHtml(result.source.toUpperCase())}</span>`
+          : "";
+
+        // Text snippet
+        const textContent = result.text || result.matched_text || result.ocr_text || result.asr_text || "";
+        const textHtml = textContent
+          ? `<div style="margin-top:6px;padding:4px 8px;font-size:12px;background:#f8fafc;border-left:3px solid var(--accent);border-radius:4px;color:var(--text);">${escapeHtml(textContent.slice(0, 160))}</div>`
+          : "";
+
+        return `
         <article class="card">
-          <img src="${escapeHtml(result.image_url || "")}" alt="Result frame ${index + 1}" loading="lazy">
+          <img src="${escapeHtml(result.image_url || "")}" alt="Result frame ${index + 1}" loading="lazy"
+            onclick="openModal('${escapeHtml(result.image_url || "")}','${escapeHtml(result.video_id || "")}','${escapeHtml(result.frame_id || "")}',null,null)">
           <div class="meta">
-            <div><strong>#${index + 1}</strong> score ${Number(result.score).toFixed(4)}</div>
-            <div>${formatTime(result.timestamp_sec)}</div>
+            <div><strong>#${index + 1}</strong> score ${Number(result.score).toFixed(4)} ${srcBadge}</div>
+            <div>${formatTime(result.timestamp_sec)} · frame ${formatNumber(result.frame_index)}</div>
             <div><strong>${escapeHtml(result.video_name || result.video_id || "")}</strong></div>
-            <div>frame ${formatNumber(result.frame_index)} · shot ${escapeHtml(result.shot_id || "")}</div>
-            <code>${escapeHtml(result.video_path || "")}</code>
+            <div>shot ${escapeHtml(result.shot_id || "s0")}</div>
             <code>${escapeHtml(result.frame_id || "")}</code>
-            ${result.text ? `<div style="margin-top:4px;font-size:12px;color:var(--muted);">${escapeHtml(result.text.slice(0, 140))}</div>` : ""}
+            ${subBadgesHtml}
+            ${compHtml}
+            ${textHtml}
           </div>
-        </article>`).join("");
+        </article>`;
+      }).join("");
     }
 
   function revertCard(videoId, chainIdx, eventIdx) {
@@ -1244,9 +1518,12 @@ INDEX_HTML = r"""<!doctype html>
         onclick="selectStrip(event,${fi})" title="${fmtTime(f.timestamp_sec)}">`
     ).join("");
 
-    // Nav buttons
-    eid("modal-prev").disabled = modal.shotIdx <= 0;
-    eid("modal-next").disabled = modal.shotIdx >= modal.shots.length - 1;
+    // Nav buttons disabled status
+    const isFirst = modal.shotIdx <= 0 && modal.frameIdx <= 0;
+    const currentShotFrames = shot.frames || [];
+    const isLast = modal.shotIdx >= modal.shots.length - 1 && modal.frameIdx >= currentShotFrames.length - 1;
+    eid("modal-prev").disabled = isFirst;
+    eid("modal-next").disabled = isLast;
 
     // Thumbnail buttons (only for TRAKE)
     if (modal.eventIdx !== null && modal.eventIdx !== undefined) {
@@ -1257,6 +1534,93 @@ INDEX_HTML = r"""<!doctype html>
       eid("btn-revert-modal").style.display = isCustom ? "inline-block" : "none";
     }
   }
+
+  // ─── Continuous Frame Navigation (Next / Previous Frame) ──────────────────────
+  function prevFrame() {
+    if (!modal.shots.length) return;
+    if (modal.frameIdx > 0) {
+      modal.frameIdx--;
+    } else if (modal.shotIdx > 0) {
+      modal.shotIdx--;
+      const prevShotFrames = modal.shots[modal.shotIdx]?.frames || [];
+      modal.frameIdx = Math.max(0, prevShotFrames.length - 1);
+    }
+    renderModal();
+  }
+
+  function nextFrame() {
+    if (!modal.shots.length) return;
+    const currentShotFrames = modal.shots[modal.shotIdx]?.frames || [];
+    if (modal.frameIdx < currentShotFrames.length - 1) {
+      modal.frameIdx++;
+    } else if (modal.shotIdx < modal.shots.length - 1) {
+      modal.shotIdx++;
+      modal.frameIdx = 0;
+    }
+    renderModal();
+  }
+
+  // ─── Strip click ─────────────────────────────────────────────────────────────
+  function selectStrip(e, fi) {
+    if (e && e.stopPropagation) e.stopPropagation();
+    modal.frameIdx = fi;
+    renderModal();
+  }
+
+  // ─── Navigation button click handlers ───────────────────────────────────────
+  eid("modal-prev").addEventListener("click", e => {
+    e.stopPropagation();
+    prevFrame();
+  });
+  eid("modal-next").addEventListener("click", e => {
+    e.stopPropagation();
+    nextFrame();
+  });
+
+  // ─── Set thumbnail ───────────────────────────────────────────────────────────
+  eid("btn-setthumb").addEventListener("click", () => {
+    if (!modal.shots.length || modal.eventIdx === null) return;
+    const frame = modal.shots[modal.shotIdx].frames[modal.frameIdx];
+    const key = trakeKey(modal.videoId, modal.chainIdx, modal.eventIdx);
+    if (!thumbState[key]) return;
+    thumbState[key].currentUrl = frame.image_url;
+    thumbState[key].currentTimestamp = frame.timestamp_sec;
+    thumbState[key].currentFrameId = frame.frame_id;
+    refreshCard(modal.videoId, modal.chainIdx, modal.eventIdx);
+    renderModal();
+    statusEl.innerHTML = `<strong>Thumbnail updated</strong> — Event ${modal.eventIdx+1} <span class="pill">CUSTOM</span>`;
+  });
+
+  // ─── Revert from modal ───────────────────────────────────────────────────────
+  eid("btn-revert-modal").addEventListener("click", () => {
+    if (modal.eventIdx === null) return;
+    revertCard(modal.videoId, modal.chainIdx, modal.eventIdx);
+    renderModal();
+  });
+
+  // ─── Close modal ─────────────────────────────────────────────────────────────
+  function closeModal() {
+    eid("frame-modal").style.display = "none";
+    eid("modal-img").src = "";
+    modal.open = false;
+    modal.shots = [];
+  }
+  eid("modal-close-x").addEventListener("click", closeModal);
+  eid("btn-close-modal").addEventListener("click", closeModal);
+  eid("frame-modal").addEventListener("click", e => {
+    if (e.target === eid("frame-modal")) closeModal();
+  });
+  eid("modal-box").addEventListener("click", e => e.stopPropagation());
+
+  // ─── Keyboard shortcuts ───────────────────────────────────────────────────────
+  document.addEventListener("keydown", e => {
+    if (!modal.open) return;
+    if (e.key === "Escape") { closeModal(); return; }
+    if (e.key === "ArrowLeft") { e.preventDefault(); prevFrame(); }
+    if (e.key === "ArrowRight") { e.preventDefault(); nextFrame(); }
+    if (e.key === "ArrowUp" && modal.shotIdx > 0) { e.preventDefault(); modal.shotIdx--; modal.frameIdx = 0; renderModal(); }
+    if (e.key === "ArrowDown" && modal.shotIdx < modal.shots.length - 1) { e.preventDefault(); modal.shotIdx++; modal.frameIdx = 0; renderModal(); }
+  });
 
   // Toggle VQA settings visibility
   form.track.addEventListener('change', (e) => {

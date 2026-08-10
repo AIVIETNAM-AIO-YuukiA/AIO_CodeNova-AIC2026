@@ -94,10 +94,16 @@ class QdrantVectorIndex(VectorIndex):
         )
         results: list[SearchResult] = []
         for hit in response.points:
-            frame_id = (hit.payload or {}).get("frame_id")
+            payload = hit.payload or {}
+            frame_id = payload.get("frame_id")
             if frame_id is None:
                 continue
-            results.append(frame_result(str(frame_id), float(hit.score)))
+            res = frame_result(str(frame_id), float(hit.score))
+            if payload.get("frame_path"):
+                import dataclasses
+
+                res = dataclasses.replace(res, frame_path=payload["frame_path"])
+            results.append(res)
         return results
 
     def _connect(self):
