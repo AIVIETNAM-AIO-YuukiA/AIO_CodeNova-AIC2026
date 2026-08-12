@@ -105,6 +105,18 @@ class SearchResult:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RetrievalQuery:
+    """Structured query representation for retrieval."""
+
+    text: str = ""
+
+    def to_search_string(self) -> str:
+        """Convert query object to plain search text string."""
+        return self.text
+
+
+
 def _optional_float(value: object) -> float | None:
     if value is None:
         return None
