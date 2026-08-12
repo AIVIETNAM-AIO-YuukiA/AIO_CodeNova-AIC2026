@@ -183,11 +183,79 @@ def events_to_query(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def result_to_payload(result: SearchResult) -> dict[str, object]:
+_VIDEO_NAME_CACHE: dict[str, str] = {}
+_CAPTIONS_CACHE: dict[str, str] = {}
+_TEXT_CACHE: list[dict] = []
+
+def _get_video_name_map(experiment: Experiment) -> dict[str, str]:
+    global _VIDEO_NAME_CACHE
+    if not _VIDEO_NAME_CACHE:
+        v_file = experiment.run_dir / "manifests" / "videos.jsonl"
+        if v_file.is_file():
+            try:
+                with open(v_file, encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        rec = json.loads(line)
+                        vid = rec.get("video_id")
+                        vpath = rec.get("path")
+                        if vid and vpath:
+                            _VIDEO_NAME_CACHE[vid] = Path(vpath).name
+            except Exception:
+                pass
+    return _VIDEO_NAME_CACHE
+
+def _get_captions_map(experiment: Experiment) -> dict[str, str]:
+    global _CAPTIONS_CACHE
+    if not _CAPTIONS_CACHE:
+        c_file = experiment.run_dir / "manifests" / "captions.jsonl"
+        if c_file.is_file():
+            try:
+                with open(c_file, encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        rec = json.loads(line)
+                        fid = rec.get("frame_id")
+                        cap = rec.get("caption")
+                        if fid and cap:
+                            _CAPTIONS_CACHE[fid] = cap
+            except Exception:
+                pass
+    return _CAPTIONS_CACHE
+
+def _get_text_records(experiment: Experiment) -> list[dict]:
+    global _TEXT_CACHE
+    if not _TEXT_CACHE:
+        t_file = experiment.run_dir / "manifests" / "text.jsonl"
+        if t_file.is_file():
+            try:
+                with open(t_file, encoding="utf-8") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        _TEXT_CACHE.append(json.loads(line))
+            except Exception:
+                pass
+    return _TEXT_CACHE
+
+
+def result_to_payload(result: SearchResult, experiment: Experiment | None = None) -> dict[str, object]:
     """Serialize a result for the browser UI."""
     payload = result.to_dict()
     if result.frame_path:
         payload["image_url"] = f"/frame?path={quote(result.frame_path)}"
+    
+    if experiment:
+        vmap = _get_video_name_map(experiment)
+        if result.video_id in vmap:
+            payload["video_name"] = vmap[result.video_id]
+        elif not payload.get("video_name"):
+            payload["video_name"] = result.video_id
+    elif not payload.get("video_name"):
+        payload["video_name"] = result.video_id
+
     return payload
 
 
@@ -410,32 +478,34 @@ def handle_default_search(
         "track": request.track,
         "track_label": SUPPORTED_TRACKS.get(request.track, request.track),
         "retrieval_text": retrieval_text,
-        "results": [result_to_payload(result) for result in results],
+        "results": [result_to_payload(result, experiment) for result in results],
     }
 
 
-def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPStatus]:
-    """Process /api/video-shots GET endpoint."""
-    video_id = query.get("video_id", [""])[0]
-    if not video_id:
-        return {"error": "video_id required"}, HTTPStatus.BAD_REQUEST
+_FRAMES_BY_VIDEO_CACHE: dict[str, tuple[list[str], dict[str, list[dict]]]] = {}
+_VIDEO_TEXT_CACHE: dict[str, tuple[list[dict], list[dict]]] = {}
 
-    frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
-    experiment.run_dir / "manifests" / "shots.jsonl"
-
-    try:
-        frames_by_shot: dict[str, list[dict]] = {}
-        shot_order: list[str] = []
-
+def _get_frames_by_video(experiment: Experiment, video_id: str) -> tuple[list[str], dict[str, list[dict]]]:
+    global _FRAMES_BY_VIDEO_CACHE
+    if not _FRAMES_BY_VIDEO_CACHE:
+        frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
         if frames_path.is_file():
-            with open(frames_path, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    frame = json.loads(line)
-                    if frame.get("video_id") == video_id:
+            try:
+                with open(frames_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        frame = json.loads(line)
+                        vid = frame.get("video_id")
+                        if not vid:
+                            continue
                         sid = frame.get("shot_id") or "s0"
+
+                        if vid not in _FRAMES_BY_VIDEO_CACHE:
+                            _FRAMES_BY_VIDEO_CACHE[vid] = ([], {})
+
+                        shot_order, frames_by_shot = _FRAMES_BY_VIDEO_CACHE[vid]
                         if sid not in frames_by_shot:
                             frames_by_shot[sid] = []
                             shot_order.append(sid)
@@ -454,11 +524,77 @@ def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPS
                         frame_copy["timestamp_sec"] = ts if ts is not None else 0.0
                         frame_copy["frame_index"] = idx if idx is not None else 0
                         frames_by_shot[sid].append(frame_copy)
+            except Exception:
+                LOGGER.exception("Failed to build frames by video cache")
 
+    return _FRAMES_BY_VIDEO_CACHE.get(video_id, ([], {}))
+
+
+def _get_video_text_texts(experiment: Experiment, video_id: str) -> tuple[list[dict], list[dict]]:
+    global _VIDEO_TEXT_CACHE
+    if not _VIDEO_TEXT_CACHE:
+        text_records = _get_text_records(experiment)
+        for txt in text_records:
+            vid = txt.get("video_id")
+            if not vid:
+                continue
+            if vid not in _VIDEO_TEXT_CACHE:
+                _VIDEO_TEXT_CACHE[vid] = ([], [])
+            src = txt.get("source", "asr")
+            rec = {
+                "text": txt.get("text"),
+                "timestamp_sec": txt.get("timestamp_sec", 0.0),
+                "frame_id": txt.get("frame_id"),
+            }
+            if src == "ocr":
+                _VIDEO_TEXT_CACHE[vid][1].append(rec)
+            else:
+                _VIDEO_TEXT_CACHE[vid][0].append(rec)
+    return _VIDEO_TEXT_CACHE.get(video_id, ([], []))
+
+
+def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPStatus]:
+    """Process /api/video-shots GET endpoint."""
+    video_id = query.get("video_id", [""])[0]
+    if not video_id:
+        return {"error": "video_id required"}, HTTPStatus.BAD_REQUEST
+
+    vmap = _get_video_name_map(experiment)
+    video_name = vmap.get(video_id, video_id)
+
+    captions_map = _get_captions_map(experiment)
+    shot_order, frames_by_shot = _get_frames_by_video(experiment, video_id)
+    video_asr_texts, video_ocr_texts = _get_video_text_texts(experiment, video_id)
+
+    try:
         shot_list = []
         for sid in shot_order:
             shot_frames = frames_by_shot[sid]
-            shot_frames.sort(key=lambda x: x.get("frame_index", 0))
+
+            formatted_frames = []
+            for f in shot_frames:
+                fid = f.get("frame_id", "")
+                fts = f.get("timestamp_sec", 0.0)
+
+                matched_asr = [
+                    a["text"] for a in video_asr_texts
+                    if abs(a["timestamp_sec"] - fts) <= 25.0
+                ]
+                matched_ocr = [
+                    o["text"] for o in video_ocr_texts
+                    if o["frame_id"] == fid or abs(o["timestamp_sec"] - fts) <= 5.0
+                ]
+
+                formatted_frames.append({
+                    "frame_id": fid,
+                    "frame_index": f.get("frame_index", 0),
+                    "timestamp_sec": fts,
+                    "frame_path": f.get("frame_path"),
+                    "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
+                    "caption": captions_map.get(fid, ""),
+                    "asr": " | ".join(matched_asr) if matched_asr else "",
+                    "ocr": " | ".join(matched_ocr) if matched_ocr else "",
+                })
 
             shot_data = {
                 "shot_id": sid,
@@ -466,20 +602,12 @@ def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPS
                 "end_frame": shot_frames[-1].get("frame_index", 0),
                 "start_time_sec": shot_frames[0].get("timestamp_sec", 0.0),
                 "end_time_sec": shot_frames[-1].get("timestamp_sec", 0.0),
-                "frames": [
-                    {
-                        "frame_id": f.get("frame_id"),
-                        "frame_index": f.get("frame_index", 0),
-                        "timestamp_sec": f.get("timestamp_sec", 0.0),
-                        "frame_path": f.get("frame_path"),
-                        "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
-                    }
-                for f in shot_frames
-            ],
-        }
+                "frames": formatted_frames,
+            }
             shot_list.append(shot_data)
 
-        return {"video_id": video_id, "shots": shot_list}, HTTPStatus.OK
+        return {"video_id": video_id, "video_name": video_name, "shots": shot_list}, HTTPStatus.OK
     except Exception:
         LOGGER.exception("Failed to load shots for video=%s", video_id)
-        return {"video_id": video_id, "shots": []}, HTTPStatus.OK
+        return {"video_id": video_id, "video_name": video_name, "shots": []}, HTTPStatus.OK
+

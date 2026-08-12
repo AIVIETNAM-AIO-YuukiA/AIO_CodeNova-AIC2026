@@ -6,8 +6,11 @@ MODAL_HTML = r"""      <!-- Modal -->
       <div id="frame-modal">
         <div class="modal-box" id="modal-box">
           <div class="modal-top">
-            <span id="modal-title">Loading...</span>
-            <span id="modal-time" class="time-badge"></span>
+            <div class="modal-title-group">
+              <span id="modal-title">Loading...</span>
+              <span id="modal-sub-id" class="sub-id-badge"></span>
+              <span id="modal-time" class="time-badge"></span>
+            </div>
             <button class="close-x" id="modal-close-x">&times;</button>
           </div>
           <div class="modal-mid">
@@ -16,6 +19,24 @@ MODAL_HTML = r"""      <!-- Modal -->
               <img id="modal-img" src="" alt="Frame preview">
             </div>
             <button class="modal-nav" id="modal-next" title="Shot tiếp (→)">&#9654;</button>
+            <div class="modal-details-side" id="modal-details-side">
+              <div class="modal-section" id="modal-scores-section" style="display:none;">
+                <div class="modal-section-title">📊 Chi tiết Điểm Subquery / Component</div>
+                <div id="modal-scores-text" class="modal-section-content">--</div>
+              </div>
+              <div class="modal-section">
+                <div class="modal-section-title">📸 Caption (Mô tả thị giác)</div>
+                <div id="modal-caption-text" class="modal-section-content">--</div>
+              </div>
+              <div class="modal-section">
+                <div class="modal-section-title">🔤 OCR (Chữ trên màn hình)</div>
+                <div id="modal-ocr-text" class="modal-section-content">--</div>
+              </div>
+              <div class="modal-section">
+                <div class="modal-section-title">🎙️ ASR (Thoại audio)</div>
+                <div id="modal-asr-text" class="modal-section-content">--</div>
+              </div>
+            </div>
           </div>
           <div class="modal-strip" id="modal-strip"></div>
           <div class="modal-bot">

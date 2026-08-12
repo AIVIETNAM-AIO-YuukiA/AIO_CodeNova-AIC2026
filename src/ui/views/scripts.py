@@ -17,7 +17,11 @@ APP_JS = r"""
       return `${mm}:${String(ss).padStart(2, "0")}`;
     }
     function fmtTime(seconds) { return formatTime(seconds); }
-    function formatNumber(n) { return Number(n).toLocaleString(); }
+    function cleanVideoName(name) {
+      if (!name) return "";
+      const parts = String(name).split(/[/\\]/);
+      return parts[parts.length - 1];
+    }
 
     const form = document.getElementById("search-form");
     const statusEl = document.getElementById("status");
@@ -398,52 +402,38 @@ APP_JS = r"""
       document.getElementById("pipeline-detail").classList.toggle("open");
     }
 
+    let lastSearchResultsMap = {};
+
     function renderResults(results) {
       if (!results || !results.length) {
         resultsEl.innerHTML = `<div class="hint" style="padding:20px;text-align:center;">No matching results found.</div>`;
         return;
       }
+      lastSearchResultsMap = {};
       resultsEl.innerHTML = results.map((result, index) => {
-        // Sub-scores for 2-stage or multi-query
-        const subs = result.sub_scores || result.subquery_scores || {};
-        const subKeys = Object.keys(subs);
-        const subBadgesHtml = subKeys.length > 0
-          ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">${subKeys.map(k => `<span class="pill" style="font-size:10px;background:#eef2ff;color:#4338ca;">${escapeHtml(k.replace('sub_',''))}: ${Number(subs[k]).toFixed(3)}</span>`).join('')}</div>`
-          : "";
-
-        // Component scores for Intelligent fusion
-        const compHtml = (result.kis_score || result.ocr_score || result.asr_score)
-          ? `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px;">
-              ${result.kis_score ? `<span class="pill" style="font-size:10px;background:#e0f2fe;color:#0369a1;">KIS ${Number(result.kis_score).toFixed(3)}</span>` : ""}
-              ${result.ocr_score ? `<span class="pill" style="font-size:10px;background:#fef3c7;color:#b45309;">OCR ${Number(result.ocr_score).toFixed(3)}</span>` : ""}
-              ${result.asr_score ? `<span class="pill" style="font-size:10px;background:#f3e8ff;color:#6b21a8;">ASR ${Number(result.asr_score).toFixed(3)}</span>` : ""}
-            </div>`
-          : "";
-
-        // Source badge
-        const srcBadge = result.source
-          ? `<span class="pill" style="font-size:10px;margin-left:6px;">${escapeHtml(result.source.toUpperCase())}</span>`
-          : "";
-
-        // Text snippet
-        const textContent = result.text || result.matched_text || result.ocr_text || result.asr_text || "";
-        const textHtml = textContent
-          ? `<div style="margin-top:6px;padding:4px 8px;font-size:12px;background:#f8fafc;border-left:3px solid var(--accent);border-radius:4px;color:var(--text);">${escapeHtml(textContent.slice(0, 160))}</div>`
-          : "";
+        if (result.frame_id) {
+          lastSearchResultsMap[result.frame_id] = result;
+        }
+        const rawVideoName = result.video_name || result.video_id || "Video";
+        const videoName = cleanVideoName(rawVideoName);
+        const scoreStr = result.score != null ? Number(result.score).toFixed(4) : "1.0000";
+        const frameNum = result.frame_index != null ? `f${result.frame_index}` : "f0";
+        const timeStr = formatTime(result.timestamp_sec || 0);
 
         return `
         <article class="card">
           <img src="${escapeHtml(result.image_url || "")}" alt="Result frame ${index + 1}" loading="lazy"
             onclick="openModal('${escapeHtml(result.image_url || "")}','${escapeHtml(result.video_id || "")}','${escapeHtml(result.frame_id || "")}',null,null)">
-          <div class="meta">
-            <div><strong>#${index + 1}</strong> score ${Number(result.score).toFixed(4)} ${srcBadge}</div>
-            <div>${formatTime(result.timestamp_sec)} · frame ${formatNumber(result.frame_index)}</div>
-            <div><strong>${escapeHtml(result.video_name || result.video_id || "")}</strong></div>
-            <div>shot ${escapeHtml(result.shot_id || "s0")}</div>
-            <code>${escapeHtml(result.frame_id || "")}</code>
-            ${subBadgesHtml}
-            ${compHtml}
-            ${textHtml}
+          <div class="card-meta">
+            <div class="card-header-row">
+              <span class="card-rank">#${index + 1}</span>
+              <span class="card-score">score ${scoreStr}</span>
+            </div>
+            <div class="card-vname" title="${escapeHtml(videoName)}">📹 ${escapeHtml(videoName)}</div>
+            <div class="card-info-row">
+              <span class="card-frame-badge">${frameNum}</span>
+              <span>⏱️ ${timeStr} (${Number(result.timestamp_sec || 0).toFixed(1)}s)</span>
+            </div>
           </div>
         </article>`;
       }).join("");
@@ -498,10 +488,11 @@ APP_JS = r"""
   // ─── Modal state ──────────────────────────────────────────────────────────────
   const modal = {
     open: false,
-    shots: [],        // [{shot_id, frames:[{frame_id, frame_index, timestamp_sec, image_url}]}]
+    shots: [],        // [{shot_id, frames:[{frame_id, frame_index, timestamp_sec, image_url, caption, ocr, asr}]}]
     shotIdx: 0,
     frameIdx: 0,
     videoId: "",
+    videoName: "",
     chainIdx: null,   // null for non-trake cards
     eventIdx: null,   // null for non-trake cards
   };
@@ -519,6 +510,7 @@ APP_JS = r"""
     // Show modal immediately with the clicked image
     modal.open = true;
     modal.videoId = videoId;
+    modal.videoName = "";
     modal.chainIdx = chainIdx != null ? chainIdx : null;
     modal.eventIdx = eventIdx;
     modal.shots = [];
@@ -527,11 +519,13 @@ APP_JS = r"""
 
     const modalEl = eid("frame-modal");
     modalEl.style.display = "flex";
+    modalEl.classList.add("open");
 
     const imgEl = eid("modal-img");
     imgEl.src = imgSrc;
 
     eid("modal-title").textContent = "Loading shots…";
+    if (eid("modal-sub-id")) eid("modal-sub-id").textContent = "";
     eid("modal-time").textContent = "";
     eid("modal-footer").textContent = "";
     eid("modal-strip").innerHTML = "";
@@ -547,6 +541,7 @@ APP_JS = r"""
     fetch("/api/video-shots?video_id=" + encodeURIComponent(videoId))
       .then(r => r.json())
       .then(data => {
+        modal.videoName = data.video_name || videoId;
         const shots = data.shots || [];
         if (!shots.length) { eid("modal-title").textContent = "No shots found"; return; }
         modal.shots = shots;
@@ -579,18 +574,61 @@ APP_JS = r"""
     eid("modal-img").src = frame.image_url;
 
     // Header
-    eid("modal-title").textContent =
-      `Shot ${modal.shotIdx+1}/${modal.shots.length}  (${shot.shot_id})`;
+    const rawVName = modal.videoName || modal.videoId;
+    const vName = cleanVideoName(rawVName);
+    eid("modal-title").textContent = `📹 ${vName}`;
+    if (eid("modal-sub-id")) {
+      eid("modal-sub-id").textContent = `Shot ${modal.shotIdx+1}/${modal.shots.length} (${shot.shot_id})`;
+    }
     eid("modal-time").textContent = fmtTime(frame.timestamp_sec);
+
+    // Subquery & component scores (for 2-stage or Intelligent fusion)
+    const searchRes = lastSearchResultsMap[frame.frame_id] || {};
+    const subs = searchRes.sub_scores || searchRes.subquery_scores || {};
+    const subKeys = Object.keys(subs);
+    const hasComps = searchRes.kis_score || searchRes.ocr_score || searchRes.asr_score;
+
+    const scoresSec = eid("modal-scores-section");
+    const scoresText = eid("modal-scores-text");
+    if (scoresSec && scoresText) {
+      if (subKeys.length > 0 || hasComps) {
+        let html = "";
+        if (subKeys.length > 0) {
+          html += `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px;">${subKeys.map(k => `<span class="pill" style="font-size:11px;background:#eef2ff;color:#4338ca;">${esc(k.replace('sub_',''))}: ${Number(subs[k]).toFixed(4)}</span>`).join('')}</div>`;
+        }
+        if (hasComps) {
+          html += `<div style="display:flex;gap:4px;flex-wrap:wrap;">
+            ${searchRes.kis_score ? `<span class="pill" style="font-size:11px;background:#e0f2fe;color:#0369a1;">KIS ${Number(searchRes.kis_score).toFixed(4)}</span>` : ""}
+            ${searchRes.ocr_score ? `<span class="pill" style="font-size:11px;background:#fef3c7;color:#b45309;">OCR ${Number(searchRes.ocr_score).toFixed(4)}</span>` : ""}
+            ${searchRes.asr_score ? `<span class="pill" style="font-size:11px;background:#f3e8ff;color:#6b21a8;">ASR ${Number(searchRes.asr_score).toFixed(4)}</span>` : ""}
+          </div>`;
+        }
+        scoresText.innerHTML = html;
+        scoresSec.style.display = "block";
+      } else {
+        scoresSec.style.display = "none";
+      }
+    }
+
+    // Side details: Caption, OCR, ASR
+    if (eid("modal-caption-text")) {
+      eid("modal-caption-text").textContent = frame.caption || "Không có mô tả (caption).";
+    }
+    if (eid("modal-ocr-text")) {
+      eid("modal-ocr-text").textContent = frame.ocr || "Không có chữ OCR nhận diện.";
+    }
+    if (eid("modal-asr-text")) {
+      eid("modal-asr-text").textContent = frame.asr || "Không có thoại ASR ở mốc thời gian này.";
+    }
 
     // Footer
     eid("modal-footer").textContent =
-      `Frame ${modal.frameIdx+1}/${shot.frames.length} · ${fmtTime(frame.timestamp_sec)} · idx ${frame.frame_index}`;
+      `Frame ${modal.frameIdx+1}/${shot.frames.length} · f${frame.frame_index} · ${fmtTime(frame.timestamp_sec)} · ${frame.frame_id}`;
 
     // Strip
     eid("modal-strip").innerHTML = shot.frames.map((f, fi) =>
       `<img src="${esc(f.image_url)}" class="${fi===modal.frameIdx?"active":""}"
-        onclick="selectStrip(event,${fi})" title="${fmtTime(f.timestamp_sec)}">`
+        onclick="selectStrip(event,${fi})" title="f${f.frame_index} · ${fmtTime(f.timestamp_sec)}">`
     ).join("");
 
     // Nav buttons disabled status
@@ -675,7 +713,9 @@ APP_JS = r"""
 
   // ─── Close modal ─────────────────────────────────────────────────────────────
   function closeModal() {
-    eid("frame-modal").style.display = "none";
+    const modalEl = eid("frame-modal");
+    modalEl.style.display = "none";
+    modalEl.classList.remove("open");
     eid("modal-img").src = "";
     modal.open = false;
     modal.shots = [];
@@ -697,14 +737,7 @@ APP_JS = r"""
     if (e.key === "ArrowDown" && modal.shotIdx < modal.shots.length - 1) { e.preventDefault(); modal.shotIdx++; modal.frameIdx = 0; renderModal(); }
   });
 
-  // Toggle VQA settings visibility
-  form.track.addEventListener('change', (e) => {
-      document.getElementById('vqa-settings').style.display = e.target.value === 'vqa' ? 'block' : 'none';
-    });
-    // Trigger initially
-    if (form.track.value === 'vqa') {
-        document.getElementById('vqa-settings').style.display = 'block';
-    }
+
 
     // --- Mode switch: manual search vs agent chat ---
     function setMode(mode) {
