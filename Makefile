@@ -107,7 +107,7 @@ build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
 	uv run codenova build-index --experiment-name $(EXP)
 
 extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
-	uv run codenova extract-text --experiment-name $(EXP)
+	uv run codenova extract-text --experiment-name $(EXP)	
 
 export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifests/text.jsonl (EXP)
 	uv run codenova export-text --experiment-name $(EXP)

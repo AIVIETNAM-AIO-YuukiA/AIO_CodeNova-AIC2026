@@ -200,6 +200,10 @@ class VllmChatClient:
                         _MAX_RETRIES,
                     )
                 else:
+                    if response.status_code >= 400:
+                        LOGGER.error(
+                            "OpenRouter HTTP %s: %s", response.status_code, response.text
+                        )
                     response.raise_for_status()
                     return response
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
