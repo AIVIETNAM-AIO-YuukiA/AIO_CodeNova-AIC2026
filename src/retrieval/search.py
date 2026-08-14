@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import os
 import sys
-
+from typing import Protocol
 
 from config.settings import Experiment
 from core.logging import get_logger
-from core.types import SearchResult, RetrievalQuery
+from core.types import SearchResult
+from core.errors import RetrievalError
+from indexing.validation import verify_embedding_provenance, verify_frame_files
 from modules.embedding import Embedder, build_embedder
 from modules.reranker.base import Reranker, build_reranker
 from retrieval.fusion import wsf_fuse
@@ -21,13 +24,20 @@ from stores.vector.factory import build_vector_index
 LOGGER = get_logger(__name__)
 
 
+class RetrievalQuery(Protocol):
+    """Structural type accepted by Retriever.search besides a plain string."""
+
+    def to_search_string(self) -> str: ...
+
+
 class Retriever:
     """Embed a text query, search the index, and hydrate result metadata.
 
     With a single configured embedding model, behaves as a plain bi-encoder
     retriever. With more than one (e.g. SigLIP + BEiT-3), the query is embedded
     once per model, each model's named vector is searched independently, the
-    per-model result lists are combined with SRRF (see retrieval/fusion.py),
+    per-model full-frame scores are combined with frame-ID-aligned WSF
+    (see retrieval/fusion.py),
     and the fused candidates are reranked with a cross-encoder (BLIP-2 ITM by
     default) before hydration — mirroring the Cascaded System paper's visual
     search stage: SigLIP + BEiT-3 -> SRRF -> BLIP-2 rerank.
@@ -106,24 +116,32 @@ class Retriever:
             model_data[model_name] = (frame_embs, frame_recs, query_embedding)
 
         fused = wsf_fuse(model_data, top_k=pool_size, weights=model_weights)
-        hydrated = self.hydrator.hydrate(fused)
-
-        # Filter out results where frame_path is missing or file does not exist on disk
-        from pathlib import Path
-
-        valid_hydrated = []
-        for r in hydrated:
-            if r.frame_path:
-                norm_p = r.frame_path.replace("\\", "/")
-                if Path(norm_p).exists():
-                    valid_hydrated.append(r)
+        hydration = self.hydrator.hydrate_with_diagnostics(fused)
+        valid_hydrated = hydration.results
+        if hydration.issues:
+            reasons = Counter(issue.reason for issue in hydration.issues)
+            LOGGER.error(
+                "event=RETRIEVAL_CANDIDATES_DROPPED count=%d reasons=%s frame_ids=%s",
+                len(hydration.issues),
+                dict(sorted(reasons.items())),
+                [issue.frame_id for issue in hydration.issues[:20]],
+            )
 
         if apply_reranker:
             rerank_limit = min(50, len(valid_hydrated))
-            reranked_top = self.reranker.rerank(
-                query=processed.visual_prompt, results=valid_hydrated[:rerank_limit]
-            )
-            valid_hydrated = reranked_top + valid_hydrated[rerank_limit:]
+            try:
+                reranked_top = self.reranker.rerank(
+                    query=processed.visual_prompt, results=valid_hydrated[:rerank_limit]
+                )
+            except Exception as exc:
+                LOGGER.exception(
+                    "event=RERANKER_DEGRADED component=retriever-reranker error=%s; "
+                    "returning pre-rerank results",
+                    exc,
+                )
+                self.reranker = None
+            else:
+                valid_hydrated = reranked_top + valid_hydrated[rerank_limit:]
         return valid_hydrated[:top_k]
 
     def _select_embedders(self, enabled_models: list[str] | None) -> dict[str, Embedder]:
@@ -168,6 +186,17 @@ def build_retriever(experiment: Experiment) -> Retriever:
     SRRF candidates — set ``DISABLE_RERANKER=1`` to skip it, which frees the
     ~1.5 GB of VRAM it holds so several embedders fit on a small GPU.
     """
+    frame_errors = verify_frame_files(experiment)
+    if frame_errors:
+        sample = "; ".join(f"{issue['frame_id']}:{issue['reason']}" for issue in frame_errors[:20])
+        raise RetrievalError(
+            f"Frame artifacts are not safe to serve ({len(frame_errors)} invalid): {sample}"
+        )
+    provenance_errors = verify_embedding_provenance(experiment)
+    if provenance_errors:
+        raise RetrievalError(
+            "Embedding provenance does not match the offline index: " + "; ".join(provenance_errors)
+        )
     embedders = {
         model_name: build_embedder(model_name=model_name, device=experiment.config.device)
         for model_name in experiment.config.embedding_models

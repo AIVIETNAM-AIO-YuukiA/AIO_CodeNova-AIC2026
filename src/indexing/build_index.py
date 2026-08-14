@@ -22,10 +22,8 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
     the index backend always recreates its collection on build, so a rebuild is
     inherently idempotent.
 
-    If multiple embedding models are configured but have embedded different
-    numbers of frames (e.g. one model's ``embed-frames`` run is behind), only
-    the frames common to every model are indexed, so every point has a
-    complete set of named vectors.
+    Every configured model must contain the same unique frame-ID set. Row order
+    may differ because vectors are joined explicitly by frame ID before build.
 
     Falls back to a model's in-progress checkpoint (``*.checkpoint.npz`` /
     ``*.checkpoint.json``) when the finished file doesn't exist yet — lets you
@@ -41,6 +39,8 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
 
     embeddings_dir = experiment.run_dir / "embeddings"
     models = experiment.config.embedding_models
+    if not models:
+        raise IndexBuildError("At least one embedding model is required.")
 
     per_model_vectors: dict[str, "np.ndarray"] = {}
     per_model_ids: dict[str, list[str]] = {}
@@ -57,16 +57,40 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
                 f"No embeddings (finished or in-progress) found for model '{model_name}' "
                 f"under {embeddings_dir}. Run embed-frames first."
             )
-        per_model_vectors[model_name] = np.load(model_vectors_path)["embeddings"].astype("float32")
-        per_model_ids[model_name] = json.loads(model_frame_ids_path.read_text(encoding="utf-8"))
+        vectors = np.load(model_vectors_path)["embeddings"].astype("float32")
+        ids = json.loads(model_frame_ids_path.read_text(encoding="utf-8"))
+        if vectors.ndim != 2 or not isinstance(ids, list):
+            raise IndexBuildError(
+                f"Invalid embedding artifact model={model_name} shape={vectors.shape}"
+            )
+        ids = [str(value) for value in ids]
+        if len(vectors) != len(ids):
+            raise IndexBuildError(
+                f"Embedding vector/ID mismatch model={model_name} "
+                f"vectors={len(vectors)} ids={len(ids)}"
+            )
+        if len(ids) != len(set(ids)):
+            raise IndexBuildError(f"Duplicate frame IDs for model={model_name}")
+        if not np.isfinite(vectors).all():
+            raise IndexBuildError(f"Non-finite embedding vectors for model={model_name}")
+        per_model_vectors[model_name] = vectors
+        per_model_ids[model_name] = ids
 
-    # Frames common to every model, in the first model's order.
-    common_ids = set(per_model_ids[models[0]])
+    # Canonical frame order comes from the first model; every other model is
+    # joined to it by frame ID rather than assumed to share row positions.
+    frame_ids = per_model_ids[models[0]]
+    canonical_ids = set(frame_ids)
     for model_name in models[1:]:
-        common_ids &= set(per_model_ids[model_name])
-    frame_ids = [fid for fid in per_model_ids[models[0]] if fid in common_ids]
+        model_ids = set(per_model_ids[model_name])
+        if model_ids != canonical_ids:
+            missing = sorted(canonical_ids - model_ids)
+            extra = sorted(model_ids - canonical_ids)
+            raise IndexBuildError(
+                f"Embedding frame-ID set mismatch model={model_name} "
+                f"missing={missing[:10]} extra={extra[:10]}"
+            )
     if not frame_ids:
-        raise IndexBuildError("No frames are embedded by every configured model.")
+        raise IndexBuildError("Embedding artifacts contain no frame IDs.")
 
     embeddings_by_model: dict[str, list[list[float]]] = {}
     for model_name in models:

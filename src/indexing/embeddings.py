@@ -2,21 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import time
+import math
 from core.logging import get_logger
 
 from config.settings import Experiment
+from core.paths import require_experiment_frame_path
 from core.types import FrameRecord
-from modules.embedding import build_embedder
+from modules.embedding import build_embedder, resolve_embedding_models
 from indexing.embedding_paths import (
     checkpoint_frame_ids_path,
     checkpoint_vectors_path,
     frame_ids_path,
     vectors_path,
 )
-from indexing.manifest import JsonlManifest
+from indexing.manifest import JsonlManifest, ManifestError
 from indexing.state import JobState
 
 LOGGER = get_logger(__name__)
@@ -80,6 +83,41 @@ def _discard_checkpoint(checkpoint_vectors_path, checkpoint_ids_path) -> None:
     checkpoint_ids_path.unlink(missing_ok=True)
 
 
+def _validate_artifact(np, vectors, frame_ids: list[str], known_ids: set[str]) -> None:
+    if vectors.ndim != 2:
+        raise RuntimeError(f"Embedding array must be 2-D, got shape={vectors.shape}")
+    if len(vectors) != len(frame_ids):
+        raise RuntimeError(
+            f"Embedding vector/ID mismatch vectors={len(vectors)} ids={len(frame_ids)}"
+        )
+    if len(frame_ids) != len(set(frame_ids)):
+        raise RuntimeError("Embedding artifact contains duplicate frame IDs")
+    if not np.isfinite(vectors).all():
+        raise RuntimeError("Embedding artifact contains NaN or Inf")
+    unknown = set(frame_ids) - known_ids
+    if unknown:
+        raise RuntimeError(f"Embedding artifact references {len(unknown)} unknown frames")
+
+
+def _publish_artifact(np, vector_path, ids_path, vectors, frame_ids: list[str]) -> None:
+    """Validate temporary files before replacing the legacy-compatible pair."""
+    vector_tmp = vector_path.with_name(vector_path.name + ".publish.tmp.npz")
+    ids_tmp = ids_path.with_name(ids_path.name + ".publish.tmp")
+    np.savez_compressed(vector_tmp, embeddings=vectors)
+    ids_tmp.write_text(json.dumps(frame_ids, indent=2) + "\n", encoding="utf-8")
+    try:
+        loaded_vectors = np.load(vector_tmp)["embeddings"]
+        loaded_ids = json.loads(ids_tmp.read_text(encoding="utf-8"))
+        if len(loaded_vectors) != len(loaded_ids):
+            raise RuntimeError("Temporary embedding pair is inconsistent")
+        vector_tmp.replace(vector_path)
+        ids_tmp.replace(ids_path)
+    except Exception:
+        vector_tmp.unlink(missing_ok=True)
+        ids_tmp.unlink(missing_ok=True)
+        raise
+
+
 def _captioned_frame_ids(captions_path) -> set[str]:
     """Return frame_ids that already have a cached caption in captions.jsonl."""
     if not captions_path.exists():
@@ -109,6 +147,7 @@ def embed_frames(
 
     Returns the number of newly embedded (frame, model) pairs across all models.
     """
+    specs = resolve_embedding_models(experiment.config.embedding_models)
     try:
         import numpy as np
     except ImportError as exc:
@@ -120,15 +159,31 @@ def embed_frames(
     output_dir = experiment.run_dir / "embeddings"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    frames = [FrameRecord.from_dict(row) for row in frames_manifest.read_all()]
+    frames = [FrameRecord.from_dict(row) for row in frames_manifest.read_all(strict=True)]
     if not frames:
-        LOGGER.warning("No frames found to embed")
-        return 0
+        raise ManifestError(f"Required frame manifest is missing or empty: {frames_manifest.path}")
+    frames = [
+        replace(
+            frame,
+            frame_path=str(require_experiment_frame_path(experiment, frame.frame_path)),
+        )
+        for frame in frames
+    ]
 
     models = experiment.config.embedding_models
+    specs_by_name = {spec.requested_name: spec for spec in specs}
     total_added = 0
 
-    for model_name in models:
+    known_frame_ids = {frame.frame_id for frame in frames}
+    manifest_by_model = {
+        str(row.get("model_name")): row
+        for row in embedding_manifest.read_all(strict=True)
+        if row.get("model_name")
+    }
+
+    for model_index, model_name in enumerate(models, start=1):
+        spec = specs_by_name[model_name]
+        state.mark(model_name, "EMBED", "RUNNING")
         model_vectors_path = vectors_path(output_dir, model_name)
         model_frame_ids_path = frame_ids_path(output_dir, model_name)
         model_checkpoint_vectors_path = checkpoint_vectors_path(output_dir, model_name)
@@ -187,6 +242,7 @@ def embed_frames(
                 LOGGER.info(
                     "[%s] All %s frames already embedded; nothing to do", model_name, len(frames)
                 )
+                state.mark(model_name, "EMBED", "COMPLETED")
                 continue
             new_ids = checkpoint_ids
             new_vectors = np.asarray(checkpoint_vectors, dtype="float32")
@@ -209,8 +265,20 @@ def embed_frames(
             # trong 1 lan goi tung len ~4GB va lam doi GPU embedder khac chay cung.
             # Van checkpoint theo tung batch nen khong anh huong toi viec resume.
             fresh_vectors: list = []
-            for start in range(0, len(new_frames), _EMBED_CHUNK_SIZE):
+            chunk_total = math.ceil(len(new_frames) / _EMBED_CHUNK_SIZE)
+            for chunk_index, start in enumerate(
+                range(0, len(new_frames), _EMBED_CHUNK_SIZE), start=1
+            ):
                 chunk = new_frames[start : start + _EMBED_CHUNK_SIZE]
+                LOGGER.info(
+                    "[model %s/%s] [batch %s/%s] Embedding model=%s frames=%s",
+                    model_index,
+                    len(models),
+                    chunk_index,
+                    chunk_total,
+                    model_name,
+                    len(chunk),
+                )
                 fresh_vectors.extend(
                     embedder.embed_images(chunk, on_batch=checkpoint_writer.add_batch)
                 )
@@ -227,18 +295,24 @@ def embed_frames(
             vectors = new_vectors
             frame_ids = new_ids
 
-        np.savez_compressed(model_vectors_path, embeddings=vectors)
-        model_frame_ids_path.write_text(json.dumps(frame_ids, indent=2) + "\n", encoding="utf-8")
+        _validate_artifact(np, vectors, frame_ids, known_frame_ids)
+        _publish_artifact(np, model_vectors_path, model_frame_ids_path, vectors, frame_ids)
         _discard_checkpoint(model_checkpoint_vectors_path, model_checkpoint_ids_path)
-        embedding_manifest.append(
-            {
-                "embedding_path": str(model_vectors_path),
-                "frame_ids_path": str(model_frame_ids_path),
-                "added": len(new_ids),
-                "total": len(frame_ids),
-                "model_name": model_name,
-            }
-        )
+        manifest_by_model[model_name] = {
+            "embedding_path": str(model_vectors_path),
+            "frame_ids_path": str(model_frame_ids_path),
+            "added": len(new_ids),
+            "total": len(frame_ids),
+            "dimension": int(vectors.shape[1]),
+            "coverage_ratio": len(set(frame_ids) & known_frame_ids) / len(known_frame_ids),
+            "model_name": model_name,
+            "requested_name": spec.requested_name,
+            "backend": spec.backend,
+            "resolved_model_id": spec.resolved_model_id,
+            "revision": spec.revision,
+            "preprocessing": spec.preprocessing,
+        }
+        state.mark(model_name, "EMBED", "COMPLETED")
         LOGGER.info(
             "[%s] Embedded frames added=%s total=%s path=%s",
             model_name,
@@ -248,5 +322,6 @@ def embed_frames(
         )
         total_added += len(new_ids)
 
+    embedding_manifest.replace_all(manifest_by_model.values(), unique_key="model_name")
     state.mark("frames", "EMBED", "COMPLETED")
     return total_added

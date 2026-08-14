@@ -36,3 +36,21 @@ def discover_videos(input_dir: Path) -> list[VideoRecord]:
             )
         )
     return videos
+
+
+def discover_video_paths(input_dir: Path):
+    """Yield supported video paths without reading their contents."""
+    for path in sorted(input_dir.rglob("*")):
+        if path.is_file() and path.suffix.lower() in VIDEO_EXTENSIONS:
+            yield path
+
+
+def inspect_video(path: Path) -> VideoRecord:
+    """Build a stable record for one path so callers can isolate per-file errors."""
+    checksum = file_checksum(path)
+    return VideoRecord(
+        video_id=checksum[:16],
+        path=str(path),
+        checksum=checksum,
+        size_bytes=path.stat().st_size,
+    )

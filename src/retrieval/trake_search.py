@@ -195,7 +195,10 @@ def _window_search_fwd(
             if frame_id in seen_fids:
                 continue
             seen_fids.add(frame_id)
-            sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
+            hydrated = hydrator.hydrate([frame_result(frame_id, score)])
+            if not hydrated:
+                continue
+            sr = hydrated[0]
             info = {
                 "frame_id": sr.frame_id,
                 "video_id": sr.video_id,
@@ -264,7 +267,10 @@ def _window_search_bwd(
             if frame_id in seen_fids:
                 continue
             seen_fids.add(frame_id)
-            sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
+            hydrated = hydrator.hydrate([frame_result(frame_id, score)])
+            if not hydrated:
+                continue
+            sr = hydrated[0]
             info = {
                 "frame_id": sr.frame_id,
                 "video_id": sr.video_id,

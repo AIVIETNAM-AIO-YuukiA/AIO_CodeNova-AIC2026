@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import html as html_lib
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import json
@@ -12,6 +14,7 @@ from core.logging import get_logger
 import mimetypes
 
 from config.settings import Experiment
+from core.errors import RetrievalError
 from core.types import SearchResult
 from retrieval.vqa import vqa_search, trake_search, enhanced_temporal_search
 from retrieval.kis_detail_search import kis_detail_2stage_search
@@ -19,12 +22,51 @@ from retrieval.intelligent_search import intelligent_search
 from retrieval.temporal_search import load_temporal_data
 from retrieval.text_search import text_search
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
+from indexing.readiness import read_readiness
+from indexing.validation import verify_artifact_fingerprints, verify_frame_files
 import numpy as np
 
 LOGGER = get_logger(__name__)
 
 
-def _warmup_models(reranker, experiment: Experiment, retriever=None) -> None:
+@dataclass(frozen=True)
+class WarmupComponentHealth:
+    component: str
+    status: str
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class WarmupReport:
+    experiment: str
+    status: str
+    components: tuple[WarmupComponentHealth, ...]
+    ui_reranker: object | None
+
+
+class _FailOpenReranker:
+    """Disable an optional UI reranker after its first runtime failure."""
+
+    def __init__(self, reranker) -> None:
+        self._reranker = reranker
+        self._available = True
+
+    def rerank(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
+        if not self._available:
+            return results
+        try:
+            return self._reranker.rerank(query=query, results=results)
+        except Exception as exc:
+            self._available = False
+            LOGGER.exception(
+                "event=RERANKER_DEGRADED component=ui-reranker error=%s; "
+                "returning pre-rerank results",
+                exc,
+            )
+            return results
+
+
+def _warmup_models(reranker, experiment: Experiment, retriever=None) -> WarmupReport:
     """Pre-load heavy models before the server starts accepting requests.
 
     The lazy-loaded models (BLIP-2 reranker, the embedders) can take minutes to
@@ -32,131 +74,99 @@ def _warmup_models(reranker, experiment: Experiment, retriever=None) -> None:
     from paying that cost, and — because this runs to completion before the
     listener starts — no two threads can race to initialize the same model.
     """
-    LOGGER.info("[warmup] Pre-loading models...")
-    try:
-        if reranker is not None and hasattr(reranker, "_load"):
-            LOGGER.info("[warmup] Loading BLIP-2 reranker...")
-            reranker._load()
-            LOGGER.info("[warmup] BLIP-2 reranker ready.")
-    except Exception as exc:
-        LOGGER.warning("[warmup] Reranker pre-load failed (non-fatal): %s", exc)
+    LOGGER.info("event=WARMUP_STARTED experiment=%s", experiment.name)
+    health: list[WarmupComponentHealth] = []
+    failed_embedders: list[str] = []
 
-    try:
-        # Warm every embedder the retriever will actually use, via the same
-        # instances, so the first query finds them already resident.
-        if retriever is not None:
-            for model_name, embedder in retriever.embedders.items():
+    # Every configured embedder is mandatory for the selected experiment, but
+    # each one is checked independently so one failure cannot hide later ones.
+    if retriever is not None:
+        for model_name, embedder in retriever.embedders.items():
+            component = f"embedder:{model_name}"
+            try:
                 embedder.embed_text("warmup query")
-                LOGGER.info("[warmup] Embedder ready: %s", model_name)
-    except Exception as exc:
-        LOGGER.warning("[warmup] Embedder pre-load failed (non-fatal): %s", exc)
+            except Exception as exc:
+                failed_embedders.append(model_name)
+                health.append(WarmupComponentHealth(component, "FAILED", str(exc)))
+                LOGGER.exception(
+                    "event=WARMUP_COMPONENT_FAILED component=%s error=%s", component, exc
+                )
+            else:
+                health.append(WarmupComponentHealth(component, "READY"))
+                LOGGER.info("event=WARMUP_COMPONENT_READY component=%s", component)
 
-    LOGGER.info("[warmup] All models pre-loaded and ready.")
-
-
-def _ensure_manifests(experiment: Experiment) -> None:
-    """Auto-recover manifests/frames.jsonl and videos.jsonl if missing or empty."""
-    manifests_dir = experiment.run_dir / "manifests"
-    frames_jsonl = manifests_dir / "frames.jsonl"
-    videos_jsonl = manifests_dir / "videos.jsonl"
-
-    if frames_jsonl.exists() and frames_jsonl.stat().st_size > 0:
-        return
-
-    LOGGER.info("[manifests] Missing or empty frames.jsonl detected. Generating automatically...")
-    manifests_dir.mkdir(parents=True, exist_ok=True)
-
-    embeddings_dir = experiment.run_dir / "embeddings"
-    json_ids_files = list(embeddings_dir.glob("frame_ids*.json")) if embeddings_dir.exists() else []
-
-    frames_records = []
-    videos_records = set()
-
-    if json_ids_files:
-        json_ids_file = json_ids_files[0]
-        LOGGER.info("[manifests] Reading frame IDs from %s...", json_ids_file.name)
+    def warm_optional(component: str, candidate):
+        if candidate is None:
+            return None
         try:
-            with open(json_ids_file, encoding="utf-8") as f:
-                frame_ids = json.load(f)
-
-            for fid in frame_ids:
-                parts = fid.split("_")
-                video_id = parts[0]
-                videos_records.add(video_id)
-                img_name = fid + ".jpg" if not fid.endswith(".jpg") else fid
-                expected_path = experiment.run_dir / "frames" / video_id / img_name
-                rel_path = (
-                    expected_path.relative_to(Path.cwd())
-                    if expected_path.is_relative_to(Path.cwd())
-                    else expected_path
-                )
-
-                match = re.search(r"_f(\d+)", fid)
-                f_num = int(match.group(1)) if match else 0
-                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
-
-                frames_records.append(
-                    {
-                        "frame_id": fid,
-                        "video_id": video_id,
-                        "shot_id": parts[1] if len(parts) > 2 else f"{video_id}_s0",
-                        "frame_index": f_num,
-                        "timestamp_sec": ts,
-                        "frame_path": str(rel_path).replace("\\", "/"),
-                    }
-                )
+            loader = getattr(candidate, "_load", None)
+            if callable(loader):
+                loader()
         except Exception as exc:
-            LOGGER.warning("[manifests] Failed to parse %s: %s", json_ids_file, exc)
+            health.append(WarmupComponentHealth(component, "FAILED", str(exc)))
+            LOGGER.exception(
+                "event=WARMUP_COMPONENT_FAILED component=%s error=%s; disabled=true",
+                component,
+                exc,
+            )
+            return None
+        health.append(WarmupComponentHealth(component, "READY"))
+        LOGGER.info("event=WARMUP_COMPONENT_READY component=%s", component)
+        return candidate
 
-    if not frames_records:
-        frames_dir = experiment.run_dir / "frames"
-        if frames_dir.exists():
-            LOGGER.info("[manifests] Scanning frames directory %s...", frames_dir)
-            for img_path in frames_dir.glob("*/*.jpg"):
-                video_id = img_path.parent.name
-                videos_records.add(video_id)
-                frame_id = f"{video_id}_{img_path.stem}"
-                match = re.search(r"_f(\d+)", frame_id)
-                f_num = int(match.group(1)) if match else 0
-                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
+    healthy_ui_reranker = warm_optional("reranker:ui", reranker)
+    if retriever is not None and retriever.reranker is not None:
+        healthy_internal = warm_optional("reranker:retriever", retriever.reranker)
+        if healthy_internal is None:
+            retriever.reranker = None
 
-                frames_records.append(
-                    {
-                        "frame_id": frame_id,
-                        "video_id": video_id,
-                        "shot_id": f"{video_id}_s0",
-                        "frame_index": f_num,
-                        "timestamp_sec": ts,
-                        "frame_path": str(img_path).replace("\\", "/"),
-                    }
-                )
-
-    if frames_records:
-        with open(frames_jsonl, "w", encoding="utf-8") as f:
-            for r in frames_records:
-                f.write(json.dumps(r) + "\n")
-
-        with open(videos_jsonl, "w", encoding="utf-8") as f:
-            for v_id in videos_records:
-                f.write(
-                    json.dumps(
-                        {
-                            "video_id": v_id,
-                            "path": f"data/videos/{v_id}.mp4",
-                            "checksum": "dummy_checksum",
-                            "size_bytes": 0,
-                        }
-                    )
-                    + "\n"
-                )
-
-        LOGGER.info(
-            "[manifests] Auto-generated %d frame records into %s", len(frames_records), frames_jsonl
+    if failed_embedders:
+        LOGGER.error(
+            "event=WARMUP_FAILED experiment=%s mandatory_embedders=%s",
+            experiment.name,
+            failed_embedders,
         )
-    else:
-        LOGGER.warning(
-            "[manifests] Could not auto-generate manifests (no frame_ids*.json or frames/ directory found)."
+        raise RetrievalError(
+            "Mandatory experiment embedder warmup failed: " + ", ".join(failed_embedders)
         )
+
+    status = "DEGRADED" if any(item.status == "FAILED" for item in health) else "READY"
+    LOGGER.info("event=WARMUP_COMPLETED experiment=%s status=%s", experiment.name, status)
+    return WarmupReport(
+        experiment.name,
+        status,
+        tuple(health),
+        _FailOpenReranker(healthy_ui_reranker) if healthy_ui_reranker is not None else None,
+    )
+
+
+def _validate_experiment_for_serving(experiment: Experiment) -> dict[str, object]:
+    """Require a fresh offline readiness report without mutating indexing artifacts."""
+    readiness = read_readiness(experiment)
+    status = str(readiness.get("status", "INVALID"))
+    if status != "READY":
+        raise RuntimeError(
+            f"Experiment {experiment.name!r} is not ready: status={status}. "
+            "Run validate-index and resolve the reported issues first."
+        )
+    if readiness.get("config_hash") != experiment.config.config_hash():
+        raise RuntimeError(
+            f"Experiment {experiment.name!r} readiness config does not match persisted config. "
+            "Run validate-index again."
+        )
+    stale = verify_artifact_fingerprints(readiness)
+    if stale:
+        raise RuntimeError(
+            f"Experiment {experiment.name!r} readiness is stale for artifacts: {stale}. "
+            "Run validate-index again."
+        )
+    frame_errors = verify_frame_files(experiment)
+    if frame_errors:
+        sample = "; ".join(f"{issue['frame_id']}:{issue['reason']}" for issue in frame_errors[:20])
+        raise RuntimeError(
+            f"Experiment has {len(frame_errors)} invalid frame artifact(s): {sample}"
+        )
+    return readiness
 
 
 def serve_ui(
@@ -170,8 +180,12 @@ def serve_ui(
     """Serve the local retrieval UI until interrupted."""
     from core.paths import set_project_root
 
-    # Ensure manifests exist so UI never has broken frame_path lookups
-    _ensure_manifests(experiment)
+    readiness = _validate_experiment_for_serving(experiment)
+    LOGGER.info(
+        "[readiness] Validated experiment=%s generated_at=%s",
+        experiment.name,
+        readiness.get("generated_at"),
+    )
 
     # frame_path values in manifests are relative to the working directory the
     # pipeline was run from, not to experiment.run_dir (which can live outside
@@ -186,18 +200,16 @@ def serve_ui(
     from retrieval.vqa import _get_retriever
 
     retriever = _get_retriever(experiment)
+    # Warm before constructing the handler so a failed optional reranker is not
+    # captured by request handlers and mandatory failures prevent socket bind.
+    warmup = _warmup_models(reranker, experiment, retriever)
     handler = build_handler(
         experiment=experiment,
         retriever=retriever,
         default_top_k=default_top_k,
-        reranker=reranker,
+        reranker=warmup.ui_reranker,
         reranker_top_k=reranker_top_k,
     )
-    # Warm the models up before serving. Doing this on a background thread
-    # races the first request: two threads then load the same embedder at once
-    # and the loser hits "Cannot copy out of meta tensor".
-    _warmup_models(reranker, experiment, retriever)
-
     server = ThreadingHTTPServer((host, port), handler)
     LOGGER.info("Serving retrieval UI at http://%s:%s", host, port)
     try:
@@ -246,7 +258,7 @@ def build_handler(
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             if parsed.path == "/":
-                html = INDEX_HTML.replace('value="20"', f'value="{default_top_k}"')
+                html = _render_index_html(experiment, default_top_k)
                 self._send_html(html)
                 return
             if parsed.path == "/health":
@@ -554,16 +566,17 @@ def build_handler(
             self.wfile.write(encoded)
 
         def _send_frame(self, raw_path: str) -> None:
-            from core.paths import resolve_frame_path
+            from core.paths import resolve_experiment_frame_path
 
             raw_path = unquote(raw_path)
             if Path(raw_path).suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp"):
                 self.send_error(HTTPStatus.NOT_FOUND, "Frame not found")
                 return
-            frame_path = resolve_frame_path(raw_path)
-            if not frame_path.is_file():
+            resolution = resolve_experiment_frame_path(experiment, raw_path)
+            if not resolution.valid or resolution.resolved_path is None:
                 self.send_error(HTTPStatus.NOT_FOUND, "Frame not found")
                 return
+            frame_path = resolution.resolved_path
 
             content_type = mimetypes.guess_type(frame_path.name)[0] or "application/octet-stream"
             content = frame_path.read_bytes()
@@ -645,6 +658,18 @@ def build_handler(
                 self._send_json({"video_id": video_id, "shots": []})
 
     return RetrievalUiHandler
+
+
+def _render_index_html(experiment: Experiment, default_top_k: int) -> str:
+    """Render the active persisted experiment identity into the UI shell."""
+    return (
+        INDEX_HTML.replace('value="20"', f'value="{default_top_k}"')
+        .replace("__ACTIVE_EXPERIMENT__", html_lib.escape(experiment.name))
+        .replace(
+            "__ACTIVE_MODELS__",
+            html_lib.escape(", ".join(experiment.config.embedding_models)),
+        )
+    )
 
 
 def result_to_payload(result: SearchResult) -> dict[str, object]:
@@ -814,7 +839,7 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>CodeNova Retrieval UI</h1>
+  <div><h1>CodeNova Retrieval UI</h1><small>Experiment: __ACTIVE_EXPERIMENT__ · Models: __ACTIVE_MODELS__</small></div>
   <div id="mode-switch">
     <button type="button" class="mode-btn active" data-mode="manual">🛠 Thủ công</button>
     <button type="button" class="mode-btn" data-mode="agent">🤖 Agent</button>
