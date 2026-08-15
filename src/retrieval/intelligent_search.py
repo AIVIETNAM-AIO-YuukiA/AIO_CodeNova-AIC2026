@@ -31,6 +31,10 @@ def intelligent_search(
     enable_kis: bool = True,
     enable_ocr: bool = True,
     enable_asr: bool = True,
+    enable_caption: bool = True,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> dict:
     """Analyze ``query`` and search KIS/OCR/ASR in whatever mix the LLM picks.
 
@@ -47,34 +51,46 @@ def intelligent_search(
     processed = retriever.query_processor.process(query)
     weights = dict(processed.weights)
 
-    # Respect the caller's on/off switches by zeroing a disabled modality's
-    # weight rather than skipping it outright — a component with real hits but
-    # zero weight still shows up in component_counts for transparency.
-    if not enable_kis:
-        weights["kis"] = 0.0
-    if not enable_ocr:
-        weights["ocr"] = 0.0
-    if not enable_asr:
-        weights["asr"] = 0.0
+    # Map bonus weights from processed query to fusion components
+    fusion_weights = {
+        "kis": 1.0 if enable_kis else 0.0,
+        "ocr": weights.get("ocr_bonus", 0.0) if enable_ocr else 0.0,
+        "asr": weights.get("asr_bonus", 0.0) if enable_asr else 0.0,
+        "caption": weights.get("caption_bonus", 0.0) if enable_caption else 0.0,
+    }
 
     pool_size = max(top_k, 100)
     results_by_component: dict[str, list[SearchResult]] = {}
     component_counts: dict[str, int] = {}
 
-    if enable_kis and weights.get("kis", 0) > 0:
-        kis_hits = _search_kis(retriever, processed.visual_prompt, pool_size)
-        results_by_component["kis"] = kis_hits
-        component_counts["kis"] = len(kis_hits)
+    if enable_kis and fusion_weights["kis"] > 0:
+        kis_results = _search_kis(
+            retriever,
+            processed.visual_prompt,
+            top_k=pool_size,
+            enabled_models=enabled_models,
+            use_reranker=use_reranker,
+            use_llm=use_llm,
+        )
+        results_by_component["kis"] = kis_results
+        component_counts["kis"] = len(kis_results)
 
-    if enable_ocr and weights.get("ocr", 0) > 0 and processed.ocr_keywords:
+    if enable_ocr and fusion_weights["ocr"] > 0 and processed.ocr_keywords:
         ocr_hits = _search_text(experiment, processed.ocr_keywords, source="ocr", top_k=pool_size)
         results_by_component["ocr"] = ocr_hits
         component_counts["ocr"] = len(ocr_hits)
 
-    if enable_asr and weights.get("asr", 0) > 0 and processed.asr_keywords:
+    if enable_asr and fusion_weights["asr"] > 0 and processed.asr_keywords:
         asr_hits = _search_text(experiment, processed.asr_keywords, source="asr", top_k=pool_size)
         results_by_component["asr"] = asr_hits
         component_counts["asr"] = len(asr_hits)
+
+    if enable_caption and fusion_weights["caption"] > 0 and processed.caption_keywords:
+        caption_hits = _search_text(
+            experiment, processed.caption_keywords, source="caption", top_k=pool_size
+        )
+        results_by_component["caption"] = caption_hits
+        component_counts["caption"] = len(caption_hits)
 
     if not results_by_component:
         return {
@@ -84,7 +100,16 @@ def intelligent_search(
             "component_counts": component_counts,
         }
 
-    fused = srrf_fuse(results_by_component, top_k=pool_size, weights=weights)
+    fused = srrf_fuse(results_by_component, top_k=pool_size, weights=fusion_weights)
+
+    # Normalize final fused scores so they stay within [0, 1]
+    if fused:
+        max_fused_score = max(r.score for r in fused)
+        if max_fused_score > 0:
+            from dataclasses import replace
+
+            fused = [replace(r, score=r.score / max_fused_score) for r in fused]
+
     hydrated = ResultHydrator(experiment).hydrate(fused[:top_k])
 
     return {
@@ -95,7 +120,14 @@ def intelligent_search(
     }
 
 
-def _search_kis(retriever, visual_prompt: str, top_k: int) -> list[SearchResult]:
+def _search_kis(
+    retriever,
+    visual_prompt: str,
+    top_k: int,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
+) -> list[SearchResult]:
     """Run the retriever's own embedding search (may itself be multi-model)."""
     return [
         SearchResult(
@@ -109,11 +141,19 @@ def _search_kis(retriever, visual_prompt: str, top_k: int) -> list[SearchResult]
             frame_index=r.frame_index,
             timestamp_sec=r.timestamp_sec,
         )
-        for r in retriever.search(visual_prompt, top_k=top_k)
+        for r in retriever.search(
+            visual_prompt,
+            top_k=top_k,
+            enabled_models=enabled_models,
+            use_reranker=use_reranker,
+            use_llm=use_llm,
+        )
     ]
 
 
-def _search_text(experiment: Experiment, keywords: list[str], source: str, top_k: int) -> list[SearchResult]:
+def _search_text(
+    experiment: Experiment, keywords: list[str], source: str, top_k: int
+) -> list[SearchResult]:
     """BM25 search each keyword, keeping the highest-scoring hit per frame.
 
     OCR documents carry a real ``frame_id``. ASR documents don't — speech
@@ -129,7 +169,9 @@ def _search_text(experiment: Experiment, keywords: list[str], source: str, top_k
         for doc in index.search_documents(keyword, top_k=top_k, source=source):
             frame_id = doc.get("frame_id")
             if not frame_id and nearest_frame is not None:
-                frame_id = nearest_frame.nearest(doc.get("video_id", ""), doc.get("timestamp_sec") or 0.0)
+                frame_id = nearest_frame.nearest(
+                    doc.get("video_id", ""), doc.get("timestamp_sec") or 0.0
+                )
             if not frame_id:
                 continue
             score = float(doc.get("score", 0.0))
@@ -143,6 +185,7 @@ def _search_text(experiment: Experiment, keywords: list[str], source: str, top_k
 def _analysis_payload(processed) -> dict:
     return {
         "visual_prompt": processed.visual_prompt,
+        "caption_keywords": processed.caption_keywords,
         "ocr_keywords": processed.ocr_keywords,
         "asr_keywords": processed.asr_keywords,
         "metadata": processed.metadata,

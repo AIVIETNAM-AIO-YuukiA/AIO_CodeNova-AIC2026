@@ -24,13 +24,20 @@ class NearestFrameIndex:
     the nearest frame in the same video looked up by timestamp instead.
     """
 
+    _cache: dict[str, dict[str, list[tuple[float, str]]]] = {}
+
     def __init__(self, experiment: Experiment) -> None:
-        by_video: dict[str, list[tuple[float, str]]] = {}
-        for frame in FrameRepository(experiment).list_all():
-            by_video.setdefault(frame.video_id, []).append((frame.timestamp_sec, frame.frame_id))
-        self._by_video = {
-            video_id: sorted(pairs) for video_id, pairs in by_video.items()
-        }
+        run_dir_key = str(experiment.run_dir)
+        if run_dir_key not in self._cache:
+            by_video: dict[str, list[tuple[float, str]]] = {}
+            for frame in FrameRepository(experiment).list_all():
+                by_video.setdefault(frame.video_id, []).append(
+                    (frame.timestamp_sec, frame.frame_id)
+                )
+            self._cache[run_dir_key] = {
+                video_id: sorted(pairs) for video_id, pairs in by_video.items()
+            }
+        self._by_video = self._cache[run_dir_key]
 
     def nearest(self, video_id: str, timestamp_sec: float) -> str | None:
         pairs = self._by_video.get(video_id)

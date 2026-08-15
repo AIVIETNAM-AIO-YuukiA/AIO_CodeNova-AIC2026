@@ -36,13 +36,15 @@ class ProcessedQuery:
     raw_query: str
     visual_prompt: str  # English visual prompt
     visual_prompt_vi: str = ""  # Vietnamese visual prompt
+    caption_keywords: list[str] = field(default_factory=list)
     ocr_keywords: list[str] = field(default_factory=list)
     asr_keywords: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
-    # How much each modality should contribute to a fused multi-source search
-    # (kis/ocr/asr, sums to ~1.0). Populated by LlmQueryProcessor; a
-    # pass-through processor leaves this at the all-visual default.
-    weights: dict[str, float] = field(default_factory=lambda: {"kis": 1.0, "ocr": 0.0, "asr": 0.0})
+    # Bonus multipliers for auxiliary text modalities (typically 0.0 to 0.3).
+    # Populated by LlmQueryProcessor. Visual KIS is implicitly the base (1.0).
+    weights: dict[str, float] = field(
+        default_factory=lambda: {"ocr_bonus": 0.0, "asr_bonus": 0.0, "caption_bonus": 0.0}
+    )
 
 
 class QueryProcessor:
@@ -117,10 +119,11 @@ class LlmQueryProcessor(QueryProcessor):
 
         1. "visual_prompt": Apply RULE 1 and RULE 2 from the system prompt to strictly filter out all invisible elements, abstract behaviors, purposes, emotions, symbols, and cultural context. Translate the remaining static visual essence into a highly optimized English noun-phrase. Keep it concise (max 20 words). DO NOT include verbs of abstract actions.
         { '2. "visual_prompt_vi": The exact same visual essence as "visual_prompt", but translated back into Vietnamese (static noun-phrase in Vietnamese).' if is_vi else '' }
-        3. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
-        4. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
-        5. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor).
-        6. "weights": A JSON object {{"kis": float, "ocr": float, "asr": float}} summing to 1.0, estimating how much each modality should contribute to retrieval. Visual-dominant queries weigh "kis" highest. Queries naming exact on-screen text weigh "ocr" highest. Queries about spoken dialogue weigh "asr" highest. A modality with an empty keyword list gets weight 0.
+        3. "caption_keywords": List 1 to 5 search keywords describing the static scene, objects, or context that would appear in a textual image caption. Set to empty list if no clear context is given.
+        4. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
+        5. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
+        6. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor).
+        7. "weights": A JSON object {{"caption_bonus": float, "ocr_bonus": float, "asr_bonus": float}}, estimating the bonus multiplier for each modality (from 0.0 to 0.3). Visual KIS is the main component and implicitly has weight 1.0. A modality with an empty keyword list should get bonus 0.0.
 
         User Query: "{query}"
 
@@ -128,12 +131,13 @@ class LlmQueryProcessor(QueryProcessor):
         {{
             "visual_prompt": "string",
             { '"visual_prompt_vi": "string",' if is_vi else '' }
+            "caption_keywords": ["string"],
             "ocr_keywords": ["string"],
             "asr_keywords": ["string"],
             "metadata": {{
                 "key": "value"
             }},
-            "weights": {{"kis": 1.0, "ocr": 0.0, "asr": 0.0}}
+            "weights": {{"caption_bonus": 0.0, "ocr_bonus": 0.0, "asr_bonus": 0.0}}
         }}
         """
         try:
@@ -149,10 +153,11 @@ class LlmQueryProcessor(QueryProcessor):
                 raw_query=query,
                 visual_prompt=data.get("visual_prompt", query) or query,
                 visual_prompt_vi=data.get("visual_prompt_vi", query) or query,
+                caption_keywords=data.get("caption_keywords", []),
                 ocr_keywords=data.get("ocr_keywords", []),
                 asr_keywords=data.get("asr_keywords", []),
                 metadata=data.get("metadata", {}),
-                weights=_normalize_weights(weights),
+                weights=_parse_bonus_weights(weights),
             )
         except Exception as exc:
             LOGGER.warning(
@@ -205,23 +210,15 @@ class LlmQueryProcessor(QueryProcessor):
             return []
 
 
-def _normalize_weights(raw: dict) -> dict[str, float]:
-    """Coerce an LLM-provided weight dict to non-negative floats summing to 1.0.
-
-    Falls back to an all-visual split if the response omits weights, uses
-    unrecognized keys, or sums to (near) zero.
-    """
+def _parse_bonus_weights(raw: dict) -> dict[str, float]:
+    """Extract bonus multipliers for text modalities (capped at 0.5 to prevent blowing up the score)."""
     weights = {}
-    for key in ("kis", "ocr", "asr"):
+    for key in ("caption_bonus", "ocr_bonus", "asr_bonus"):
         try:
-            weights[key] = max(0.0, float(raw.get(key, 0.0)))
+            weights[key] = max(0.0, min(0.5, float(raw.get(key, 0.0))))
         except (TypeError, ValueError):
             weights[key] = 0.0
-
-    total = sum(weights.values())
-    if total <= 1e-9:
-        return {"kis": 1.0, "ocr": 0.0, "asr": 0.0}
-    return {key: value / total for key, value in weights.items()}
+    return weights
 
 
 def _extract_json(text: str) -> dict:

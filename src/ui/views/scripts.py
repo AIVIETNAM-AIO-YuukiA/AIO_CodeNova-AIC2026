@@ -168,6 +168,12 @@ APP_JS = r"""
     sidebarAnswer.style.display = "none";
     const track = form.track.value;
     let endpoint, payload;
+    const globalParams = {
+      enabled_models: getEnabledModels(),
+      use_reranker: eid("use-reranker").checked,
+      use_llm: eid("use-llm").checked,
+    };
+
     if (track === "trake") {
       const events = getEvents();
       if (events.length < 2) { statusEl.className="status warn"; statusEl.textContent="Need at least 2 events."; submitEl.disabled=false; return; }
@@ -177,36 +183,34 @@ APP_JS = r"""
         events,
         top_k: 300,
         window: Number(eid("window-slider").value),
-        enabled_models: getEnabledModels(),
-        use_reranker: eid("use-reranker").checked,
-        use_llm: eid("use-llm").checked,
+        ...globalParams
       };
     } else if (track === "kis_detail_2stage") {
       const { general, specific } = get2StageEvents();
       if (general.length < 1) { statusEl.className="status warn"; statusEl.textContent="Need at least 1 general subquery."; submitEl.disabled=false; return; }
       if (specific.length < 1) { statusEl.className="status warn"; statusEl.textContent="Need at least 1 specific subquery."; submitEl.disabled=false; return; }
-      endpoint = "/api/kis-detail-2stage"; payload = { general, specific };
+      endpoint = "/api/kis-detail-2stage"; payload = { general, specific, ...globalParams };
     } else if (track === "vqa") {
       endpoint = "/api/vqa-search";
-      payload = { query: form.query.value, context: form.context.value, question: form.question.value, top_k: Number(form["top_k"].value||20) };
+      payload = { query: form.query.value, context: form.context.value, question: form.question.value, top_k: Number(form["top_k"].value||20), ...globalParams };
     } else if (track === "asr_search" || track === "ocr_search") {
       endpoint = track === "asr_search" ? "/api/asr-search" : "/api/ocr-search";
-      payload = { query: form.query.value, top_k: 300 };
+      payload = { query: form.query.value, top_k: 300, ...globalParams };
     } else if (track === "intelligent") {
       endpoint = "/api/intelligent-search";
-      payload = { query: form.query.value, top_k: Number(form["top_k"].value||20) };
+      payload = { query: form.query.value, top_k: Number(form["top_k"].value||20), ...globalParams };
     } else if (track === "temporal_enhanced") {
       endpoint = "/api/enhanced-temporal-search";
       payload = {
         query: form.query.value, context: form.context.value,
         top_k: Number(form["top_k"].value||20), max_events: 5,
+        ...globalParams
       };
     } else {
       endpoint = "/api/search";
       payload = {
         track, query: form.query.value, context: form.context.value, question: form.question.value,
-        top_k: 300, enabled_models: getEnabledModels(), use_reranker: eid("use-reranker").checked,
-        use_llm: eid("use-llm").checked,
+        top_k: 300, ...globalParams
       };
     }
 

@@ -65,9 +65,7 @@ def ensure_manifests(experiment: Experiment) -> None:
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
     embeddings_dir = experiment.run_dir / "embeddings"
-    json_ids_files = (
-        list(embeddings_dir.glob("frame_ids*.json")) if embeddings_dir.exists() else []
-    )
+    json_ids_files = list(embeddings_dir.glob("frame_ids*.json")) if embeddings_dir.exists() else []
 
     frames_records = []
     videos_records = set()
@@ -93,7 +91,7 @@ def ensure_manifests(experiment: Experiment) -> None:
 
                 match = re.search(r"_f(\d+)", fid)
                 f_num = int(match.group(1)) if match else 0
-                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
+                ts = None
 
                 frames_records.append(
                     {
@@ -118,7 +116,7 @@ def ensure_manifests(experiment: Experiment) -> None:
                 frame_id = f"{video_id}_{img_path.stem}"
                 match = re.search(r"_f(\d+)", frame_id)
                 f_num = int(match.group(1)) if match else 0
-                ts = round(f_num / 25.0, 2) if f_num > 0 else 0.0
+                ts = None
 
                 frames_records.append(
                     {
@@ -187,6 +185,7 @@ _VIDEO_NAME_CACHE: dict[str, str] = {}
 _CAPTIONS_CACHE: dict[str, str] = {}
 _TEXT_CACHE: list[dict] = []
 
+
 def _get_video_name_map(experiment: Experiment) -> dict[str, str]:
     global _VIDEO_NAME_CACHE
     if not _VIDEO_NAME_CACHE:
@@ -205,6 +204,7 @@ def _get_video_name_map(experiment: Experiment) -> dict[str, str]:
             except Exception:
                 pass
     return _VIDEO_NAME_CACHE
+
 
 def _get_captions_map(experiment: Experiment) -> dict[str, str]:
     global _CAPTIONS_CACHE
@@ -225,6 +225,7 @@ def _get_captions_map(experiment: Experiment) -> dict[str, str]:
                 pass
     return _CAPTIONS_CACHE
 
+
 def _get_text_records(experiment: Experiment) -> list[dict]:
     global _TEXT_CACHE
     if not _TEXT_CACHE:
@@ -241,12 +242,14 @@ def _get_text_records(experiment: Experiment) -> list[dict]:
     return _TEXT_CACHE
 
 
-def result_to_payload(result: SearchResult, experiment: Experiment | None = None) -> dict[str, object]:
+def result_to_payload(
+    result: SearchResult, experiment: Experiment | None = None
+) -> dict[str, object]:
     """Serialize a result for the browser UI."""
     payload = result.to_dict()
     if result.frame_path:
         payload["image_url"] = f"/frame?path={quote(result.frame_path)}"
-    
+
     if experiment:
         vmap = _get_video_name_map(experiment)
         if result.video_id in vmap:
@@ -318,9 +321,7 @@ def handle_trake_or_enhanced_search(
         if r.get("frame_path"):
             r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
     for ev in result.get("events", []):
-        ev["image_urls"] = [
-            f"/frame?path={quote(fp)}" for fp in ev.get("frame_paths", []) if fp
-        ]
+        ev["image_urls"] = [f"/frame?path={quote(fp)}" for fp in ev.get("frame_paths", []) if fp]
     return result
 
 
@@ -384,6 +385,14 @@ def handle_text_search(
 
 def handle_intelligent_search(payload: dict, experiment: Experiment, default_top_k: int) -> dict:
     """Process /api/intelligent-search."""
+    enabled_models = payload.get("enabled_models") or None
+    use_reranker = payload.get("use_reranker")
+    if use_reranker is not None:
+        use_reranker = bool(use_reranker)
+    use_llm = payload.get("use_llm")
+    if use_llm is not None:
+        use_llm = bool(use_llm)
+
     result = intelligent_search(
         experiment,
         query=str(payload.get("query", "")),
@@ -391,6 +400,9 @@ def handle_intelligent_search(payload: dict, experiment: Experiment, default_top
         enable_kis=bool(payload.get("enable_kis", True)),
         enable_ocr=bool(payload.get("enable_ocr", True)),
         enable_asr=bool(payload.get("enable_asr", True)),
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
     )
     for r in result.get("results", []):
         if r.get("frame_path"):
@@ -408,12 +420,16 @@ def handle_kis_detail_2stage(payload: dict, experiment: Experiment) -> dict:
         raise ValueError("At least 1 specific subquery is required.")
     general = [str(s).strip() for s in general_raw if str(s).strip()]
     specific = [str(s).strip() for s in specific_raw if str(s).strip()]
+
+    enabled_models = payload.get("enabled_models") or None
+
     result = kis_detail_2stage_search(
         experiment=experiment,
         general=general,
         specific=specific,
         general_weights=payload.get("general_weights"),
         specific_weights=payload.get("specific_weights"),
+        enabled_models=enabled_models,
     )
     for r in result.get("results", []):
         if r.get("frame_path"):
@@ -421,7 +437,9 @@ def handle_kis_detail_2stage(payload: dict, experiment: Experiment) -> dict:
     return result
 
 
-def handle_compute_sub_score(payload: dict, experiment: Experiment, retriever) -> tuple[dict, HTTPStatus]:
+def handle_compute_sub_score(
+    payload: dict, experiment: Experiment, retriever
+) -> tuple[dict, HTTPStatus]:
     """Process /api/compute-sub-score."""
     frame_id = payload.get("frame_id")
     sub_text = payload.get("sub_text")
@@ -485,7 +503,10 @@ def handle_default_search(
 _FRAMES_BY_VIDEO_CACHE: dict[str, tuple[list[str], dict[str, list[dict]]]] = {}
 _VIDEO_TEXT_CACHE: dict[str, tuple[list[dict], list[dict]]] = {}
 
-def _get_frames_by_video(experiment: Experiment, video_id: str) -> tuple[list[str], dict[str, list[dict]]]:
+
+def _get_frames_by_video(
+    experiment: Experiment, video_id: str
+) -> tuple[list[str], dict[str, list[dict]]]:
     global _FRAMES_BY_VIDEO_CACHE
     if not _FRAMES_BY_VIDEO_CACHE:
         frames_path = experiment.run_dir / "manifests" / "frames.jsonl"
@@ -516,7 +537,6 @@ def _get_frames_by_video(experiment: Experiment, video_id: str) -> tuple[list[st
                         match = re.search(r"_f(\d+)", fid)
                         if match:
                             f_num = int(match.group(1))
-                            ts = round(f_num / 25.0, 2)
                             if idx is None or idx == 0:
                                 idx = f_num
 
@@ -577,24 +597,30 @@ def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPS
                 fts = f.get("timestamp_sec", 0.0)
 
                 matched_asr = [
-                    a["text"] for a in video_asr_texts
-                    if abs(a["timestamp_sec"] - fts) <= 25.0
+                    a["text"]
+                    for a in video_asr_texts
+                    if a.get("frame_id") == fid
+                    or (not a.get("frame_id") and a.get("timestamp_sec") == fts)
                 ]
                 matched_ocr = [
-                    o["text"] for o in video_ocr_texts
-                    if o["frame_id"] == fid or abs(o["timestamp_sec"] - fts) <= 5.0
+                    o["text"]
+                    for o in video_ocr_texts
+                    if o.get("frame_id") == fid
+                    or (not o.get("frame_id") and o.get("timestamp_sec") == fts)
                 ]
 
-                formatted_frames.append({
-                    "frame_id": fid,
-                    "frame_index": f.get("frame_index", 0),
-                    "timestamp_sec": fts,
-                    "frame_path": f.get("frame_path"),
-                    "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
-                    "caption": captions_map.get(fid, ""),
-                    "asr": " | ".join(matched_asr) if matched_asr else "",
-                    "ocr": " | ".join(matched_ocr) if matched_ocr else "",
-                })
+                formatted_frames.append(
+                    {
+                        "frame_id": fid,
+                        "frame_index": f.get("frame_index", 0),
+                        "timestamp_sec": fts,
+                        "frame_path": f.get("frame_path"),
+                        "image_url": f"/frame?path={quote(f.get('frame_path', ''))}",
+                        "caption": captions_map.get(fid, ""),
+                        "asr": " | ".join(matched_asr) if matched_asr else "",
+                        "ocr": " | ".join(matched_ocr) if matched_ocr else "",
+                    }
+                )
 
             shot_data = {
                 "shot_id": sid,
@@ -610,4 +636,3 @@ def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPS
     except Exception:
         LOGGER.exception("Failed to load shots for video=%s", video_id)
         return {"video_id": video_id, "video_name": video_name, "shots": []}, HTTPStatus.OK
-
