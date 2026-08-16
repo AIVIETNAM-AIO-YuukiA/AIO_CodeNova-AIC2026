@@ -235,3 +235,5 @@ qdrant_storage/
 
 # Elasticsearch local data
 elasticsearch_storage/
+
+scratchpad/

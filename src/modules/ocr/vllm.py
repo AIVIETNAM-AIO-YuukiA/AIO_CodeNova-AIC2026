@@ -7,6 +7,7 @@ import logging
 from core.errors import CaptioningError
 from modules._vllm_chat import VllmChatClient
 from modules.ocr.base import OcrModel
+from modules.ocr.validation import validate_ocr_text
 from prompts.ocr import NO_TEXT_MARKER, build_ocr_prompt
 
 LOGGER = logging.getLogger(__name__)
@@ -47,4 +48,10 @@ class VllmOcrModel(OcrModel):
             LOGGER.exception("vLLM OCR failed for %s: %s", frame_path, exc)
             raise CaptioningError(f"vLLM OCR failed for {frame_path}: {exc}") from exc
 
-        return "" if text.strip() == NO_TEXT_MARKER else text
+        text = "" if text.strip() == NO_TEXT_MARKER else text
+        validation = validate_ocr_text(text)
+        if not validation.valid:
+            reasons = ", ".join(validation.reasons)
+            LOGGER.warning("Invalid OCR output for %s: %s", frame_path, reasons)
+            raise CaptioningError(f"Invalid OCR output for {frame_path}: {reasons}")
+        return text

@@ -48,20 +48,34 @@ def _pick_one_frame_per_shot(frames: list[FrameRecord]) -> list[FrameRecord]:
 
 
 class _TextSink:
-    """Writes documents to the text index and mirrors them into text.jsonl."""
+    """Writes documents to the text index and mirrors them into text.jsonl.
+
+    Elasticsearch dedupes writes on its own (``doc_id`` is the document
+    ``_id``, so a rewrite is an upsert, not a duplicate) — but a video whose
+    ASR/OCR finished writing documents and then crashed before ``JobState``
+    recorded it as ``COMPLETED`` gets reprocessed on the next run, and
+    text.jsonl is append-only, so it would otherwise pick up a second copy
+    of every document. Track doc_ids already on disk (seeded from the
+    existing file) so a rerun's writes are skipped here instead.
+    """
 
     def __init__(self, experiment) -> None:
         self._index = build_text_index(experiment)
         self._manifest = JsonlManifest(experiment.run_dir / "manifests" / "text.jsonl")
         self._lock = threading.Lock()
+        self._known_doc_ids = {
+            str(row["doc_id"]) for row in self._manifest.read_all() if "doc_id" in row
+        }
 
     def write(self, documents: list[TextDocument]) -> None:
         if not documents:
             return
         self._index.index_documents(documents)
         with self._lock:
-            for doc in documents:
+            new_documents = [doc for doc in documents if doc.doc_id not in self._known_doc_ids]
+            for doc in new_documents:
                 self._manifest.append(asdict(doc))
+                self._known_doc_ids.add(doc.doc_id)
 
 
 def extract_ocr(experiment, force: bool = False) -> int:

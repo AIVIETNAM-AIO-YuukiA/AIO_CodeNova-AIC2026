@@ -34,6 +34,10 @@ QUY TẮC BẮT BUỘC:
 1. Chỉ dùng tiếng Việt. Không chèn tiếng Anh trừ khi đó là chữ/số
    xuất hiện trực tiếp trên màn hình (biển hiệu, phụ đề, số liệu, tên
    riêng nước ngoài).
+   Tuyệt đối không dùng chữ Hán/CJK hoặc tiếng Trung để mô tả cảnh.
+   Nếu màn hình thật sự có chữ Trung Quốc/chữ Hán, chỉ viết bằng tiếng Việt
+   rằng ảnh có chữ Trung Quốc/chữ Hán; không chép nguyên văn các ký tự đó
+   vào caption vì OCR là pipeline riêng.
 2. Văn phong đời thường, viết như tường thuật lại những gì nhìn thấy.
    Cấm dùng từ hoa mỹ, ẩn dụ, ví von, đánh giá cảm xúc (KHÔNG viết
    "khung cảnh nên thơ", "ánh sáng lung linh huyền ảo", "tuyệt đẹp",
@@ -53,7 +57,10 @@ QUY TẮC BẮT BUỘC:
    không chắc, mô tả chung chung thay vì đoán chi tiết.
 5. Không lặp lại chủ ngữ "trong ảnh", "hình ảnh cho thấy", "có thể thấy"
    nhiều lần. Vào thẳng nội dung mô tả.
-6. Độ dài: 3-5 câu, khoảng 50-100 từ. Không viết dài hơn."""
+6. Độ dài: 3-5 câu, khoảng 50-100 từ. Không viết dài hơn.
+7. Không giải thích quá trình suy luận, không tự nhận lỗi, không viết nội
+   dung meta như "lỗi hệ thống", "xử lý sai mã", "sửa lại", "đoạn trên".
+8. Không lặp từ, cụm từ hoặc ký tự bất thường."""
 
 CAPTION_USER_TEMPLATE = """Mô tả khung hình này theo đúng 5 phần sau, viết liền thành đoạn văn
 (không cần đánh số/gạch đầu dòng), theo ĐÚNG thứ tự:
@@ -79,12 +86,12 @@ CAPTION_USER_TEMPLATE = """Mô tả khung hình này theo đúng 5 phần sau, v
 
 5. CHỮ TRÊN MÀN HÌNH: mọi chữ, số, thanh chạy chữ (ticker) dưới màn hình,
    tên chương trình, logo kênh, bảng số liệu, phụ đề tên người đang phỏng
-   vấn xuất hiện trong ảnh — CHÉP LẠI CHÍNH XÁC nội dung trong dấu ngoặc
-   kép, kể cả khi không chắc chắn 100% (chép đúng gần nhất theo những gì
-   đọc được, không được bỏ qua vì không chắc). Nếu ảnh có nhiều dòng chữ
-   khác nhau, liệt kê từng đoạn trong ngoặc kép riêng. Nếu hoàn toàn không
-   có chữ/số nào trong ảnh, bỏ qua phần này, không viết "không có chữ"
-   hay câu tương đương.
+   vấn xuất hiện trong ảnh. Chỉ chép lại chính xác nội dung tiếng Việt,
+   số, ký hiệu hoặc tên riêng Latin trong dấu ngoặc kép. Nếu chữ trên màn
+   hình là tiếng Trung/chữ Hán, chỉ viết bằng tiếng Việt rằng có chữ Trung
+   Quốc/chữ Hán, không chép nguyên văn ký tự Hán. Nếu hoàn toàn không có
+   chữ/số nào trong ảnh, bỏ qua phần này, không viết "không có chữ" hay
+   câu tương đương.
 
 Viết thành 3-5 câu liền mạch, không dùng gạch đầu dòng, không nhắc lại
 tên 5 phần trên trong câu trả lời."""

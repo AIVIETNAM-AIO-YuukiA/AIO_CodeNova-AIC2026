@@ -148,10 +148,15 @@ Pass `--transnetv2-weights` to point at an existing `.pth` and skip all of it.
 
 ## Running the pipeline
 
-`EXP` selects the experiment (run) name; run `make help` for all targets.
+`EXP` selects the experiment (run) name — every stage reads/writes
+`runs/<EXP>/` (manifests, frames, embeddings, `jobs.sqlite`, logs). So
+`EXP=result` means all commands below operate on `runs/result/`; `INPUT`
+only matters for `ingest` (it's where the source videos are, e.g.
+`data/raw_videos`) and is not tied to `EXP` beyond that first call. Run
+`make help` for the full target list.
 
 ```bash
-# Full offline pipeline (vector index only)
+# Full offline pipeline (vector index only) — first run, new experiment
 make pipeline EXP=demo INPUT=data/raw_videos
 
 # Or step by step
@@ -172,8 +177,56 @@ make search   EXP=demo QUERY="a person riding a motorbike"
 make serve-ui EXP=demo            # http://127.0.0.1:7860 (tracks + agent chat)
 ```
 
-Each stage records progress in `runs/<EXP>/jobs.sqlite`; re-running a stage
-skips completed work. Pass `--force` (raw CLI) to redo a stage.
+Each stage records progress per video/frame in `runs/<EXP>/jobs.sqlite`;
+re-running a stage skips completed work, so it's always safe to re-run the
+same command to pick up where it left off. Pass `--force` (raw CLI) to redo
+a stage from scratch instead of skipping.
+
+### Adding more videos to an existing experiment
+
+Drop the new files into the same `INPUT` directory (e.g. more `.mp4`s into
+`data/raw_videos`) and re-run the pipeline with **the same `EXP`** plus
+`RESUME=1` on `ingest` — without it, `ingest` refuses to touch an experiment
+that already exists (`Experiment '<EXP>' already exists. Use --resume or
+choose another name.`), because `--resume` is what tells it "add to
+`runs/<EXP>/`" instead of "this should be empty":
+
+```bash
+make ingest         EXP=demo INPUT=data/raw_videos RESUME=1
+make detect-shots   EXP=demo
+make extract-frames EXP=demo
+make embed-frames   EXP=demo
+make build-index    EXP=demo
+```
+
+`detect-shots`/`extract-frames`/`embed-frames`/`build-index` don't need
+`RESUME` — they're incremental by video/frame id already, so they only
+process what's new; passing them on the existing `EXP` is enough.
+
+On **PowerShell**, chain the stages with `&&` on one line (PowerShell 7+) so
+a failed stage stops the rest instead of silently continuing on stale data:
+
+```powershell
+make ingest EXP=demo INPUT=data/raw_videos RESUME=1 && make detect-shots EXP=demo && make extract-frames EXP=demo
+```
+
+Splitting that across multiple lines pasted into the same prompt does **not**
+run them sequentially the way a `.sh` script would — PowerShell treats an
+unterminated line as a continuation (`>>` prompt), so paste one `&&`-joined
+line, or run each `make` command separately and check its exit status before
+moving to the next.
+
+If `--embedding-models` includes `vietnamese-embedding`, `make embed-frames`
+alone **skips** frames with no caption yet — the Makefile target doesn't
+expose `--caption-missing`, so call the CLI directly to caption+embed them:
+
+```bash
+uv run codenova embed-frames --experiment-name demo --caption-missing --embedding-models vietnamese-embedding
+```
+
+Captioning calls an external VLM per frame in chunks, so one run only
+processes one chunk before exiting; re-run the exact same command until it
+reports `"embeddings": 0` to confirm every frame is captioned.
 
 ### Re-indexing after an embedding-model change
 

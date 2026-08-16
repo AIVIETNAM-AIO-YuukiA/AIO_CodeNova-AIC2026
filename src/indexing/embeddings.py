@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from core.errors import EmbeddingError
 from core.logging import get_logger
 
 from config.settings import Experiment
@@ -35,43 +36,68 @@ _EMBED_CHUNK_SIZE = int(os.environ.get("EMBED_CHUNK_SIZE", "2000"))
 class _CheckpointWriter:
     """Buffers embedded (frame_id, vector) pairs and periodically flushes them
     to a ``*.checkpoint.npz`` / ``*.checkpoint.json`` pair, so a run killed
-    mid-model can resume from the last flush instead of from scratch."""
+    mid-model can resume from the last flush instead of from scratch.
+
+    Vectors are kept as a NumPy array, not a Python list of lists: with
+    hundreds of thousands of 1152-dim float vectors, each Python float object
+    costs ~28 bytes vs. 4 bytes packed in a float32 array — a list-of-lists
+    of e.g. 175K x 1152 floats runs to ~7GB of pure object overhead, most of
+    a laptop's RAM, for data a NumPy array holds in under 1GB.
+    """
 
     def __init__(self, np, checkpoint_vectors_path, checkpoint_ids_path, prior_ids, prior_vectors):
         self._np = np
         self._vectors_path = checkpoint_vectors_path
         self._ids_path = checkpoint_ids_path
         self._ids: list[str] = list(prior_ids)
-        self._vectors: list = list(prior_vectors)
+        self._vectors = np.asarray(prior_vectors, dtype="float32") if len(prior_vectors) else None
+        self._pending: list = []
         self._last_flush = time.monotonic()
 
     def add_batch(self, frames: list[FrameRecord], vectors: list[list[float]]) -> None:
         self._ids.extend(frame.frame_id for frame in frames)
-        self._vectors.extend(vectors)
+        self._pending.extend(vectors)
         now = time.monotonic()
         if now - self._last_flush >= _CHECKPOINT_INTERVAL_SECONDS:
             self.flush()
             self._last_flush = now
 
+    def _merge_pending(self) -> None:
+        """Fold buffered raw batches into the NumPy array, then drop the list."""
+        if not self._pending:
+            return
+        new_array = self._np.asarray(self._pending, dtype="float32")
+        self._vectors = (
+            new_array
+            if self._vectors is None
+            else self._np.concatenate([self._vectors, new_array], axis=0)
+        )
+        self._pending = []
+
     def flush(self) -> None:
         """Write vectors/ids atomically (temp file + rename)."""
         if not self._ids:
             return
-        array = self._np.asarray(self._vectors, dtype="float32")
+        self._merge_pending()
         vectors_tmp = self._vectors_path.with_name(self._vectors_path.name + ".tmp.npz")
         ids_tmp = self._ids_path.with_suffix(self._ids_path.suffix + ".tmp")
-        self._np.savez(vectors_tmp, embeddings=array)
+        self._np.savez(vectors_tmp, embeddings=self._vectors)
         ids_tmp.write_text(json.dumps(self._ids) + "\n", encoding="utf-8")
         vectors_tmp.replace(self._vectors_path)
         ids_tmp.replace(self._ids_path)
 
 
 def _load_checkpoint(np, checkpoint_vectors_path, checkpoint_ids_path):
-    """Return (ids, vectors) from a prior interrupted run's checkpoint, or empty lists."""
+    """Return (ids, vectors) from a prior interrupted run's checkpoint, or empty lists.
+
+    ``vectors`` stays a NumPy array (not ``.tolist()``) — callers that only
+    need it to seed ``_CheckpointWriter`` or build the final ``.npz`` should
+    never round-trip through a Python list of floats.
+    """
     if not (checkpoint_vectors_path.exists() and checkpoint_ids_path.exists()):
-        return [], []
+        return [], np.empty((0, 0), dtype="float32")
     ids = json.loads(checkpoint_ids_path.read_text(encoding="utf-8"))
-    vectors = np.load(checkpoint_vectors_path)["embeddings"].astype("float32").tolist()
+    vectors = np.load(checkpoint_vectors_path)["embeddings"].astype("float32")
     return ids, vectors
 
 
@@ -84,8 +110,16 @@ def _captioned_frame_ids(captions_path) -> set[str]:
     """Return frame_ids that already have a cached caption in captions.jsonl."""
     if not captions_path.exists():
         return set()
+    from modules.captioning.validation import validate_caption
+
     manifest = JsonlManifest(captions_path)
-    return {row["frame_id"] for row in manifest.read_all() if row.get("frame_id")}
+    captioned: set[str] = set()
+    for row in manifest.read_all():
+        frame_id = row.get("frame_id")
+        caption = row.get("caption")
+        if frame_id and validate_caption(str(caption) if caption is not None else None).valid:
+            captioned.add(str(frame_id))
+    return captioned
 
 
 def embed_frames(
@@ -147,7 +181,7 @@ def embed_frames(
         checkpoint_ids, checkpoint_vectors = (
             _load_checkpoint(np, model_checkpoint_vectors_path, model_checkpoint_ids_path)
             if not force
-            else ([], [])
+            else ([], np.empty((0, 0), dtype="float32"))
         )
         if checkpoint_ids:
             LOGGER.info(
@@ -205,20 +239,52 @@ def embed_frames(
                 checkpoint_vectors,
             )
             # Chia nho theo _EMBED_CHUNK_SIZE de RAM khong phinh to: vietnamese-embedding
-            # giu ca future + caption + vector cho tung frame dang xu ly, voi 60k frame
-            # trong 1 lan goi tung len ~4GB va lam doi GPU embedder khac chay cung.
-            # Van checkpoint theo tung batch nen khong anh huong toi viec resume.
-            fresh_vectors: list = []
+            # giu ca future + caption cho tung frame dang xu ly, voi 60k frame trong 1
+            # lan goi tung len ~4GB va lam doi GPU embedder khac chay cung.
+            #
+            # KHONG giu song song 1 ban fresh_ids/fresh_vectors trong RAM - checkpoint_writer
+            # da la nguon su that duy nhat (flush xuong dia moi _CHECKPOINT_INTERVAL_SECONDS
+            # hoac cuoi cung o day). Voi vai tram nghin frame, giu 2 ban trung lap se lam
+            # RAM phinh gap doi khong can thiet.
+            expected_count = len(checkpoint_ids)
+
+            def _record_embedded_batch(
+                batch_frames: list[FrameRecord], batch_vectors: list[list[float]]
+            ) -> None:
+                nonlocal expected_count
+                checkpoint_writer.add_batch(batch_frames, batch_vectors)
+                expected_count += len(batch_frames)
+
             for start in range(0, len(new_frames), _EMBED_CHUNK_SIZE):
                 chunk = new_frames[start : start + _EMBED_CHUNK_SIZE]
-                fresh_vectors.extend(
-                    embedder.embed_images(chunk, on_batch=checkpoint_writer.add_batch)
-                )
+                before = expected_count
+                returned_vectors = embedder.embed_images(chunk, on_batch=_record_embedded_batch)
+                if expected_count == before and returned_vectors:
+                    if len(returned_vectors) != len(chunk):
+                        raise EmbeddingError(
+                            f"Embedder '{model_name}' returned {len(returned_vectors)} "
+                            f"vectors for {len(chunk)} frames without reporting frame ids."
+                        )
+                    _record_embedded_batch(chunk, returned_vectors)
 
-            # new_frames da loai tru phan checkpoint cover roi, nen ket qua cuoi
-            # cua model = checkpoint mang sang + ket qua lan chay nay.
-            new_ids = checkpoint_ids + [frame.frame_id for frame in new_frames]
-            new_vectors = np.asarray(checkpoint_vectors + list(fresh_vectors), dtype="float32")
+            # Ep flush lan cuoi (add_batch chi flush moi _CHECKPOINT_INTERVAL_SECONDS,
+            # nen phan chua flush cua batch cuoi van con nam trong RAM cua
+            # checkpoint_writer, chua ra dia) roi doc lai tu dia lam ket qua cuoi cung.
+            checkpoint_writer.flush()
+            new_ids, new_vectors = _load_checkpoint(
+                np, model_checkpoint_vectors_path, model_checkpoint_ids_path
+            )
+
+        # Moi frame trong new_frames co the that bai het (vd: toan bo con lai
+        # deu bi VLM tu choi vi Han/CJK) - new_vectors khi do la mang rong 1
+        # chieu, khong ghep duoc voi existing_vectors 2 chieu qua concatenate.
+        # Khong co gi moi de ghi thi giu nguyen file cu, khoi dung toi no.
+        if not new_ids:
+            LOGGER.info(
+                "[%s] No frame captioned successfully this pass; leaving existing file untouched",
+                model_name,
+            )
+            continue
 
         if existing_vectors is not None and len(existing_vectors):
             vectors = np.concatenate([existing_vectors, new_vectors], axis=0)

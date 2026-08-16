@@ -15,7 +15,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
         vllm-index-up vllm-index-down vllm-index-health \
-        ingest detect-shots extract-frames embed-frames build-index extract-text export-text import-text pipeline \
+        ingest detect-shots extract-frames embed-frames build-index extract-text extract-asr extract-ocr export-text import-text pipeline \
         search serve-ui clean-runs clean
 
 help: ## Hiện danh sách lệnh này
@@ -107,7 +107,13 @@ build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
 	uv run codenova build-index --experiment-name $(EXP)
 
 extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
-	uv run codenova extract-text --experiment-name $(EXP)	
+	uv run codenova extract-text --experiment-name $(EXP)
+
+extract-asr: ## Chỉ chạy ASR, index vào Elasticsearch (EXP); cần Elasticsearch đang chạy (không cần vllm-index)
+	uv run codenova extract-text --experiment-name $(EXP) --skip-ocr
+
+extract-ocr: ## Chỉ chạy OCR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
+	uv run codenova extract-text --experiment-name $(EXP) --skip-asr
 
 export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifests/text.jsonl (EXP)
 	uv run codenova export-text --experiment-name $(EXP)

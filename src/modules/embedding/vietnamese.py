@@ -22,6 +22,7 @@ from core.errors import EmbeddingError
 from core.types import FrameRecord
 from indexing.manifest import JsonlManifest
 from modules.captioning.base import CaptioningModel
+from modules.captioning.validation import validate_caption
 from modules.embedding.base import BatchCallback, BatchProgressLogger, Embedder
 
 LOGGER = logging.getLogger(__name__)
@@ -75,7 +76,7 @@ class VietnameseEmbedder(Embedder):
             return []
         self._load_caption_cache()
         progress = BatchProgressLogger(LOGGER, f"{self.model_name} (captioning)", len(frames))
-        captions: list[str | None] = [None] * len(frames)
+        captions_by_index: list[str | None] = [None] * len(frames)
         failed = 0
         with ThreadPoolExecutor(max_workers=self.caption_workers) as executor:
             future_to_index = {
@@ -84,19 +85,28 @@ class VietnameseEmbedder(Embedder):
             for future in as_completed(future_to_index):
                 index = future_to_index[future]
                 try:
-                    captions[index] = future.result()
+                    captions_by_index[index] = future.result()
                 except Exception:
                     # One frame the VLM refuses (a 400 from a content filter, a
-                    # transient upstream fault) must not discard the whole
-                    # batch's captions. Embed it as empty text and move on; a
-                    # later run retries it, since it never reaches captions.jsonl.
+                    # transient upstream fault) must not discard successful
+                    # captions in the same chunk. Do not embed an empty string:
+                    # without a vector/checkpoint row this frame remains
+                    # eligible for a later ``embed-frames --caption-missing`` run.
                     LOGGER.exception("Captioning failed for %s", frames[index].frame_path)
-                    captions[index] = ""
                     failed += 1
                 progress.advance(1)
         if failed:
             LOGGER.warning("%s/%s frames could not be captioned this pass", failed, len(frames))
-        return self._embed_texts(captions, frames=frames, on_batch=on_batch)
+        successful_frames = []
+        captions = []
+        for frame, caption in zip(frames, captions_by_index):
+            if caption is None:
+                continue
+            successful_frames.append(frame)
+            captions.append(caption)
+        if not captions:
+            return []
+        return self._embed_texts(captions, frames=successful_frames, on_batch=on_batch)
 
     def embed_text(self, query: str) -> list[float]:
         """Embed 1 cau query."""
@@ -146,7 +156,15 @@ class VietnameseEmbedder(Embedder):
         """
         cache = self._caption_cache
         if cache is not None and frame.frame_id in cache:
-            return cache[frame.frame_id]
+            cached = cache[frame.frame_id]
+            validation = validate_caption(cached)
+            if validation.valid:
+                return cached
+            LOGGER.warning(
+                "Ignoring invalid cached caption for %s: %s",
+                frame.frame_id,
+                ", ".join(validation.reasons),
+            )
 
         captioner = self._load_captioner()
         caption = captioner.caption(frame.frame_path)

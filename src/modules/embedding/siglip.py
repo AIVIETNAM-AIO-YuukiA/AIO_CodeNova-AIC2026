@@ -101,28 +101,45 @@ class SiglipEmbedder(Embedder):
         vectors: list[list[float]] = []
         progress = BatchProgressLogger(LOGGER, self.model_name, len(frames))
         with ThreadPoolExecutor(max_workers=_DECODE_WORKERS) as executor:
-            for start in range(0, len(frames), self.batch_size):
-                batch = frames[start : start + self.batch_size]
-                images = list(executor.map(_load_image, batch))
-                try:
-                    inputs = processor(images=images, return_tensors="pt").to(device)
-                    if use_trt:
+            if use_trt:
+                # TensorRT engine duoc build san cho 1 kich thuoc batch co dinh
+                # (opt_batch), nen van goi theo lo o day.
+                for start in range(0, len(frames), self.batch_size):
+                    batch = frames[start : start + self.batch_size]
+                    images = list(executor.map(_load_image, batch))
+                    try:
+                        inputs = processor(images=images, return_tensors="pt").to(device)
                         raw = self._trt_encoder.infer(inputs["pixel_values"].to(torch.float32))
-                        features = torch.nn.functional.normalize(raw, p=2, dim=-1)
-                    else:
+                        features = torch.nn.functional.normalize(raw, p=2, dim=-1, eps=1e-8)
+                        batch_vectors = features.detach().cpu().numpy().astype("float32").tolist()
+                        vectors.extend(batch_vectors)
+                    finally:
+                        for image in images:
+                            image.close()
+                    progress.advance(len(batch))
+                    if on_batch is not None:
+                        on_batch(batch, batch_vectors)
+                    if _BATCH_COOLDOWN:
+                        time.sleep(_BATCH_COOLDOWN)
+            else:
+                # Khong TensorRT: xu ly tung anh mot (giong AIC_2025's
+                # get_image_embedding) thay vi batch GPU thuc su.
+                for frame in frames:
+                    image = _load_image(frame)
+                    try:
+                        inputs = processor(images=image, return_tensors="pt").to(device)
                         with torch.no_grad(), _autocast(torch, device):
                             features = projected_features(model.get_image_features(**inputs))
-                            features = torch.nn.functional.normalize(features, p=2, dim=-1)
-                    batch_vectors = features.detach().cpu().numpy().astype("float32").tolist()
-                    vectors.extend(batch_vectors)
-                finally:
-                    for image in images:
+                            features = torch.nn.functional.normalize(features, p=2, dim=-1, eps=1e-8)
+                        vector = features.detach().cpu().numpy().astype("float32").tolist()
+                        vectors.extend(vector)
+                    finally:
                         image.close()
-                progress.advance(len(batch))
-                if on_batch is not None:
-                    on_batch(batch, batch_vectors)
-                if _BATCH_COOLDOWN:
-                    time.sleep(_BATCH_COOLDOWN)
+                    progress.advance(1)
+                    if on_batch is not None:
+                        on_batch([frame], vector)
+                    if _BATCH_COOLDOWN:
+                        time.sleep(_BATCH_COOLDOWN)
         return vectors
 
     def _export_onnx(self, onnx_path: Path) -> None:
@@ -198,8 +215,15 @@ class SiglipEmbedder(Embedder):
         # sau do se bao loi "Cannot copy out of meta tensor" - da kiem tra
         # cach nay khong dinh loi do.
         model = AutoModel.from_pretrained(
-            self.model_name, dtype=dtype
+            self.model_name, dtype=dtype, device_map="auto", low_cpu_mem_usage=True
         ).to(device).eval()
+        # torch.compile giam overhead Python giua cac lan goi lien tiep -
+        # chi co loi khi khong dung TensorRT (nhanh hon nhieu, khong can compile).
+        if hasattr(torch, "compile") and device.type == "cuda":
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+            except Exception:
+                LOGGER.warning("[%s] torch.compile khong kha dung, dung eager mode", self.model_name)
         self._model = model
         self._processor = processor
         self._torch = torch

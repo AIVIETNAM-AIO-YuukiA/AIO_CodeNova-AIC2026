@@ -115,3 +115,30 @@ def test_resumes_from_mid_model_checkpoint(tmp_path, monkeypatch) -> None:
     # checkpoint files are cleaned up once the model finishes
     assert not (output_dir / f"frame_ids__{MODEL}.checkpoint.json").exists()
     assert not (output_dir / f"frames__{MODEL}.checkpoint.npz").exists()
+
+
+def test_embedder_can_report_subset_of_successful_frames(tmp_path, monkeypatch) -> None:
+    import numpy as np
+
+    class PartialEmbedder:
+        def embed_images(self, frames: list[FrameRecord], on_batch=None) -> list[list[float]]:
+            successful = [frames[0]]
+            vectors = [[1.0, 2.0]]
+            if on_batch is not None:
+                on_batch(successful, vectors)
+            return vectors
+
+    exp = _experiment(tmp_path)
+    monkeypatch.setattr(embeddings, "build_embedder", lambda **kw: PartialEmbedder())
+
+    _add_frame(tmp_path, "v1_s0_f1")
+    _add_frame(tmp_path, "v1_s0_f2")
+
+    added = embeddings.embed_frames(exp)
+
+    assert added == 1
+    output_dir = tmp_path / "embeddings"
+    ids = json.loads((output_dir / f"frame_ids__{MODEL}.json").read_text())
+    vecs = np.load(output_dir / f"frames__{MODEL}.npz")["embeddings"]
+    assert ids == ["v1_s0_f1"]
+    assert vecs.shape == (1, 2)

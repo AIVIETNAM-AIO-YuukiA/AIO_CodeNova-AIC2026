@@ -10,18 +10,24 @@ import sys
 
 from dotenv import load_dotenv
 
-from config.settings import Experiment, PipelineConfig, validate_experiment_name
-from core.errors import CodeNovaError
-from core.logging import configure_logging, get_logger
-from indexing.build_index import build_index
-from indexing.embeddings import embed_frames
-from indexing.extract_text import export_text, extract_asr, extract_ocr, import_text
-from indexing.frames import extract_frames
-from indexing.ingest import ingest_videos
-from indexing.shots import detect_shots
-from modules.reranker.base import build_reranker
-from retrieval import build_retriever
-from ui.server import serve_ui
+# Phai chay TRUOC moi import noi bo: nhieu module (vd modules/embedding/siglip.py)
+# doc os.environ.get("SOME_FLAG", ...) ngay o module-level luc import, khong phai
+# luc goi ham. Neu load_dotenv() chay sau (vd trong main()), cac module da import
+# se dong bang gia tri mac dinh truoc khi .env kip nap - .env bi lang phi vo hieu.
+load_dotenv()
+
+from config.settings import Experiment, PipelineConfig, validate_experiment_name  # noqa: E402
+from core.errors import CodeNovaError  # noqa: E402
+from core.logging import configure_logging, get_logger  # noqa: E402
+from indexing.build_index import build_index  # noqa: E402
+from indexing.embeddings import embed_frames  # noqa: E402
+from indexing.extract_text import export_text, extract_asr, extract_ocr, import_text  # noqa: E402
+from indexing.frames import extract_frames  # noqa: E402
+from indexing.ingest import ingest_videos  # noqa: E402
+from indexing.shots import detect_shots  # noqa: E402
+from modules.reranker.base import build_reranker  # noqa: E402
+from retrieval import build_retriever  # noqa: E402
+from ui.server import serve_ui  # noqa: E402
 
 LOGGER = get_logger(__name__)
 
@@ -339,7 +345,6 @@ def handle_serve_ui(args: Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the command-line interface."""
-    load_dotenv()
     parser = build_parser()
     args = parser.parse_args(argv)
 
