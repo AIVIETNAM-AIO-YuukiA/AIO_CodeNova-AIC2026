@@ -24,31 +24,17 @@ from config.settings import Experiment
 from retrieval.hydrator import ResultHydrator
 from stores.vector.base import frame_result
 from retrieval.temporal_search import load_temporal_data
+from stores.text.factory import build_text_index
+from retrieval.text_search import NearestFrameIndex
 
 LOGGER = logging.getLogger(__name__)
 
 
 def _get_timestamp_sec(rec: dict) -> float:
-    """Calculate timestamp_sec from record metadata or frame_id if timestamp_sec is 0.0/None."""
+    """Get timestamp_sec from record metadata (provided by map-keyframes JSON)."""
     ts = rec.get("timestamp_sec")
-    if ts is not None and float(ts) > 0.0:
+    if ts is not None:
         return float(ts)
-    fi = rec.get("frame_index")
-    if fi is not None and float(fi) > 0.0:
-        return float(fi) / 25.0
-    fid = str(rec.get("frame_id", ""))
-    if "_f" in fid:
-        try:
-            frame_num = int(fid.split("_f")[-1])
-            return float(frame_num) / 25.0
-        except ValueError:
-            pass
-    nums = re.findall(r"\d+", fid)
-    if nums:
-        try:
-            return float(nums[-1]) / 25.0
-        except ValueError:
-            pass
     return 0.0
 
 
@@ -73,8 +59,52 @@ def _build_video_index(
     return index
 
 
-def _search_event_kis(
-    retriever,
+def _fetch_text_scores_to_ram(experiment: Experiment, processed) -> dict:
+    """Fetch global BM25 scores into RAM for fast window lookup."""
+    index = build_text_index(experiment)
+    nearest = NearestFrameIndex(experiment)
+
+    def _fetch(keywords, source):
+        if not keywords:
+            return {}, 0.0
+        best_score = {}
+        for kw in keywords:
+            for doc in index.search_documents(kw, top_k=5000, source=source):
+                fid = doc.get("frame_id")
+                if not fid and source == "asr":
+                    fid = nearest.nearest(doc.get("video_id", ""), doc.get("timestamp_sec") or 0.0)
+                if not fid:
+                    continue
+                s = float(doc.get("score", 0.0))
+                if s > best_score.get(fid, -1.0):
+                    best_score[fid] = s
+        m_score = max(best_score.values()) if best_score else 0.0
+        return best_score, m_score
+
+    ocr_d, max_ocr = _fetch(processed.ocr_keywords, "ocr")
+    asr_d, max_asr = _fetch(processed.asr_keywords, "asr")
+    cap_d, max_cap = _fetch(processed.caption_keywords, "caption")
+
+    weights = processed.weights
+    fusion_weights = {
+        "ocr": weights.get("ocr_bonus", 0.0),
+        "asr": weights.get("asr_bonus", 0.0),
+        "caption": weights.get("caption_bonus", 0.0),
+    }
+
+    return {
+        "ocr_dict": ocr_d,
+        "max_ocr": max_ocr,
+        "asr_dict": asr_d,
+        "max_asr": max_asr,
+        "cap_dict": cap_d,
+        "max_cap": max_cap,
+        "fusion_weights": fusion_weights,
+    }
+
+
+def _search_event_intelligent(
+    experiment: Experiment,
     event_text: str,
     event_index: int,
     top_k: int = 300,
@@ -82,45 +112,52 @@ def _search_event_kis(
     use_reranker: bool | None = None,
     use_llm: bool = True,
 ) -> list[dict]:
-    """Search one event globally using Bản 1's full KIS Basic pipeline.
+    """Search one event globally using intelligent_search."""
+    # Imported lazily: retrieval/__init__ pulls in trake_search, and
+    # intelligent_search reaches back into retrieval.vqa -> agent ->
+    # retrieval.temporal_search, so importing it at module scope makes
+    # `import retrieval` a circular import.
+    from retrieval.intelligent_search import intelligent_search
 
-    Retriever.search handles multi-model embedding, SRRF fusion, BLIP-2 reranking,
-    and metadata hydration. Returns up to `top_k` distinct enriched frame dicts.
-    """
-    results = retriever.search(
+    response = intelligent_search(
+        experiment=experiment,
         query=event_text,
         top_k=top_k,
+        enable_kis=True,
+        enable_ocr=True,
+        enable_asr=True,
+        enable_caption=True,
         enabled_models=enabled_models,
         use_reranker=use_reranker,
         use_llm=use_llm,
     )
     out = []
     seen_fids = set()
-    for rank, r in enumerate(results, start=1):
-        if r.frame_id in seen_fids:
+    for rank, r in enumerate(response.get("results", []), start=1):
+        if r["frame_id"] in seen_fids:
             continue
-        seen_fids.add(r.frame_id)
-        ts = r.timestamp_sec
+        seen_fids.add(r["frame_id"])
+        ts = r.get("timestamp_sec")
         if ts is None or ts == 0.0:
             ts = _get_timestamp_sec(
                 {
-                    "frame_id": r.frame_id,
-                    "timestamp_sec": r.timestamp_sec,
-                    "frame_index": r.frame_index,
+                    "frame_id": r["frame_id"],
+                    "timestamp_sec": r.get("timestamp_sec"),
+                    "frame_index": r.get("frame_index"),
                 }
             )
         out.append(
             {
                 "event_index": event_index,
                 "rank": rank,
-                "score": r.score,
-                "frame_id": r.frame_id,
-                "video_id": r.video_id,
-                "video_name": r.video_name or r.video_id,
-                "frame_path": r.frame_path,
+                "score": r["score"],
+                "frame_id": r["frame_id"],
+                "video_id": r["video_id"],
+                "video_name": r.get("video_name") or r["video_id"],
+                "frame_path": r["frame_path"],
                 "timestamp_sec": ts,
-                "shot_id": r.shot_id,
-                "frame_index": r.frame_index,
+                "shot_id": r.get("shot_id"),
+                "frame_index": r.get("frame_index"),
             }
         )
     return out
@@ -165,6 +202,7 @@ def _window_search_fwd(
     frame_embeddings: np.ndarray,
     frame_records: list[dict],
     hydrator: ResultHydrator,
+    text_context: dict | None = None,
 ) -> list[tuple[dict, float]]:
     """In-memory cosine search in (t_start, t_start + window].
 
@@ -180,15 +218,43 @@ def _window_search_fwd(
     idxs = idx_list[lo:hi]
     embs = frame_embeddings[idxs]
     sims = embs @ query_embed
-    top_n = min(30, len(sims))
+
+    final_scores = np.copy(sims)
+    if text_context:
+        w_ocr = text_context["fusion_weights"]["ocr"]
+        w_asr = text_context["fusion_weights"]["asr"]
+        w_cap = text_context["fusion_weights"]["caption"]
+
+        m_ocr = max(text_context["max_ocr"], 15.0)
+        m_asr = max(text_context["max_asr"], 15.0)
+        m_cap = max(text_context["max_cap"], 15.0)
+
+        for i, pos in enumerate(idxs):
+            rec = frame_records[pos]
+            fid = rec.get("frame_id")
+            if not fid:
+                continue
+
+            ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
+            asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
+            cap_s = text_context["cap_dict"].get(fid, 0.0) / m_cap
+
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s) + (w_cap * cap_s)
+            final_scores[i] += bonus
+
+        global_max_possible = 1.0 + w_ocr + w_asr + w_cap
+        if global_max_possible > 0:
+            final_scores = final_scores / global_max_possible
+
+    top_n = min(30, len(final_scores))
     if top_n == 0:
         return []
-    top_pos = np.argpartition(sims, -top_n)[-top_n:]
-    top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
+    top_pos = np.argpartition(final_scores, -top_n)[-top_n:]
+    top_pos = top_pos[np.argsort(final_scores[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
     seen_fids: set[str] = set()
     for pos in top_pos:
-        score = float(sims[pos])
+        score = float(final_scores[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
@@ -237,6 +303,7 @@ def _window_search_bwd(
     frame_embeddings: np.ndarray,
     frame_records: list[dict],
     hydrator: ResultHydrator,
+    text_context: dict | None = None,
 ) -> list[tuple[dict, float]]:
     """In-memory cosine search in [t_end - window, t_end).
 
@@ -252,15 +319,43 @@ def _window_search_bwd(
     idxs = idx_list[lo:hi]
     embs = frame_embeddings[idxs]
     sims = embs @ query_embed
-    top_n = min(30, len(sims))
+
+    final_scores = np.copy(sims)
+    if text_context:
+        w_ocr = text_context["fusion_weights"]["ocr"]
+        w_asr = text_context["fusion_weights"]["asr"]
+        w_cap = text_context["fusion_weights"]["caption"]
+
+        m_ocr = max(text_context["max_ocr"], 15.0)
+        m_asr = max(text_context["max_asr"], 15.0)
+        m_cap = max(text_context["max_cap"], 15.0)
+
+        for i, pos in enumerate(idxs):
+            rec = frame_records[pos]
+            fid = rec.get("frame_id")
+            if not fid:
+                continue
+
+            ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
+            asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
+            cap_s = text_context["cap_dict"].get(fid, 0.0) / m_cap
+
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s) + (w_cap * cap_s)
+            final_scores[i] += bonus
+
+        global_max_possible = 1.0 + w_ocr + w_asr + w_cap
+        if global_max_possible > 0:
+            final_scores = final_scores / global_max_possible
+
+    top_n = min(30, len(final_scores))
     if top_n == 0:
         return []
-    top_pos = np.argpartition(sims, -top_n)[-top_n:]
-    top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
+    top_pos = np.argpartition(final_scores, -top_n)[-top_n:]
+    top_pos = top_pos[np.argsort(final_scores[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
     seen_fids: set[str] = set()
     for pos in top_pos:
-        score = float(sims[pos])
+        score = float(final_scores[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
@@ -304,6 +399,7 @@ def _window_search_bwd(
 
 
 def bidirectional_pair_search(
+    experiment: Experiment,
     retriever,
     event_text_i: str,
     event_text_j: str,
@@ -325,13 +421,23 @@ def bidirectional_pair_search(
 
     Returns top-K pairs, each pair = (f_i_info, f_j_info, pair_score, sim_i, sim_j).
     """
+    processed_i = retriever.query_processor.process(
+        event_text_i, enabled_models=enabled_models, use_llm=use_llm
+    )
+    processed_j = retriever.query_processor.process(
+        event_text_j, enabled_models=enabled_models, use_llm=use_llm
+    )
+
+    text_context_i = _fetch_text_scores_to_ram(experiment, processed_i)
+    text_context_j = _fetch_text_scores_to_ram(experiment, processed_j)
+
     embed_i = _embed_event(retriever, event_text_i, enabled_models=enabled_models, use_llm=use_llm)
     embed_j = _embed_event(retriever, event_text_j, enabled_models=enabled_models, use_llm=use_llm)
 
-    # 1. Candidate search for eᵢ and eᵢ₊₁ via full KIS Basic pipeline (top 300 pool)
+    # 1. Candidate search for eᵢ and eᵢ₊₁ via full Intelligent pipeline (top 300 pool)
     candidate_pool = top_k
-    candidates_i = _search_event_kis(
-        retriever,
+    candidates_i = _search_event_intelligent(
+        experiment,
         event_text_i,
         event_index_i,
         candidate_pool,
@@ -339,8 +445,8 @@ def bidirectional_pair_search(
         use_reranker=use_reranker,
         use_llm=use_llm,
     )
-    candidates_j = _search_event_kis(
-        retriever,
+    candidates_j = _search_event_intelligent(
+        experiment,
         event_text_j,
         event_index_i + 1,
         candidate_pool,
@@ -389,6 +495,7 @@ def bidirectional_pair_search(
             frame_embeddings,
             frame_records,
             hydrator,
+            text_context_j,
         ):
             fid_j = f_j_info.get("frame_id")
             if fid_j and fid_j in rank_map_j:
@@ -415,6 +522,7 @@ def bidirectional_pair_search(
             frame_embeddings,
             frame_records,
             hydrator,
+            text_context_i,
         ):
             fid_i = f_i_info.get("frame_id")
             if fid_i and fid_i in rank_map_i:
@@ -456,6 +564,13 @@ def bidirectional_pair_search(
 # ── chain join ────────────────────────────────────────────────────────
 
 
+def _get_shot_num(sid: str | None) -> int | None:
+    if not sid:
+        return None
+    nums = re.findall(r"\d+", sid)
+    return int(nums[-1]) if nums else None
+
+
 def chain_join(
     pair_lists: list[list[tuple[dict, dict, float, float, float]]],
     window: int = 15,
@@ -483,11 +598,23 @@ def chain_join(
         for chain_frames, chain_scores in chains:
             last_frame = chain_frames[-1]
             last_vid = last_frame.get("video_id")
+            last_shot = last_frame.get("shot_id")
+            last_shot_num = _get_shot_num(last_shot)
             last_ts = last_frame.get("timestamp_sec")
 
             best_ext: tuple[dict, float] | None = None  # (f_j, sj)
             best_ps = -float("inf")
             for f_i, f_j, ps, si, sj in pairs_k:
+                # 0. Ensure the joining point is within 3 shots
+                f_i_shot = f_i.get("shot_id")
+                f_i_shot_num = _get_shot_num(f_i_shot)
+
+                if last_shot_num is not None and f_i_shot_num is not None:
+                    if abs(f_i_shot_num - last_shot_num) > 3:
+                        continue
+                elif last_shot and f_i_shot and f_i_shot != last_shot:
+                    continue
+
                 # 1. Next event frame f_j must be in the same video
                 if f_j.get("video_id") != last_vid:
                     continue
@@ -628,6 +755,7 @@ def trake_bpj_search(
     pair_lists: list[list[tuple[dict, dict, float, float, float]]] = []
     for i in range(n - 1):
         pairs = bidirectional_pair_search(
+            experiment=experiment,
             retriever=retriever,
             event_text_i=clean[i],
             event_text_j=clean[i + 1],

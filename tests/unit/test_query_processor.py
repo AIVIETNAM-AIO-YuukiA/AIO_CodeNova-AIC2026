@@ -6,7 +6,7 @@ from retrieval.query_processor import (
     LlmQueryProcessor,
     PassThroughQueryProcessor,
     ProcessedQuery,
-    _normalize_weights,
+    _parse_bonus_weights,
     get_query_processor,
 )
 
@@ -21,7 +21,7 @@ def test_pass_through_query_processor() -> None:
     assert processed.ocr_keywords == []
     assert processed.asr_keywords == []
     assert processed.metadata == {}
-    assert processed.weights == {"kis": 1.0, "ocr": 0.0, "asr": 0.0}
+    assert processed.weights == {"ocr_bonus": 0.0, "asr_bonus": 0.0, "caption_bonus": 0.0}
 
 
 def test_get_query_processor_returns_llm_processor() -> None:
@@ -75,12 +75,29 @@ def test_llm_processor_parses_weights() -> None:
     client = MagicMock()
     client.complete_text.return_value = (
         '{"visual_prompt": "a red car on a highway", "ocr_keywords": [],'
+        ' "asr_keywords": [], "metadata": {},'
+        ' "weights": {"caption_bonus": 0.2, "ocr_bonus": 0.0, "asr_bonus": 0.1}}'
+    )
+    processor._client = client
+
+    processed = processor.process("xe hơi đỏ trên cao tốc")
+    assert processed.weights == {"caption_bonus": 0.2, "ocr_bonus": 0.0, "asr_bonus": 0.1}
+
+
+def test_llm_processor_ignores_legacy_weight_schema() -> None:
+    # Older prompts answered with kis/ocr/asr shares that summed to 1.0. Those
+    # keys mean nothing to the bonus model, so they must not leak through as
+    # bonuses — every modality falls back to no bonus instead.
+    processor = LlmQueryProcessor(model_name="test-model")
+    client = MagicMock()
+    client.complete_text.return_value = (
+        '{"visual_prompt": "a red car on a highway", "ocr_keywords": [],'
         ' "asr_keywords": [], "metadata": {}, "weights": {"kis": 0.9, "ocr": 0.0, "asr": 0.1}}'
     )
     processor._client = client
 
     processed = processor.process("xe hơi đỏ trên cao tốc")
-    assert processed.weights == {"kis": 0.9, "ocr": 0.0, "asr": 0.1}
+    assert processed.weights == {"caption_bonus": 0.0, "ocr_bonus": 0.0, "asr_bonus": 0.0}
 
 
 def test_llm_processor_defaults_weights_when_missing() -> None:
@@ -92,26 +109,32 @@ def test_llm_processor_defaults_weights_when_missing() -> None:
     processor._client = client
 
     processed = processor.process("cảnh nấu ăn")
-    assert processed.weights == {"kis": 1.0, "ocr": 0.0, "asr": 0.0}
+    assert processed.weights == {"ocr_bonus": 0.0, "asr_bonus": 0.0, "caption_bonus": 0.0}
 
 
-def test_normalize_weights_sums_to_one() -> None:
-    result = _normalize_weights({"kis": 0.7, "ocr": 0.2, "asr": 0.1})
-    assert result == {"kis": 0.7, "ocr": 0.2, "asr": 0.1}
+def test_parse_bonus_weights_keeps_in_range_values() -> None:
+    result = _parse_bonus_weights(
+        {"caption_bonus": 0.3, "ocr_bonus": 0.2, "asr_bonus": 0.1}
+    )
+    assert result == {"caption_bonus": 0.3, "ocr_bonus": 0.2, "asr_bonus": 0.1}
 
 
-def test_normalize_weights_rescales_when_not_summing_to_one() -> None:
-    result = _normalize_weights({"kis": 1.4, "ocr": 0.4, "asr": 0.2})
-    assert abs(sum(result.values()) - 1.0) < 1e-9
-    assert result["kis"] == 0.7
+def test_parse_bonus_weights_clamps_to_half() -> None:
+    # A runaway LLM weight must not be able to dominate the base visual score.
+    result = _parse_bonus_weights({"caption_bonus": 5.0, "ocr_bonus": -1.0, "asr_bonus": 0.5})
+    assert result == {"caption_bonus": 0.5, "ocr_bonus": 0.0, "asr_bonus": 0.5}
 
 
-def test_normalize_weights_falls_back_when_all_zero() -> None:
-    assert _normalize_weights({"kis": 0.0, "ocr": 0.0, "asr": 0.0}) == {
-        "kis": 1.0, "ocr": 0.0, "asr": 0.0,
+def test_parse_bonus_weights_defaults_missing_keys_to_zero() -> None:
+    assert _parse_bonus_weights({}) == {
+        "caption_bonus": 0.0,
+        "ocr_bonus": 0.0,
+        "asr_bonus": 0.0,
     }
 
 
-def test_normalize_weights_ignores_bad_types() -> None:
-    result = _normalize_weights({"kis": "not-a-number", "ocr": 0.5, "asr": 0.5})
-    assert result == {"kis": 0.0, "ocr": 0.5, "asr": 0.5}
+def test_parse_bonus_weights_ignores_bad_types() -> None:
+    result = _parse_bonus_weights(
+        {"caption_bonus": "not-a-number", "ocr_bonus": 0.2, "asr_bonus": None}
+    )
+    assert result == {"caption_bonus": 0.0, "ocr_bonus": 0.2, "asr_bonus": 0.0}

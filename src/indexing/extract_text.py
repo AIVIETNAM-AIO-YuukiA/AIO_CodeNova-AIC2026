@@ -281,3 +281,41 @@ def import_text(experiment) -> int:
     text_index.index_documents(documents)
     LOGGER.info("Imported %s text documents from %s", len(documents), manifest_path)
     return len(documents)
+
+
+def import_captions(experiment) -> int:
+    """Load ``manifests/captions.jsonl`` into Elasticsearch for intelligent search."""
+    from repository.caption_repo import CaptionRepository
+
+    repo = CaptionRepository(experiment)
+    captions = repo.by_id()
+    if not captions:
+        LOGGER.warning("No captions found to import")
+        return 0
+
+    frames_manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
+    frame_records = {
+        row["frame_id"]: FrameRecord.from_dict(row) for row in frames_manifest.read_all()
+    }
+
+    text_index = build_text_index(experiment)
+    documents = []
+    for frame_id, caption in captions.items():
+        record = frame_records.get(frame_id)
+        if not record:
+            continue
+        documents.append(
+            TextDocument(
+                doc_id=f"{frame_id}__caption",
+                video_id=record.video_id,
+                text=caption,
+                source="caption",
+                frame_id=frame_id,
+                timestamp_sec=record.timestamp_sec,
+            )
+        )
+
+    if documents:
+        text_index.index_documents(documents)
+    LOGGER.info("Imported %s caption documents", len(documents))
+    return len(documents)
