@@ -15,8 +15,10 @@ import threading
 
 from core.errors import CodeNovaError
 from core.logging import get_logger
+from core.paths import require_experiment_frame_path
 from core.types import FrameRecord, VideoRecord
 from indexing.manifest import JsonlManifest
+from indexing.partitions import PartitionStore
 from indexing.state import JobState
 from modules.asr.gipformer import GipformerAsrModel
 from modules.ocr.vllm import VllmOcrModel
@@ -31,7 +33,11 @@ _DEFAULT_OCR_WORKERS = 8
 # instead of every keyframe. On-screen text is usually static within a shot, so
 # this cuts VLM calls (and cost) by ~2/3 at the risk of missing text that
 # appears only mid-shot, such as a moving ticker.
-_ONE_FRAME_PER_SHOT = os.environ.get("OCR_ONE_FRAME_PER_SHOT", "0").lower() not in ("0", "false", "")
+_ONE_FRAME_PER_SHOT = os.environ.get("OCR_ONE_FRAME_PER_SHOT", "0").lower() not in (
+    "0",
+    "false",
+    "",
+)
 
 
 def _pick_one_frame_per_shot(frames: list[FrameRecord]) -> list[FrameRecord]:
@@ -50,32 +56,52 @@ def _pick_one_frame_per_shot(frames: list[FrameRecord]) -> list[FrameRecord]:
 class _TextSink:
     """Writes documents to the text index and mirrors them into text.jsonl.
 
-    Elasticsearch dedupes writes on its own (``doc_id`` is the document
-    ``_id``, so a rewrite is an upsert, not a duplicate) — but a video whose
-    ASR/OCR finished writing documents and then crashed before ``JobState``
-    recorded it as ``COMPLETED`` gets reprocessed on the next run, and
-    text.jsonl is append-only, so it would otherwise pick up a second copy
-    of every document. Track doc_ids already on disk (seeded from the
-    existing file) so a rerun's writes are skipped here instead.
+    A video whose ASR/OCR finished writing documents and then crashed before
+    ``JobState`` recorded it as ``COMPLETED`` gets reprocessed on the next
+    run. Rather than dedupe against an in-memory set (which only protects a
+    single run), each video's documents are kept in their own partition file
+    under ``manifests/partitions/text/<source>/<video_id>.jsonl``, rewritten
+    in full (keyed by ``doc_id``) every time that video produces documents —
+    so a rerun, even from a different process, converges on the same content
+    instead of appending duplicates. ``text.jsonl`` is then rebuilt from all
+    partitions on every write, which is the source of truth on disk;
+    Elasticsearch is a derived index, upserted after the JSONL is durable.
     """
 
     def __init__(self, experiment) -> None:
         self._index = build_text_index(experiment)
         self._manifest = JsonlManifest(experiment.run_dir / "manifests" / "text.jsonl")
+        self._partition_root = experiment.run_dir / "manifests" / "partitions" / "text"
         self._lock = threading.Lock()
-        self._known_doc_ids = {
-            str(row["doc_id"]) for row in self._manifest.read_all() if "doc_id" in row
-        }
 
     def write(self, documents: list[TextDocument]) -> None:
         if not documents:
             return
-        self._index.index_documents(documents)
         with self._lock:
-            new_documents = [doc for doc in documents if doc.doc_id not in self._known_doc_ids]
-            for doc in new_documents:
-                self._manifest.append(asdict(doc))
-                self._known_doc_ids.add(doc.doc_id)
+            grouped: dict[tuple[str, str], list[TextDocument]] = {}
+            for document in documents:
+                grouped.setdefault((document.source, document.video_id), []).append(document)
+            for (source, video_id), group in grouped.items():
+                store = PartitionStore(self._partition_root / source)
+                existing = store.path_for(video_id)
+                by_id = (
+                    {
+                        str(row["doc_id"]): row
+                        for row in JsonlManifest(existing).read_all(strict=True)
+                    }
+                    if existing.exists()
+                    else {}
+                )
+                by_id.update({document.doc_id: asdict(document) for document in group})
+                store.write(video_id, by_id.values(), partition_key="video_id", unique_key="doc_id")
+
+            rows: list[dict[str, object]] = []
+            for path in sorted(self._partition_root.glob("*/*.jsonl")):
+                rows.extend(JsonlManifest(path).read_all(strict=True))
+            self._manifest.replace_all(rows, unique_key="doc_id", backup=True)
+            # Elasticsearch is a derived index. Publish durable JSONL first,
+            # then upsert the same documents into the online text store.
+            self._index.index_documents(documents)
 
 
 def extract_ocr(experiment, force: bool = False) -> int:
@@ -101,33 +127,43 @@ def extract_ocr(experiment, force: bool = False) -> int:
     sink = _TextSink(experiment)
     workers = int(os.environ.get("CAPTION_WORKERS", _DEFAULT_OCR_WORKERS))
 
-    def _process(frame: FrameRecord) -> bool:
+    def _process(frame: FrameRecord) -> tuple[FrameRecord, TextDocument | None, Exception | None]:
         try:
-            text = ocr_model.recognize(frame.frame_path)
-            if text:
-                sink.write(
-                    [
-                        TextDocument(
-                            doc_id=f"{frame.frame_id}__ocr",
-                            video_id=frame.video_id,
-                            frame_id=frame.frame_id,
-                            text=text,
-                            source="ocr",
-                            timestamp_sec=frame.timestamp_sec,
-                        )
-                    ]
+            text = ocr_model.recognize(
+                str(require_experiment_frame_path(experiment, frame.frame_path))
+            )
+            document = (
+                TextDocument(
+                    doc_id=f"{frame.frame_id}__ocr",
+                    video_id=frame.video_id,
+                    frame_id=frame.frame_id,
+                    text=text,
+                    source="ocr",
+                    timestamp_sec=frame.timestamp_sec,
                 )
-            state.mark(frame.frame_id, "EXTRACT_OCR", "COMPLETED")
-            return bool(text)
+                if text
+                else None
+            )
+            return frame, document, None
         except Exception as exc:
             LOGGER.exception("OCR failed frame_id=%s", frame.frame_id)
             state.mark(frame.frame_id, "EXTRACT_OCR", "FAILED", error=str(exc))
-            return False
+            return frame, None, exc
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         results = list(executor.map(_process, frames))
 
-    indexed = sum(results)
+    documents = [document for _, document, error in results if error is None and document]
+    if documents:
+        sink.write(documents)
+    for frame, document, error in results:
+        if error is None:
+            state.mark(
+                frame.frame_id,
+                "EXTRACT_OCR",
+                "COMPLETED" if document else "COMPLETED_NO_OUTPUT",
+            )
+    indexed = len(documents)
     LOGGER.info("OCR extraction complete: %s frames indexed", indexed)
     return indexed
 
@@ -150,10 +186,17 @@ def extract_asr(experiment, force: bool = False) -> int:
     sink = _TextSink(experiment)
     indexed = 0
 
-    for video in videos:
+    for position, video in enumerate(videos, start=1):
         if state.should_skip(video.video_id, "EXTRACT_ASR", force=force):
             continue
         try:
+            LOGGER.info(
+                "[video %s/%s] ASR started video_id=%s path=%s",
+                position,
+                len(videos),
+                video.video_id,
+                video.path,
+            )
             transcripts = asr_model.transcribe(video.path)
             documents = [
                 TextDocument(
@@ -170,7 +213,18 @@ def extract_asr(experiment, force: bool = False) -> int:
             if documents:
                 sink.write(documents)
                 indexed += len(documents)
-            state.mark(video.video_id, "EXTRACT_ASR", "COMPLETED")
+            state.mark(
+                video.video_id,
+                "EXTRACT_ASR",
+                "COMPLETED" if documents else "COMPLETED_NO_OUTPUT",
+            )
+            LOGGER.info(
+                "[video %s/%s] ASR completed video_id=%s segments=%s",
+                position,
+                len(videos),
+                video.video_id,
+                len(documents),
+            )
         except Exception as exc:
             LOGGER.exception("ASR failed video_id=%s", video.video_id)
             state.mark(video.video_id, "EXTRACT_ASR", "FAILED", error=str(exc))

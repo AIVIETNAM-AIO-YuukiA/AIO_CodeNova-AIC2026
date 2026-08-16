@@ -19,6 +19,8 @@ import logging
 import numpy as np
 
 from config.settings import Experiment
+from core.errors import RetrievalError
+from core.paths import require_experiment_frame_path
 from indexing.embedding_paths import frame_ids_path, vectors_path
 
 LOGGER = logging.getLogger(__name__)
@@ -275,6 +277,18 @@ def load_temporal_data(
 
     vectors = np.load(embeddings_path)["embeddings"].astype("float32")
     id_list = json.loads(frame_ids_json_path.read_text(encoding="utf-8"))
+    if vectors.ndim != 2:
+        raise RetrievalError(
+            f"Embedding artifact for model {model_name!r} must be 2-D, got {vectors.shape}"
+        )
+    if not isinstance(id_list, list) or len(vectors) != len(id_list):
+        raise RetrievalError(
+            f"Embedding artifact mismatch for model {model_name!r}: "
+            f"vectors={len(vectors)} frame_ids={len(id_list) if isinstance(id_list, list) else 'invalid'}"
+        )
+    id_list = [str(value) for value in id_list]
+    if len(id_list) != len(set(id_list)):
+        raise RetrievalError(f"Duplicate frame IDs in embedding artifact for model {model_name!r}")
 
     frame_map: dict[str, dict] = {}
     if frames_manifest.exists():
@@ -287,9 +301,11 @@ def load_temporal_data(
 
     records = []
     for fid in id_list:
-        meta = frame_map.get(fid, {})
+        meta = dict(frame_map.get(fid, {}))
         if meta.get("frame_id") is None:
             meta["frame_id"] = fid
+        if meta.get("frame_path"):
+            meta["frame_path"] = str(require_experiment_frame_path(experiment, meta["frame_path"]))
         records.append(meta)
 
     sorted_indices = sorted(
@@ -297,6 +313,7 @@ def load_temporal_data(
         key=lambda i: (
             records[i].get("video_id", ""),
             records[i].get("frame_index", 0) or 0,
+            records[i].get("frame_id", ""),
         ),
     )
 

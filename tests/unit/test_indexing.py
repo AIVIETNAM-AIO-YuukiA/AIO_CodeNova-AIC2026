@@ -5,6 +5,9 @@ from retrieval.hydrator import ResultHydrator
 
 
 def test_hydrator_attaches_video_filename_and_frame_index(tmp_path) -> None:
+    frame_path = tmp_path / "frames" / "video1" / "video1_s000001_f00000042.jpg"
+    frame_path.parent.mkdir(parents=True)
+    frame_path.write_bytes(b"frame")
     experiment = Experiment(
         name="exp",
         run_dir=tmp_path,
@@ -23,7 +26,7 @@ def test_hydrator_attaches_video_filename_and_frame_index(tmp_path) -> None:
             "frame_id": "video1_s000001_f00000042",
             "video_id": "video1",
             "shot_id": "video1_s000001",
-            "frame_path": "runs/exp/frames/video1/video1_s000001_f00000042.jpg",
+            "frame_path": "frames/video1/video1_s000001_f00000042.jpg",
             "frame_index": 42,
             "timestamp_sec": 1.4,
         }
@@ -38,7 +41,7 @@ def test_hydrator_attaches_video_filename_and_frame_index(tmp_path) -> None:
     assert results[0].shot_id == "video1_s000001"
 
 
-def test_hydrator_passes_through_unknown_frame(tmp_path) -> None:
+def test_hydrator_reports_and_drops_unknown_frame(tmp_path) -> None:
     experiment = Experiment(
         name="exp",
         run_dir=tmp_path,
@@ -46,6 +49,9 @@ def test_hydrator_passes_through_unknown_frame(tmp_path) -> None:
     )
     raw = [SearchResult(frame_id="missing", video_id="", score=0.5)]
 
-    results = ResultHydrator(experiment).hydrate(raw)
+    batch = ResultHydrator(experiment).hydrate_with_diagnostics(raw)
 
-    assert results == raw
+    assert batch.results == []
+    assert [(issue.frame_id, issue.reason) for issue in batch.issues] == [
+        ("missing", "FRAME_METADATA_MISSING")
+    ]

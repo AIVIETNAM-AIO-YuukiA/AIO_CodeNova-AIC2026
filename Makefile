@@ -5,6 +5,7 @@ INPUT       ?= data/raw_videos
 TOPK        ?= 20
 QUERY       ?= a person riding a motorbike
 RESUME      ?=          # set 1 để resume 1 experiment đã có (vd: make pipeline RESUME=1)
+WITH_TEXT   ?=          # set 1 để chạy thêm OCR/ASR trong offline-index
 # HOST/PORT để trống -> lấy mặc định từ CODENOVA_UI_HOST/PORT trong .env
 HOST        ?=
 PORT        ?=
@@ -15,6 +16,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
         qdrant-up qdrant-down qdrant-health \
         elasticsearch-up elasticsearch-health \
         vllm-index-up vllm-index-down vllm-index-health \
+        preflight-index validate-index repair-manifest offline-index \
         ingest detect-shots extract-frames embed-frames build-index extract-text extract-asr extract-ocr export-text import-text pipeline \
         search serve-ui clean-runs clean
 
@@ -89,6 +91,25 @@ vllm-index-health: ## Kiểm tra vllm-index có sống không
 	curl -sf http://localhost:8881/v1/models && echo
 
 ## --- Pipeline index offline ---
+preflight-index: ## In inventory và tạo plan; thêm APPROVE=1 để phê duyệt plan (EXP, INPUT)
+	uv run codenova preflight-index --input $(INPUT) --experiment-name $(EXP) \
+		$(if $(APPROVE),--approve)
+
+validate-index: ## Chạy quality gate và ghi readiness.json (EXP)
+	uv run codenova validate-index --experiment-name $(EXP)
+
+repair-manifest: ## Dry-run repair JSONL (EXP, MANIFEST); thêm APPLY=1 để sửa + backup
+	uv run codenova repair-manifest $(MANIFEST) --experiment-name $(EXP) \
+		$(if $(APPLY),--apply)
+
+migrate-frame-paths: ## Dry-run chuẩn hóa frame path (EXP, LEGACY_ROOT); APPLY=1 để ghi
+	uv run codenova migrate-frame-paths --experiment-name $(EXP) \
+		--legacy-root $(LEGACY_ROOT) $(if $(APPLY),--apply)
+
+offline-index: ## Một lệnh: preflight được duyệt -> vector stages -> quality gate (EXP, INPUT)
+	uv run codenova offline-index --input $(INPUT) --experiment-name $(EXP) --approve \
+		$(if $(RESUME),--resume) $(if $(WITH_TEXT),--with-text)
+
 ingest: ## Quét video (INPUT, EXP; RESUME=1 để dùng lại experiment đã có)
 	uv run codenova ingest --input $(INPUT) --experiment-name $(EXP) $(if $(RESUME),--resume)
 
@@ -121,7 +142,7 @@ export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifes
 import-text: ## Nạp runs/<exp>/manifests/text.jsonl vào Elasticsearch (EXP); cần Elasticsearch đang chạy
 	uv run codenova import-text --experiment-name $(EXP)
 
-pipeline: ingest detect-shots extract-frames embed-frames build-index ## Chạy toàn bộ pipeline offline (chỉ vector index; extract-text chạy riêng cho OCR/ASR)
+pipeline: offline-index ## Alias tương thích cho offline-index có preflight và quality gate
 
 ## --- Retrieval online ---
 search: ## Tìm kiếm bằng text (EXP, QUERY, TOPK)

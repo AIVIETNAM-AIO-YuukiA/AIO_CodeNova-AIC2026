@@ -95,7 +95,10 @@ def kis_detail_search(
         if not frame_id:
             continue
 
-        sr = hydrator.hydrate([frame_result(frame_id, float(final_scores[idx]))])[0]
+        hydrated = hydrator.hydrate([frame_result(frame_id, float(final_scores[idx]))])
+        if not hydrated:
+            continue
+        sr = hydrated[0]
 
         sub_scores = {}
         for i, q in enumerate(clean):
@@ -265,7 +268,10 @@ def kis_detail_2stage_search(
         if not frame_id:
             continue
 
-        sr = hydrator.hydrate([frame_result(frame_id, float(final2[rank - 1]))])[0]
+        hydrated = hydrator.hydrate([frame_result(frame_id, float(final2[rank - 1]))])
+        if not hydrated:
+            continue
+        sr = hydrated[0]
 
         sub_scores = {}
         for i, q in enumerate(clean_spec):

@@ -3,8 +3,10 @@
 import json
 
 import numpy as np
+import pytest
 
 from config.settings import Experiment, PipelineConfig
+from core.errors import IndexBuildError
 from indexing.build_index import build_index
 
 
@@ -38,7 +40,7 @@ def test_build_index_single_model_reads_named_file(tmp_path, monkeypatch) -> Non
     assert embeddings_by_model["beit3"] == [[1.0, 0.0], [0.0, 1.0]]
 
 
-def test_build_index_multi_model_intersects_common_frames(tmp_path, monkeypatch) -> None:
+def test_build_index_rejects_multi_model_frame_set_mismatch(tmp_path, monkeypatch) -> None:
     config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3", "siglip2"))
     experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
     embeddings_dir = tmp_path / "embeddings"
@@ -49,9 +51,24 @@ def test_build_index_multi_model_intersects_common_frames(tmp_path, monkeypatch)
     fake_index = FakeVectorIndex()
     monkeypatch.setattr("indexing.build_index.build_vector_index", lambda exp: fake_index)
 
-    count = build_index(experiment)
+    with pytest.raises(IndexBuildError, match="frame-ID set mismatch") as captured:
+        build_index(experiment)
 
-    assert count == 2  # only f1, f2 are embedded by both models
+    assert "missing=['f3']" in str(captured.value)
+    assert fake_index.built is None
+
+
+def test_build_index_joins_reordered_model_rows_by_frame_id(tmp_path, monkeypatch) -> None:
+    config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3", "siglip2"))
+    experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
+    embeddings_dir = tmp_path / "embeddings"
+    _write_embeddings(embeddings_dir, "beit3", ["f1", "f2"], [[1, 0], [0, 1]])
+    _write_embeddings(embeddings_dir, "siglip2", ["f2", "f1"], [[0, 2], [2, 0]])
+    fake_index = FakeVectorIndex()
+    monkeypatch.setattr("indexing.build_index.build_vector_index", lambda exp: fake_index)
+
+    assert build_index(experiment) == 2
+
     embeddings_by_model, frame_ids = fake_index.built
     assert frame_ids == ["f1", "f2"]
     assert embeddings_by_model["beit3"] == [[1, 0], [0, 1]]

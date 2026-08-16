@@ -9,7 +9,24 @@ import os
 
 LOGGER = logging.getLogger(__name__)
 
-_SYSTEM_PROMPT = "You are an expert query processor for a video retrieval system."
+_SYSTEM_PROMPT = """You are an expert AI query optimization assistant for Visual Information Retrieval systems (like SigLIP, CLIP). Your sole purpose is to convert natural language queries into highly optimized, static, and purely visual English queries.
+
+THE CORE PRINCIPLE
+Visual embedding models DO NOT understand abstract concepts, emotions, intentions, cultural contexts, or dynamic actions over time. They ONLY understand what can be seen in a single freeze-frame: objects, colors, spatial layouts, and physical shapes.
+
+Your task is to strip away everything invisible and translate the remaining visual elements into English.
+
+RULE 1: Action-to-Static Conversion
+Rewrite any action/verb phrase so the result describes what a single freeze-frame would show (e.g., "mọi người nhảy múa" -> "people on a stage", "người đang cầu nguyện" -> "a person sitting").
+
+RULE 2: The Critical Filter (Remove Unsearchable Elements)
+If a detail cannot be clearly represented by a specific object, color, or shape in a static frame, YOU MUST REMOVE IT entirely. DO NOT include:
+1. Abstract Behaviors (e.g., cầu nguyện, khấn vái -> keep only the physical posture).
+2. Purposes & Intentions (e.g., cầu cho chuyến đi bình an -> remove).
+3. Emotions (e.g., vui mừng, xúc động -> remove, unless a clear physical expression like smiling).
+4. Symbolic Meanings (remove).
+5. Cultural & Historical Context (e.g., lễ hội Obon -> remove proper nouns, keep "people in traditional costumes").
+6. Social Relationships (e.g., người dân, cụ già -> keep only visual identifiers like "elderly person")."""
 
 
 @dataclass
@@ -17,7 +34,8 @@ class ProcessedQuery:
     """Structured representation of a processed search query."""
 
     raw_query: str
-    visual_prompt: str
+    visual_prompt: str  # English visual prompt
+    visual_prompt_vi: str = ""  # Vietnamese visual prompt
     ocr_keywords: list[str] = field(default_factory=list)
     asr_keywords: list[str] = field(default_factory=list)
     metadata: dict[str, str] = field(default_factory=dict)
@@ -30,7 +48,9 @@ class ProcessedQuery:
 class QueryProcessor:
     """Base interface for query processing."""
 
-    def process(self, query: str) -> ProcessedQuery:
+    def process(
+        self, query: str, enabled_models: list[str] | None = None, use_llm: bool = True
+    ) -> ProcessedQuery:
         """Process a raw user query into structured fields."""
         raise NotImplementedError
 
@@ -42,8 +62,10 @@ class QueryProcessor:
 class PassThroughQueryProcessor(QueryProcessor):
     """Query processor that passes the raw query directly without modifications."""
 
-    def process(self, query: str) -> ProcessedQuery:
-        return ProcessedQuery(raw_query=query, visual_prompt=query)
+    def process(
+        self, query: str, enabled_models: list[str] | None = None, use_llm: bool = True
+    ) -> ProcessedQuery:
+        return ProcessedQuery(raw_query=query, visual_prompt=query, visual_prompt_vi=query)
 
 
 class LlmQueryProcessor(QueryProcessor):
@@ -73,24 +95,39 @@ class LlmQueryProcessor(QueryProcessor):
             )
         return self._client
 
-    def process(self, query: str) -> ProcessedQuery:
-        if self._disabled:
-            return ProcessedQuery(raw_query=query, visual_prompt=query)
+    def process(
+        self, query: str, enabled_models: list[str] | None = None, use_llm: bool = True
+    ) -> ProcessedQuery:
+        if self._disabled or not use_llm:
+            return ProcessedQuery(raw_query=query, visual_prompt=query, visual_prompt_vi=query)
+
+        is_vi = False
+        if not enabled_models:
+            is_vi = True
+        else:
+            for m in enabled_models:
+                m_lower = m.lower()
+                if "vietnamese" in m_lower or "vism" in m_lower:
+                    is_vi = True
+                else:
+                    pass
 
         prompt = f"""
         Analyze the user query (which might be in Vietnamese or English) and output a JSON object with the following fields:
 
-        1. "visual_prompt": If the query is in Vietnamese, translate it to English. Then rewrite it as a natural, easy-to-understand visual search prompt for vision-language video retrieval. Stay as close as possible to the user's original query. Preserve all entities and intent exactly. Do not add, infer, or invent any actions, objects, people, locations, events, attributes, camera details, lighting, colors, or other visual elements that are not explicitly mentioned in the query. Only rephrase for clarity and naturalness. Keep the output concise (max 50 words).
-        2. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
-        3. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
-        4. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor), or "action", if explicitly mentioned.
-        5. "weights": A JSON object {{"kis": float, "ocr": float, "asr": float}} summing to 1.0, estimating how much each modality should contribute to retrieval. Visual-dominant queries (actions, scenes, objects) weigh "kis" highest. Queries naming exact on-screen text/numbers weigh "ocr" highest. Queries about spoken topics/dialogue weigh "asr" highest. A modality with an empty keyword list gets weight 0.
+        1. "visual_prompt": Apply RULE 1 and RULE 2 from the system prompt to strictly filter out all invisible elements, abstract behaviors, purposes, emotions, symbols, and cultural context. Translate the remaining static visual essence into a highly optimized English noun-phrase. Keep it concise (max 20 words). DO NOT include verbs of abstract actions.
+        { '2. "visual_prompt_vi": The exact same visual essence as "visual_prompt", but translated back into Vietnamese (static noun-phrase in Vietnamese).' if is_vi else '' }
+        3. "ocr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing text, signs, logos, or writing that might appear *on screen* (OCR text). Set to empty list if no text/signs are implied.
+        4. "asr_keywords": List 1 to 5 search keywords (in English and Vietnamese if applicable) representing words or topics that might be *spoken* (ASR speech). Set to empty list if no speech/dialogue is implied.
+        5. "metadata": A JSON dictionary of extracted attributes like "color", "weather", "time_of_day", "location_type" (indoor/outdoor).
+        6. "weights": A JSON object {{"kis": float, "ocr": float, "asr": float}} summing to 1.0, estimating how much each modality should contribute to retrieval. Visual-dominant queries weigh "kis" highest. Queries naming exact on-screen text weigh "ocr" highest. Queries about spoken dialogue weigh "asr" highest. A modality with an empty keyword list gets weight 0.
 
         User Query: "{query}"
 
         Respond with ONLY the JSON object:
         {{
             "visual_prompt": "string",
+            { '"visual_prompt_vi": "string",' if is_vi else '' }
             "ocr_keywords": ["string"],
             "asr_keywords": ["string"],
             "metadata": {{
@@ -106,10 +143,12 @@ class LlmQueryProcessor(QueryProcessor):
                 generation_params={"temperature": 0.0, "max_tokens": 400},
             )
             data = _extract_json(text)
+            LOGGER.info("Qwen Preprocessing Result: %s", json.dumps(data, ensure_ascii=False))
             weights = data.get("weights") or {}
             return ProcessedQuery(
                 raw_query=query,
                 visual_prompt=data.get("visual_prompt", query) or query,
+                visual_prompt_vi=data.get("visual_prompt_vi", query) or query,
                 ocr_keywords=data.get("ocr_keywords", []),
                 asr_keywords=data.get("asr_keywords", []),
                 metadata=data.get("metadata", {}),
@@ -122,7 +161,7 @@ class LlmQueryProcessor(QueryProcessor):
                 exc,
             )
             self._disabled = True
-            return ProcessedQuery(raw_query=query, visual_prompt=query)
+            return ProcessedQuery(raw_query=query, visual_prompt=query, visual_prompt_vi=query)
 
     def extract_temporal_events(self, query: str, max_events: int = 5) -> list[str]:
         """Split one free-form query into an ordered list of atomic events.

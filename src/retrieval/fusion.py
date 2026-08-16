@@ -15,7 +15,11 @@ fused score.
 
 from __future__ import annotations
 
+import numpy as np
+
+from core.errors import FusionError
 from core.types import SearchResult
+from stores.vector.base import frame_result
 
 
 def srrf_fuse(
@@ -83,3 +87,135 @@ def srrf_fuse(
             )
         )
     return fused
+
+
+def wsf_fuse(
+    model_data: dict[str, tuple[np.ndarray, list[dict], np.ndarray]],
+    top_k: int,
+    weights: dict[str, float] | None = None,
+) -> list[SearchResult]:
+    """Weighted normalized sum fusion (WSF).
+
+    For each model, computes cosine similarity between all frame embeddings and
+    the query embedding. Scores are max-normalized globally per model. The final
+    score is the weighted sum of these normalized scores across models.
+
+    Args:
+        model_data: Dict mapping model_name to (frame_embeddings, frame_records, query_embedding).
+            - frame_embeddings: [N, D] array
+            - frame_records: list of dicts (metadata)
+            - query_embedding: [D] or [1, D] array
+        top_k: Number of top frames to return.
+        weights: Custom model weights. Defaults to 1/K for K models.
+
+    Returns:
+        List of SearchResult, sorted by fused WSF score descending.
+    """
+    if not model_data:
+        return []
+
+    model_names = list(model_data.keys())
+    k_models = len(model_names)
+
+    # Resolve weights
+    if not weights:
+        w = np.full(k_models, 1.0 / k_models, dtype="float32")
+    else:
+        w = np.array([float(weights.get(name, 1.0)) for name in model_names], dtype="float32")
+        w_sum = w.sum()
+        if w_sum > 1e-12:
+            w = w / w_sum
+        else:
+            w = np.full(k_models, 1.0 / k_models, dtype="float32")
+
+    first_model = model_names[0]
+    canonical_embeddings, frame_records, _ = model_data[first_model]
+    canonical_ids = _validate_model_rows(first_model, canonical_embeddings, frame_records)
+    n_frames = len(canonical_ids)
+
+    if n_frames == 0:
+        return []
+
+    # Calculate raw cosine similarities per model
+    # scores shape will be [N, K_models]
+    scores = np.zeros((n_frames, k_models), dtype="float32")
+
+    for i, model_name in enumerate(model_names):
+        frame_embs, model_records, query_emb = model_data[model_name]
+        model_ids = _validate_model_rows(model_name, frame_embs, model_records)
+        if set(model_ids) != set(canonical_ids):
+            missing = sorted(set(canonical_ids) - set(model_ids))
+            extra = sorted(set(model_ids) - set(canonical_ids))
+            raise FusionError(
+                f"Cannot fuse model {model_name!r}: frame-ID set differs from "
+                f"{first_model!r}; missing={missing[:10]} extra={extra[:10]}"
+            )
+        row_by_id = {frame_id: row for row, frame_id in enumerate(model_ids)}
+        aligned_rows = [row_by_id[frame_id] for frame_id in canonical_ids]
+        aligned_embeddings = np.asarray(frame_embs, dtype="float32")[aligned_rows]
+        q = np.asarray(query_emb, dtype="float32").flatten()
+        if aligned_embeddings.ndim != 2 or aligned_embeddings.shape[1] != len(q):
+            raise FusionError(
+                f"Cannot fuse model {model_name!r}: frame dimension="
+                f"{aligned_embeddings.shape} query dimension={len(q)}"
+            )
+        # Normalize query
+        norm_q = np.linalg.norm(q)
+        if norm_q > 1e-12:
+            q = q / norm_q
+
+        # Calculate scores
+        # frame_embs are assumed to be L2-normalized already in load_temporal_data, but let's be safe
+        sim_scores = aligned_embeddings @ q
+        scores[:, i] = sim_scores
+
+    # Max-normalize each model (column)
+    max_scores = scores.max(axis=0)
+    max_scores = np.where(max_scores > 1e-12, max_scores, 1.0)
+    normalized = scores / max_scores
+
+    # Weighted sum
+    final_scores = normalized @ w
+
+    # Get top-K
+    n = min(top_k, n_frames)
+    if n == 0:
+        return []
+
+    top_indices = np.argpartition(final_scores, -n)[-n:]
+    top_indices = top_indices[np.argsort(final_scores[top_indices])[::-1]]
+
+    # Convert to SearchResult
+    fused: list[SearchResult] = []
+    for idx in top_indices:
+        rec = frame_records[idx]
+        frame_id = rec.get("frame_id")
+        if not frame_id:
+            continue
+
+        # We use frame_result helper to create the initial SearchResult
+        sr = frame_result(frame_id, float(final_scores[idx]))
+        fused.append(sr)
+
+    return fused
+
+
+def _validate_model_rows(
+    model_name: str, frame_embeddings: np.ndarray, frame_records: list[dict]
+) -> list[str]:
+    embeddings = np.asarray(frame_embeddings)
+    if embeddings.ndim != 2:
+        raise FusionError(
+            f"Cannot fuse model {model_name!r}: embeddings must be 2-D, got {embeddings.shape}"
+        )
+    if len(embeddings) != len(frame_records):
+        raise FusionError(
+            f"Cannot fuse model {model_name!r}: vectors={len(embeddings)} "
+            f"records={len(frame_records)}"
+        )
+    frame_ids = [str(record.get("frame_id") or "") for record in frame_records]
+    if any(not frame_id for frame_id in frame_ids):
+        raise FusionError(f"Cannot fuse model {model_name!r}: frame record is missing frame_id")
+    if len(frame_ids) != len(set(frame_ids)):
+        raise FusionError(f"Cannot fuse model {model_name!r}: duplicate frame_id detected")
+    return frame_ids

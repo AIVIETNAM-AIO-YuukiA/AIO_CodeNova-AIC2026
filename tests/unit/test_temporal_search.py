@@ -3,8 +3,10 @@
 import json
 
 import numpy as np
+import pytest
 
 from config.settings import Experiment, PipelineConfig
+from core.errors import RetrievalError
 from retrieval.temporal_search import (
     temporal_search_forward,
     temporal_search_backward,
@@ -157,3 +159,33 @@ def test_load_temporal_data_missing_file_raises(tmp_path) -> None:
         raise AssertionError("expected FileNotFoundError")
     except FileNotFoundError as exc:
         assert "beit3" in str(exc)
+
+
+def test_load_temporal_data_uses_frame_id_as_deterministic_tiebreaker(tmp_path) -> None:
+    config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3",))
+    experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
+    _write_embeddings(
+        tmp_path / "embeddings",
+        "beit3",
+        ["f2", "f1"],
+        np.array([[2.0, 0.0], [1.0, 0.0]], dtype="float32"),
+    )
+
+    vectors, records = load_temporal_data(experiment)
+
+    assert [record["frame_id"] for record in records] == ["f1", "f2"]
+    assert vectors[:, 0].tolist() == [1.0, 2.0]
+
+
+def test_load_temporal_data_rejects_vector_id_count_mismatch(tmp_path) -> None:
+    config = PipelineConfig(runs_dir=tmp_path, embedding_models=("beit3",))
+    experiment = Experiment(name="exp", run_dir=tmp_path, config=config)
+    _write_embeddings(
+        tmp_path / "embeddings",
+        "beit3",
+        ["f1"],
+        np.array([[1.0, 0.0], [2.0, 0.0]], dtype="float32"),
+    )
+
+    with pytest.raises(RetrievalError, match="vectors=2 frame_ids=1"):
+        load_temporal_data(experiment)

@@ -1,6 +1,9 @@
 import json
 
+import pytest
+
 from config.settings import Experiment, PipelineConfig
+from core.errors import EmbeddingError
 from core.types import FrameRecord
 from indexing import embeddings
 from indexing.manifest import JsonlManifest
@@ -35,12 +38,15 @@ def _experiment(tmp_path) -> Experiment:
 
 
 def _add_frame(tmp_path, frame_id: str) -> None:
+    frame_path = tmp_path / "frames" / f"{frame_id}.jpg"
+    frame_path.parent.mkdir(parents=True, exist_ok=True)
+    frame_path.write_bytes(b"frame")
     JsonlManifest(tmp_path / "manifests" / "frames.jsonl").append(
         {
             "frame_id": frame_id,
             "video_id": frame_id.split("_")[0],
             "shot_id": frame_id.rsplit("_", 1)[0],
-            "frame_path": f"/x/{frame_id}.jpg",
+            "frame_path": f"frames/{frame_id}.jpg",
         }
     )
 
@@ -68,6 +74,10 @@ def test_incremental_embeds_only_new_frames(tmp_path, monkeypatch) -> None:
     vecs = np.load(tmp_path / "embeddings" / f"frames__{MODEL}.npz")["embeddings"]
     assert ids == ["v1_s0_f1", "v1_s0_f2", "v1_s0_f3"]
     assert vecs.shape == (3, 2)
+    provenance = JsonlManifest(tmp_path / "manifests" / "embeddings.jsonl").read_all(strict=True)[0]
+    assert provenance["backend"] == "JinaClipEmbedder"
+    assert provenance["resolved_model_id"] == "jinaai/jina-clip-v2"
+    assert provenance["dimension"] == 2
 
 
 def test_rerun_with_no_new_frames_is_noop(tmp_path, monkeypatch) -> None:
@@ -142,3 +152,46 @@ def test_embedder_can_report_subset_of_successful_frames(tmp_path, monkeypatch) 
     vecs = np.load(output_dir / f"frames__{MODEL}.npz")["embeddings"]
     assert ids == ["v1_s0_f1"]
     assert vecs.shape == (1, 2)
+
+
+def test_invalid_new_vectors_do_not_replace_existing_artifact(tmp_path, monkeypatch) -> None:
+    import numpy as np
+    import pytest
+
+    exp = _experiment(tmp_path)
+    _add_frame(tmp_path, "v1_s0_f1")
+    output_dir = tmp_path / "embeddings"
+    output_dir.mkdir(parents=True)
+    ids_path = output_dir / f"frame_ids__{MODEL}.json"
+    vectors_path = output_dir / f"frames__{MODEL}.npz"
+    ids_path.write_text(json.dumps(["v1_s0_f1"]), encoding="utf-8")
+    np.savez_compressed(vectors_path, embeddings=np.array([[1.0, 2.0]], dtype="float32"))
+
+    class InvalidEmbedder(FakeEmbedder):
+        def embed_images(self, frames, on_batch=None):
+            return [[float("nan"), 1.0] for _ in frames]
+
+    monkeypatch.setattr(embeddings, "build_embedder", lambda **kw: InvalidEmbedder())
+
+    with pytest.raises(RuntimeError, match="NaN or Inf"):
+        embeddings.embed_frames(exp, force=True)
+
+    assert json.loads(ids_path.read_text(encoding="utf-8")) == ["v1_s0_f1"]
+    np.testing.assert_array_equal(
+        np.load(vectors_path)["embeddings"], np.array([[1.0, 2.0]], dtype="float32")
+    )
+
+
+def test_unknown_model_fails_before_creating_embedding_artifacts(tmp_path) -> None:
+    experiment = Experiment(
+        name="exp",
+        run_dir=tmp_path,
+        config=PipelineConfig(runs_dir=tmp_path, embedding_models=("unknown-model",)),
+    )
+    _add_frame(tmp_path, "v1_s0_f1")
+
+    with pytest.raises(EmbeddingError, match="unknown-model"):
+        embeddings.embed_frames(experiment)
+
+    assert not (tmp_path / "embeddings").exists()
+    assert not (tmp_path / "manifests" / "embeddings.jsonl").exists()

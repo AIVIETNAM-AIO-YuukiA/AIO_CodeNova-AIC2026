@@ -83,3 +83,9 @@ packages = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "integration: exercises more than one pipeline component",
+    "requires_ffmpeg: requires the bundled/system ffmpeg and OpenCV",
+    "gpu: requires an explicitly enabled CUDA smoke-test environment",
+    "slow: may load a real model or process real media",
+]
