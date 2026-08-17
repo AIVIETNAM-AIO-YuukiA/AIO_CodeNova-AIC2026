@@ -237,3 +237,5 @@ qdrant_storage/
 elasticsearch_storage/
 
 scratchpad/
+
+notebook/

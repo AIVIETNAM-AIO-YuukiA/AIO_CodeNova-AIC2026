@@ -66,6 +66,13 @@ class _TextSink:
     instead of appending duplicates. ``text.jsonl`` is then rebuilt from all
     partitions on every write, which is the source of truth on disk;
     Elasticsearch is a derived index, upserted after the JSONL is durable.
+
+    Because the rebuild only reads from partitions, a ``text.jsonl`` written
+    by anything that predates the partition scheme (or whose rows never made
+    it into a partition for any other reason) would silently vanish the
+    first time a new document triggers a rewrite. ``__init__`` guards against
+    that: on first use, any ``text.jsonl`` row not yet backed by a partition
+    file is migrated in before this sink accepts its first write.
     """
 
     def __init__(self, experiment) -> None:
@@ -73,6 +80,50 @@ class _TextSink:
         self._manifest = JsonlManifest(experiment.run_dir / "manifests" / "text.jsonl")
         self._partition_root = experiment.run_dir / "manifests" / "partitions" / "text"
         self._lock = threading.Lock()
+        self._migrate_legacy_manifest()
+
+    def _migrate_legacy_manifest(self) -> None:
+        """One-time backfill: partition any text.jsonl rows not already partitioned."""
+        if not self._manifest.path.exists():
+            return
+        existing_doc_ids: set[str] = set()
+        for path in self._partition_root.glob("*/*.jsonl"):
+            existing_doc_ids.update(
+                str(row["doc_id"]) for row in JsonlManifest(path).read_all(strict=True)
+            )
+
+        orphaned = [
+            row
+            for row in self._manifest.read_all(strict=True)
+            if str(row.get("doc_id")) not in existing_doc_ids
+        ]
+        if not orphaned:
+            return
+
+        LOGGER.warning(
+            "Migrating %s pre-partition text.jsonl row(s) into partitions "
+            "(source=%s) before accepting new writes",
+            len(orphaned),
+            self._partition_root,
+        )
+        grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for row in orphaned:
+            key = (str(row.get("source")), str(row.get("video_id")))
+            grouped.setdefault(key, []).append(row)
+
+        for (source, video_id), rows in grouped.items():
+            store = PartitionStore(self._partition_root / source)
+            existing_path = store.path_for(video_id)
+            by_id = (
+                {
+                    str(existing_row["doc_id"]): existing_row
+                    for existing_row in JsonlManifest(existing_path).read_all(strict=True)
+                }
+                if existing_path.exists()
+                else {}
+            )
+            by_id.update({str(row["doc_id"]): row for row in rows})
+            store.write(video_id, by_id.values(), partition_key="video_id", unique_key="doc_id")
 
     def write(self, documents: list[TextDocument]) -> None:
         if not documents:
@@ -98,7 +149,16 @@ class _TextSink:
             rows: list[dict[str, object]] = []
             for path in sorted(self._partition_root.glob("*/*.jsonl")):
                 rows.extend(JsonlManifest(path).read_all(strict=True))
-            self._manifest.replace_all(rows, unique_key="doc_id", backup=True)
+            # backup=False: this runs once per video (hundreds of times per
+            # extract-text run), and text.jsonl only grows larger as the run
+            # progresses. backup=True copied the whole file — tens to
+            # hundreds of MB — on every single call, unbounded, and none of
+            # those .bak files were ever cleaned up; a long run has filled
+            # the disk with them before (~13GB from one session). The
+            # per-video partitions under manifests/partitions/text/ plus
+            # Elasticsearch are the durable copies here, so a rewrite
+            # snapshot isn't needed on every write.
+            self._manifest.replace_all(rows, unique_key="doc_id", backup=False)
             # Elasticsearch is a derived index. Publish durable JSONL first,
             # then upsert the same documents into the online text store.
             self._index.index_documents(documents)
