@@ -1,9 +1,9 @@
 """Elasticsearch-backed text index.
 
-Indexes OCR (``modules/ocr/vllm.py``) and ASR (``modules/asr/gipformer.py``)
-documents under one mapping (same convention as the AIC 2025 reference
-project's ``elasticsearch_service.py``: one index, ``source`` field
-distinguishes OCR vs ASR rather than separate indices per modality).
+Indexes OCR (``modules/ocr/vllm.py``), ASR (``modules/asr/gipformer.py``), and
+caption documents under one mapping (same convention as the AIC 2025
+reference project's ``elasticsearch_service.py``: one index, ``source``
+distinguishes modalities rather than using separate indices).
 """
 
 from __future__ import annotations
@@ -88,14 +88,26 @@ class ElasticTextIndex(TextIndex):
         hits = self._query(query, top_k)
         return [(hit["_id"], float(hit["_score"])) for hit in hits]
 
-    def search_documents(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
-        """Return full matching documents, optionally restricted to one source."""
+    def search_documents(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
+        """Return full matching documents, optionally restricted by source."""
+        if source is not None and not isinstance(source, str) and not source:
+            return []
         hits = self._query(query, top_k, source=source)
         return [
             {"doc_id": hit["_id"], "score": float(hit["_score"]), **hit["_source"]} for hit in hits
         ]
 
-    def _query(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
+    def _query(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
         client = self._connect()
         should = [
             {"match_phrase": {"text": {"query": query, "boost": 8.0}}},
@@ -113,8 +125,10 @@ class ElasticTextIndex(TextIndex):
             {"match": {"text": {"query": query, "fuzziness": "AUTO", "boost": 2.0}}},
         ]
         bool_query: dict = {"should": should, "minimum_should_match": 1}
-        if source is not None:
+        if isinstance(source, str):
             bool_query["filter"] = [{"term": {"source": source}}]
+        elif source is not None:
+            bool_query["filter"] = [{"terms": {"source": list(source)}}]
         response = client.search(index=self.index_name, query={"bool": bool_query}, size=top_k)
         return response["hits"]["hits"]
 

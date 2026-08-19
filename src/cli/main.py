@@ -113,14 +113,19 @@ def build_parser() -> ArgumentParser:
     text_parser.add_argument("--skip-asr", action="store_true", help="Skip the ASR sub-stage")
 
     export_text_parser = subparsers.add_parser(
-        "export-text", help="Dump OCR/ASR documents from Elasticsearch to manifests/text.jsonl"
+        "export-text", help="Dump text documents from Elasticsearch to manifests/text.jsonl"
     )
     add_run_args(export_text_parser)
 
     import_text_parser = subparsers.add_parser(
-        "import-text", help="Load manifests/text.jsonl into Elasticsearch"
+        "import-text", help="Load text.jsonl and captions.jsonl into Elasticsearch"
     )
     add_run_args(import_text_parser)
+    import_text_parser.add_argument(
+        "--no-captions",
+        action="store_true",
+        help="Do not import manifests/captions.jsonl when it exists",
+    )
 
     preflight_parser = subparsers.add_parser(
         "preflight-index", help="Inventory config, device and dataset before indexing"
@@ -631,7 +636,7 @@ def handle_extract_text(args: Namespace) -> int:
 
 
 def handle_export_text(args: Namespace) -> int:
-    """Dump OCR/ASR documents from Elasticsearch to a local JSONL file."""
+    """Dump text documents from Elasticsearch to a local JSONL file."""
     experiment = load_experiment(args)
     count = export_text(experiment=experiment)
     print(json.dumps({"experiment": experiment.name, "exported": count}))
@@ -641,7 +646,7 @@ def handle_export_text(args: Namespace) -> int:
 def handle_import_text(args: Namespace) -> int:
     """Load a local JSONL text export into Elasticsearch."""
     experiment = load_experiment(args)
-    count = import_text(experiment=experiment)
+    count = import_text(experiment=experiment, include_captions=not args.no_captions)
     print(json.dumps({"experiment": experiment.name, "imported": count}))
     return 0
 

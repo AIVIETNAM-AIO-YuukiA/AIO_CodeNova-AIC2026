@@ -294,7 +294,7 @@ def extract_asr(experiment, force: bool = False) -> int:
 
 
 def export_text(experiment) -> int:
-    """Re-dump every OCR/ASR document from Elasticsearch to ``manifests/text.jsonl``.
+    """Re-dump every text document from Elasticsearch to ``manifests/text.jsonl``.
 
     Extraction already mirrors documents there as they are produced; this
     rebuilds the file from Elasticsearch when it has drifted or been deleted.
@@ -313,69 +313,134 @@ def export_text(experiment) -> int:
     return count
 
 
-def import_text(experiment) -> int:
-    """Load ``manifests/text.jsonl`` back into Elasticsearch.
+def import_text(experiment, *, include_captions: bool = True) -> int:
+    """Load local text manifests back into Elasticsearch.
 
     The counterpart to ``export_text`` — lets a teammate who only received
     the JSONL file (e.g. over git/Slack, without access to this machine's
     Elasticsearch volume) reconstruct the text index locally with one
     command, same as ``build-index`` reconstructs Qdrant from the local
-    ``embeddings/*.npz`` files.
+    ``embeddings/*.npz`` files. Caption documents are included by default
+    when ``manifests/captions.jsonl`` exists. Elasticsearch uses the stable
+    ``doc_id`` as ``_id``, so repeated imports replace the same records rather
+    than creating duplicates.
     """
     manifest_path = experiment.run_dir / "manifests" / "text.jsonl"
-    if not manifest_path.exists():
-        raise CodeNovaError(f"No text.jsonl found at {manifest_path}. Run export-text first.")
+    caption_path = experiment.run_dir / "manifests" / "captions.jsonl"
+    if not manifest_path.exists() and not (include_captions and caption_path.exists()):
+        raise CodeNovaError(
+            f"No importable text manifest found at {manifest_path}"
+            + (" or " + str(caption_path) if include_captions else "")
+            + ". Run extract-text/export-text first."
+        )
+
+    from modules.captioning.validation import validate_caption
+
+    documents: list[TextDocument] = []
+    skipped_caption_rows = 0
+    manifest_rows = JsonlManifest(manifest_path).read_all() if manifest_path.exists() else []
+    for row in manifest_rows:
+        source = row["source"]
+        text = row["text"]
+        if source == "caption":
+            if not include_captions:
+                continue
+            if (
+                not isinstance(text, str)
+                or not text.strip()
+                or not validate_caption(text).valid
+            ):
+                skipped_caption_rows += 1
+                continue
+        documents.append(
+            TextDocument(
+                doc_id=row["doc_id"],
+                video_id=row["video_id"],
+                text=text.strip() if source == "caption" and isinstance(text, str) else text,
+                source=source,
+                frame_id=row.get("frame_id"),
+                timestamp_sec=row.get("timestamp_sec"),
+            )
+        )
+    if skipped_caption_rows:
+        LOGGER.warning(
+            "Skipped %s empty or invalid caption row(s) from %s",
+            skipped_caption_rows,
+            manifest_path,
+        )
+
+    if include_captions:
+        if caption_path.exists():
+            # A full Elasticsearch export may already contain caption rows.
+            # Keying the combined batch by doc_id keeps the import count and
+            # bulk request idempotent in that case as well.
+            by_id = {document.doc_id: document for document in documents}
+            for document in _caption_documents(experiment):
+                by_id[document.doc_id] = document
+            documents = list(by_id.values())
 
     text_index = build_text_index(experiment)
-    documents = [
-        TextDocument(
-            doc_id=row["doc_id"],
-            video_id=row["video_id"],
-            text=row["text"],
-            source=row["source"],
-            frame_id=row.get("frame_id"),
-            timestamp_sec=row.get("timestamp_sec"),
-        )
-        for row in JsonlManifest(manifest_path).read_all()
-    ]
     text_index.index_documents(documents)
-    LOGGER.info("Imported %s text documents from %s", len(documents), manifest_path)
+    LOGGER.info(
+        "Imported %s text documents from %s (captions=%s)",
+        len(documents),
+        manifest_path,
+        "included" if include_captions else "disabled",
+    )
     return len(documents)
 
 
 def import_captions(experiment) -> int:
     """Load ``manifests/captions.jsonl`` into Elasticsearch for intelligent search."""
-    from repository.caption_repo import CaptionRepository
+    documents = _caption_documents(experiment)
 
-    repo = CaptionRepository(experiment)
-    captions = repo.by_id()
-    if not captions:
-        LOGGER.warning("No captions found to import")
-        return 0
+    if documents:
+        build_text_index(experiment).index_documents(documents)
+    LOGGER.info("Imported %s caption documents", len(documents))
+    return len(documents)
+
+
+def _caption_documents(experiment) -> list[TextDocument]:
+    """Build valid, frame-linked caption documents without mutating an index."""
+    from modules.captioning.validation import validate_caption
+
+    captions_path = experiment.run_dir / "manifests" / "captions.jsonl"
+    if not captions_path.exists():
+        return []
 
     frames_manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
     frame_records = {
         row["frame_id"]: FrameRecord.from_dict(row) for row in frames_manifest.read_all()
     }
 
-    text_index = build_text_index(experiment)
-    documents = []
-    for frame_id, caption in captions.items():
-        record = frame_records.get(frame_id)
-        if not record:
+    documents_by_id: dict[str, TextDocument] = {}
+    skipped = 0
+    for row in JsonlManifest(captions_path).read_all():
+        frame_id = row.get("frame_id")
+        caption = row.get("caption")
+        if not isinstance(frame_id, str) or not frame_id:
+            skipped += 1
             continue
-        documents.append(
-            TextDocument(
-                doc_id=f"{frame_id}__caption",
-                video_id=record.video_id,
-                text=caption,
-                source="caption",
-                frame_id=frame_id,
-                timestamp_sec=record.timestamp_sec,
-            )
+        if not isinstance(caption, str) or not caption.strip():
+            skipped += 1
+            continue
+        if not validate_caption(caption).valid:
+            skipped += 1
+            continue
+        record = frame_records.get(frame_id)
+        if record is None:
+            skipped += 1
+            continue
+        document = TextDocument(
+            doc_id=f"{frame_id}__caption",
+            video_id=record.video_id,
+            text=caption.strip(),
+            source="caption",
+            frame_id=frame_id,
+            timestamp_sec=record.timestamp_sec,
         )
+        documents_by_id[document.doc_id] = document
 
-    if documents:
-        text_index.index_documents(documents)
-    LOGGER.info("Imported %s caption documents", len(documents))
-    return len(documents)
+    if skipped:
+        LOGGER.warning("Skipped %s empty, invalid, or unlinked caption record(s)", skipped)
+    return list(documents_by_id.values())
