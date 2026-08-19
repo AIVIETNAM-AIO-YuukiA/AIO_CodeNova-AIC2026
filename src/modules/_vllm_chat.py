@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import threading
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,10 +68,14 @@ class VllmChatClient:
         openrouter_model: str | None = None,
         openrouter_api_key: str | None = None,
         prefer_openrouter: bool | None = None,
+        max_retries: int | None = None,
     ) -> None:
         self.base_url = (base_url or os.environ.get("VLLM_BASE_URL", _DEFAULT_BASE_URL)).rstrip("/")
         self.model_name = model_name or os.environ.get("VLLM_MODEL", _DEFAULT_MODEL)
         self.timeout = timeout
+        self.max_retries = None if max_retries is None else max(0, int(max_retries))
+        self._usage_local = threading.local()
+        self.last_usage: dict[str, object] = {}
 
         self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
         if prefer_openrouter is None:
@@ -86,6 +91,15 @@ class VllmChatClient:
 
         self._client = None
         self._openrouter_client = None
+
+    @property
+    def last_usage(self) -> dict[str, object]:
+        """Return usage for the current request thread only."""
+        return getattr(self._usage_local, "value", {})
+
+    @last_usage.setter
+    def last_usage(self, value: dict[str, object]) -> None:
+        self._usage_local.value = dict(value) if isinstance(value, dict) else {}
 
     def complete_with_image(
         self,
@@ -115,6 +129,7 @@ class VllmChatClient:
             lambda model_name: {"model": model_name, "messages": messages, **generation_params}
         )
         payload = response.json()
+        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         return payload["choices"][0]["message"]["content"].strip()
 
     def complete_text(
@@ -139,6 +154,7 @@ class VllmChatClient:
             }
         )
         payload = response.json()
+        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         return payload["choices"][0]["message"]["content"].strip()
 
     def _post_with_fallback(self, build_payload):
@@ -184,11 +200,12 @@ class VllmChatClient:
             # without. Captioning and OCR have nothing to reason about.
             payload.setdefault("reasoning", {"enabled": False})
         last_error: Exception | None = None
-        for attempt in range(_MAX_RETRIES):
+        max_attempts = _MAX_RETRIES if self.max_retries is None else self.max_retries + 1
+        for attempt in range(max_attempts):
             retry_after = None
             try:
                 response = client.post("/chat/completions", json=payload)
-                if response.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES - 1:
+                if response.status_code in _RETRY_STATUS and attempt < max_attempts - 1:
                     last_error = httpx.HTTPStatusError(
                         f"HTTP {response.status_code}", request=response.request, response=response
                     )
@@ -197,7 +214,7 @@ class VllmChatClient:
                         "OpenRouter HTTP %s (attempt %s/%s), backing off",
                         response.status_code,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_attempts,
                     )
                 else:
                     if response.status_code >= 400:
@@ -208,7 +225,7 @@ class VllmChatClient:
                     return response
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                 last_error = exc
-                if attempt == _MAX_RETRIES - 1:
+                if attempt == max_attempts - 1:
                     raise
             _sleep_before_retry(attempt, retry_after)
         raise last_error if last_error else RuntimeError("OpenRouter request failed")

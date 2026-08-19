@@ -17,7 +17,7 @@ from modules.reranker.base import Reranker, build_reranker
 from retrieval.fusion import wsf_fuse
 import numpy as np
 from retrieval.hydrator import ResultHydrator
-from retrieval.query_processor import QueryProcessor, get_query_processor
+from retrieval.query_processor import ProcessedQuery, QueryProcessor, get_query_processor
 from stores.vector.base import VectorIndex
 from stores.vector.factory import build_vector_index
 
@@ -99,6 +99,30 @@ class Retriever:
             query, enabled_models=enabled_models, use_llm=use_llm
         )
         _log_processed_query(processed)
+
+        return self.search_processed(
+            processed,
+            top_k=top_k,
+            enabled_models=enabled_models,
+            model_weights=model_weights,
+            use_reranker=use_reranker,
+        )
+
+    def search_processed(
+        self,
+        processed: ProcessedQuery,
+        top_k: int = 300,
+        enabled_models: list[str] | None = None,
+        model_weights: dict[str, float] | None = None,
+        use_reranker: bool | None = None,
+    ) -> list[SearchResult]:
+        """Search using an already decomposed query.
+
+        Intelligent search decomposes a query once for all modalities.  This
+        entry point prevents the visual branch from sending the generated
+        visual prompt through the LLM a second time.  Plain ``search`` keeps
+        its existing public behaviour and delegates here after processing.
+        """
 
         active = self._select_embedders(enabled_models)
         apply_reranker = self.reranker is not None and use_reranker is not False
