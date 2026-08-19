@@ -78,6 +78,7 @@ packages = [
     "src/ui",
     "src/video",
     "src/agent",
+    "src/evaluation",
 ]
 
 [tool.pytest.ini_options]

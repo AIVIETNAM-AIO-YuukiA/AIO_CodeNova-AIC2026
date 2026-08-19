@@ -1,0 +1,1 @@
+{"query_id":"q001","query":"người nói về sụt lún đồng bằng sông cửu long","relevant_frame_ids":["REPLACE_WITH_FRAME_ID"],"relevant_moments":[{"video_id":"REPLACE_WITH_VIDEO_ID","start_sec":4.0,"end_sec":40.0}],"expected_modalities":["asr"],"group":"asr-only"}
