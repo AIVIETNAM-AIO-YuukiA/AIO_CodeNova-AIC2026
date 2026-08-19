@@ -10,10 +10,17 @@ import logging
 from pathlib import Path
 import shutil
 import tempfile
+import time
 
 from core.errors import CodeNovaError
 
 LOGGER = logging.getLogger(__name__)
+
+# On Windows, os.replace() can transiently fail with PermissionError/WinError 5
+# when another process (antivirus, search indexer) briefly holds a handle on a
+# just-written file — not a real conflict, just needs a moment to clear.
+_REPLACE_MAX_RETRIES = 5
+_REPLACE_RETRY_SECONDS = 0.05
 
 
 class ManifestError(CodeNovaError):
@@ -161,7 +168,17 @@ class JsonlManifest:
                     f"{self.path.name}.{self.path.stat().st_mtime_ns}.bak"
                 )
                 shutil.copy2(self.path, backup_path)
-            temporary.replace(self.path)
+            self._replace_with_retry(temporary)
         except Exception:
             temporary.unlink(missing_ok=True)
             raise
+
+    def _replace_with_retry(self, temporary: Path) -> None:
+        for attempt in range(_REPLACE_MAX_RETRIES):
+            try:
+                temporary.replace(self.path)
+                return
+            except PermissionError:
+                if attempt == _REPLACE_MAX_RETRIES - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_SECONDS * (attempt + 1))

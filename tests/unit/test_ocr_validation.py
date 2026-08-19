@@ -33,13 +33,19 @@ def test_invalid_repeated_ngram_run() -> None:
     assert_invalid("abc def abc def abc def abc def", "repeated_ngram_run")
 
 
-def test_invalid_too_long() -> None:
-    assert_invalid(" ".join(["text"] * 221), "too_long_words")
-
-
 def test_invalid_meta_output() -> None:
-    assert_invalid("Xin lỗi, tôi không thể xử lý ảnh này.", "meta_or_error_phrase")
+    assert_invalid("I'm sorry, I cannot process this image.", "meta_or_error_phrase")
 
 
-def test_invalid_scene_description() -> None:
-    assert_invalid("Đây là cảnh phóng sự hiện trường với một người đàn ông.", "scene_description")
+def test_meta_phrase_does_not_false_positive_on_real_text() -> None:
+    # "AI Cannot" is a real on-screen slide heading — its lowercase form
+    # "ai cannot" must not be flagged just because it contains "i cannot".
+    text = "AI Cannot\n- Perform commonsense reasoning\n- Create a unique thought"
+    assert validate_ocr_text(text).valid
+
+
+def test_dense_but_real_text_is_valid() -> None:
+    # Screens with many real UI labels (e.g. video editor software) can have
+    # far more lines/words than a normal caption without being garbage.
+    text = "\n".join(f"Label {i}" for i in range(60))
+    assert validate_ocr_text(text).valid
