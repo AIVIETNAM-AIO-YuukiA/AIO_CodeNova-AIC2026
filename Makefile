@@ -17,7 +17,7 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
         elasticsearch-up elasticsearch-health \
         vllm-index-up vllm-index-down vllm-index-health \
         preflight-index validate-index repair-manifest offline-index \
-        ingest detect-shots extract-frames embed-frames build-index extract-text extract-asr extract-ocr export-text import-text pipeline \
+        ingest detect-shots extract-frames embed-frames build-index extract-text extract-asr extract-ocr drop-ocr-watermarks export-text import-text pipeline \
         search serve-ui clean-runs clean
 
 help: ## Hiện danh sách lệnh này
@@ -135,6 +135,9 @@ extract-asr: ## Chỉ chạy ASR, index vào Elasticsearch (EXP); cần Elastics
 
 extract-ocr: ## Chỉ chạy OCR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
 	uv run codenova extract-text --experiment-name $(EXP) --skip-asr
+
+drop-ocr-watermarks: ## Lọc dòng watermark/logo đài lặp lại khỏi OCR đã trích (EXP); chạy sau khi extract-ocr xong hẳn
+	uv run codenova drop-ocr-watermarks --experiment-name $(EXP)
 
 export-text: ## Xuất document OCR/ASR từ Elasticsearch ra runs/<exp>/manifests/text.jsonl (EXP)
 	uv run codenova export-text --experiment-name $(EXP)

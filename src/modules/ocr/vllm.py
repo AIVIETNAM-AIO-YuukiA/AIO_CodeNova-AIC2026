@@ -22,6 +22,14 @@ _GENERATION_PARAMS = {
     "seed": 42,
 }
 
+# Repetition reasons are handled by _dedupe_consecutive_lines above; if they
+# still fire afterwards (e.g. repetition isn't line-aligned), the text is kept
+# rather than discarding the whole frame — other reasons (too-long, meta/error
+# phrases) still indicate a genuinely bad response and are rejected.
+_REPETITION_REASONS = frozenset(
+    {"repeated_character_run", "repeated_token_run", "repeated_ngram_run"}
+)
+
 
 class VllmOcrModel(OcrModel):
     """Extract on-screen text from keyframes via a self-hosted vLLM endpoint."""
@@ -48,10 +56,39 @@ class VllmOcrModel(OcrModel):
             LOGGER.exception("vLLM OCR failed for %s: %s", frame_path, exc)
             raise CaptioningError(f"vLLM OCR failed for {frame_path}: {exc}") from exc
 
-        text = "" if text.strip() == NO_TEXT_MARKER else text
+        text = text.strip()
+        if "</think>" in text:
+            text = text.split("</think>")[-1].strip()
+        text = "" if text == NO_TEXT_MARKER else text
+        # The model occasionally gets stuck re-emitting the same line dozens of
+        # times (observed on frames with many repeated banners along a shot's
+        # background) instead of a network/decoding failure — collapse that
+        # in place rather than discarding the whole frame, same as how AIC
+        # 2025's OCR script accepts every response and only prunes noise
+        # afterwards (its cross-document watermark filter, mirrored in
+        # extract_text._drop_watermark_lines) rather than rejecting responses.
+        text = _dedupe_consecutive_lines(text)
+
         validation = validate_ocr_text(text)
         if not validation.valid:
             reasons = ", ".join(validation.reasons)
-            LOGGER.warning("Invalid OCR output for %s: %s", frame_path, reasons)
-            raise CaptioningError(f"Invalid OCR output for {frame_path}: {reasons}")
+            if set(validation.reasons) <= _REPETITION_REASONS:
+                LOGGER.warning(
+                    "OCR output for %s still repetitive after line-dedupe (%s); keeping as-is",
+                    frame_path,
+                    reasons,
+                )
+            else:
+                LOGGER.warning("Invalid OCR output for %s: %s", frame_path, reasons)
+                raise CaptioningError(f"Invalid OCR output for {frame_path}: {reasons}")
         return text
+
+
+def _dedupe_consecutive_lines(text: str) -> str:
+    """Collapse runs of identical consecutive lines to a single occurrence."""
+    lines = text.splitlines()
+    deduped: list[str] = []
+    for line in lines:
+        if not deduped or line.strip() != deduped[-1].strip():
+            deduped.append(line)
+    return "\n".join(deduped)

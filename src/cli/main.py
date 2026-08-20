@@ -22,7 +22,13 @@ from core.errors import CodeNovaError, ExperimentNameError  # noqa: E402
 from core.logging import configure_logging, get_logger  # noqa: E402
 from indexing.build_index import build_index  # noqa: E402
 from indexing.embeddings import embed_frames  # noqa: E402
-from indexing.extract_text import export_text, extract_asr, extract_ocr, import_text  # noqa: E402
+from indexing.extract_text import (  # noqa: E402
+    drop_ocr_watermarks,
+    export_text,
+    extract_asr,
+    extract_ocr,
+    import_text,
+)
 from indexing.frames import extract_frames  # noqa: E402
 from indexing.frame_paths import (  # noqa: E402
     apply_frame_path_migration,
@@ -111,6 +117,18 @@ def build_parser() -> ArgumentParser:
     text_parser.add_argument("--force", action="store_true")
     text_parser.add_argument("--skip-ocr", action="store_true", help="Skip the OCR sub-stage")
     text_parser.add_argument("--skip-asr", action="store_true", help="Skip the ASR sub-stage")
+
+    watermarks_parser = subparsers.add_parser(
+        "drop-ocr-watermarks",
+        help="Strip recurring station-watermark lines from already-extracted OCR text",
+    )
+    add_run_args(watermarks_parser)
+    watermarks_parser.add_argument(
+        "--drop-ratio",
+        type=float,
+        default=None,
+        help="Line document-frequency threshold (default: OCR_WATERMARK_DROP_RATIO env or 0.15)",
+    )
 
     export_text_parser = subparsers.add_parser(
         "export-text", help="Dump text documents from Elasticsearch to manifests/text.jsonl"
@@ -635,6 +653,15 @@ def handle_extract_text(args: Namespace) -> int:
     return _stage_exit_code(experiment, *stages)
 
 
+def handle_drop_ocr_watermarks(args: Namespace) -> int:
+    """Strip recurring station-watermark lines from already-extracted OCR text."""
+    experiment = load_experiment(args)
+    kwargs = {} if args.drop_ratio is None else {"drop_ratio": args.drop_ratio}
+    count = drop_ocr_watermarks(experiment=experiment, **kwargs)
+    print(json.dumps({"experiment": experiment.name, "documents_updated": count}))
+    return 0
+
+
 def handle_export_text(args: Namespace) -> int:
     """Dump text documents from Elasticsearch to a local JSONL file."""
     experiment = load_experiment(args)
@@ -712,6 +739,8 @@ def main(argv: list[str] | None = None) -> int:
             return handle_build_index(args)
         if args.command == "extract-text":
             return handle_extract_text(args)
+        if args.command == "drop-ocr-watermarks":
+            return handle_drop_ocr_watermarks(args)
         if args.command == "export-text":
             return handle_export_text(args)
         if args.command == "import-text":

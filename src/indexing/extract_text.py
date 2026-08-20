@@ -29,50 +29,104 @@ LOGGER = get_logger(__name__)
 
 _DEFAULT_OCR_WORKERS = 8
 
-# Set OCR_ONE_FRAME_PER_SHOT=1 to OCR a single representative frame per shot
-# instead of every keyframe. On-screen text is usually static within a shot, so
-# this cuts VLM calls (and cost) by ~2/3 at the risk of missing text that
-# appears only mid-shot, such as a moving ticker.
-_ONE_FRAME_PER_SHOT = os.environ.get("OCR_ONE_FRAME_PER_SHOT", "0").lower() not in (
+# On-screen text is usually static within a shot, so OCR only a single
+# representative frame per shot and copy its text to the shot's other
+# keyframes. Cuts VLM calls (and cost) by ~2/3 at the risk of missing text
+# that appears only mid-shot, such as a moving ticker. Set
+# OCR_ONE_FRAME_PER_SHOT=0 to OCR every keyframe instead.
+_ONE_FRAME_PER_SHOT = os.environ.get("OCR_ONE_FRAME_PER_SHOT", "1").lower() not in (
     "0",
     "false",
-    "",
 )
+
+# Lines that recur across at least this fraction of a run's OCR'd shots are
+# station watermarks/logos/program names rather than content — indistinguishable
+# per-frame, so they are dropped after all shots have been read.
+_WATERMARK_DROP_RATIO = float(os.environ.get("OCR_WATERMARK_DROP_RATIO", "0.15"))
+_WATERMARK_WRITE_BATCH_SIZE = 500
+
+
+def _group_frames_by_shot(frames: list[FrameRecord]) -> dict[str, list[FrameRecord]]:
+    by_shot: dict[str, list[FrameRecord]] = {}
+    for frame in frames:
+        by_shot.setdefault(frame.shot_id, []).append(frame)
+    return by_shot
 
 
 def _pick_one_frame_per_shot(frames: list[FrameRecord]) -> list[FrameRecord]:
     """Keep the middle frame of each shot, which is furthest from cut boundaries."""
-    by_shot: dict[str, list[FrameRecord]] = {}
-    for frame in frames:
-        by_shot.setdefault(frame.shot_id, []).append(frame)
     picked = []
-    for shot_frames in by_shot.values():
+    for shot_frames in _group_frames_by_shot(frames).values():
         shot_frames.sort(key=lambda f: f.timestamp_sec)
         picked.append(shot_frames[len(shot_frames) // 2])
     picked.sort(key=lambda f: (f.video_id, f.timestamp_sec))
     return picked
 
 
+def _normalize_line(line: str) -> str:
+    return " ".join(line.strip().lower().split())
+
+
+def _drop_watermark_lines(texts: dict[str, str], drop_ratio: float) -> dict[str, str]:
+    """Strip lines that repeat across many OCR'd shots (station logo/branding)."""
+    if not texts:
+        return texts
+    line_doc_freq: dict[str, int] = {}
+    for text in texts.values():
+        for line in {_normalize_line(ln) for ln in text.splitlines() if ln.strip()}:
+            line_doc_freq[line] = line_doc_freq.get(line, 0) + 1
+
+    threshold = max(2, int(len(texts) * drop_ratio))
+    watermark_lines = {line for line, freq in line_doc_freq.items() if freq >= threshold}
+    if not watermark_lines:
+        return texts
+
+    LOGGER.info(
+        "OCR watermark filter: dropping %s recurring line(s) (>= %s/%s shots)",
+        len(watermark_lines),
+        threshold,
+        len(texts),
+    )
+    cleaned: dict[str, str] = {}
+    for frame_id, text in texts.items():
+        kept = [
+            line
+            for line in text.splitlines()
+            if line.strip() and _normalize_line(line) not in watermark_lines
+        ]
+        if kept:
+            cleaned[frame_id] = "\n".join(kept)
+    return cleaned
+
+
 class _TextSink:
     """Writes documents to the text index and mirrors them into text.jsonl.
 
-    A video whose ASR/OCR finished writing documents and then crashed before
-    ``JobState`` recorded it as ``COMPLETED`` gets reprocessed on the next
-    run. Rather than dedupe against an in-memory set (which only protects a
-    single run), each video's documents are kept in their own partition file
+    A frame/video whose ASR/OCR finished writing documents and then crashed
+    before ``JobState`` recorded it as ``COMPLETED`` gets reprocessed on the
+    next run. Each video's documents are kept in their own partition file
     under ``manifests/partitions/text/<source>/<video_id>.jsonl``, rewritten
     in full (keyed by ``doc_id``) every time that video produces documents —
     so a rerun, even from a different process, converges on the same content
-    instead of appending duplicates. ``text.jsonl`` is then rebuilt from all
-    partitions on every write, which is the source of truth on disk;
-    Elasticsearch is a derived index, upserted after the JSONL is durable.
+    instead of appending duplicates there. Partitions are the source of
+    truth on disk; Elasticsearch is a derived index, upserted after the
+    partition write is durable.
 
-    Because the rebuild only reads from partitions, a ``text.jsonl`` written
-    by anything that predates the partition scheme (or whose rows never made
-    it into a partition for any other reason) would silently vanish the
-    first time a new document triggers a rewrite. ``__init__`` guards against
-    that: on first use, any ``text.jsonl`` row not yet backed by a partition
-    file is migrated in before this sink accepts its first write.
+    ``text.jsonl`` is only ever appended to, not rebuilt from partitions on
+    every write: with 100k+ shots calling this per-shot, re-reading and
+    rewriting the whole (ever-growing) file on every single call made
+    ``write()`` the dominant cost of extraction. That means a doc_id
+    reprocessed after a crash can end up duplicated in ``text.jsonl`` (rare —
+    only on resume-after-failure) even though the partition and Elasticsearch
+    stay correctly deduped; run ``export_text`` to rebuild a clean
+    ``text.jsonl`` from Elasticsearch when that matters.
+
+    Because ``text.jsonl`` is no longer rebuilt from partitions, a
+    ``text.jsonl`` written by anything that predates the partition scheme (or
+    whose rows never made it into a partition for any other reason) would
+    otherwise never get backfilled. ``__init__`` guards against that: on
+    first use, any ``text.jsonl`` row not yet backed by a partition file is
+    migrated in before this sink accepts its first write.
     """
 
     def __init__(self, experiment) -> None:
@@ -146,39 +200,75 @@ class _TextSink:
                 by_id.update({document.doc_id: asdict(document) for document in group})
                 store.write(video_id, by_id.values(), partition_key="video_id", unique_key="doc_id")
 
-            rows: list[dict[str, object]] = []
-            for path in sorted(self._partition_root.glob("*/*.jsonl")):
-                rows.extend(JsonlManifest(path).read_all(strict=True))
-            # backup=False: this runs once per video (hundreds of times per
-            # extract-text run), and text.jsonl only grows larger as the run
-            # progresses. backup=True copied the whole file — tens to
-            # hundreds of MB — on every single call, unbounded, and none of
-            # those .bak files were ever cleaned up; a long run has filled
-            # the disk with them before (~13GB from one session). The
-            # per-video partitions under manifests/partitions/text/ plus
-            # Elasticsearch are the durable copies here, so a rewrite
-            # snapshot isn't needed on every write.
-            self._manifest.replace_all(rows, unique_key="doc_id", backup=False)
+            # Append-only: with 100k+ shots each calling write() once, reading
+            # and rewriting the whole (ever-growing) text.jsonl on every call
+            # made this the dominant cost of extraction. Partitions above are
+            # the deduped source of truth; text.jsonl may end up with a
+            # duplicate doc_id on resume-after-failure (rare) — export_text
+            # rebuilds a clean copy from Elasticsearch when that matters.
+            self._manifest.extend(asdict(document) for document in documents)
             # Elasticsearch is a derived index. Publish durable JSONL first,
             # then upsert the same documents into the online text store.
             self._index.index_documents(documents)
 
 
+def _document_for_ocr(frame: FrameRecord, text: str | None) -> TextDocument | None:
+    if not text:
+        return None
+    return TextDocument(
+        doc_id=f"{frame.frame_id}__ocr",
+        video_id=frame.video_id,
+        frame_id=frame.frame_id,
+        text=text,
+        source="ocr",
+        timestamp_sec=frame.timestamp_sec,
+    )
+
+
 def extract_ocr(experiment, force: bool = False) -> int:
     """Run OCR on every keyframe, indexing results and mirroring them to JSONL.
 
+    With ``OCR_ONE_FRAME_PER_SHOT`` (default on), only the middle frame of
+    each shot is sent to the VLM; its text is copied to every other keyframe
+    in that shot, since on-screen text is usually static within a shot.
     Frames with no on-screen text are still marked completed so they aren't
     retried, but produce no document. Runs CAPTION_WORKERS threads since each
     call is a slow VLM round trip.
+
+    Each shot's document is written and marked COMPLETED as soon as it's
+    OCR'd, not batched until the whole run finishes: with 100k+ shots this
+    can run for hours, and a run that only persisted results after every
+    single shot succeeded would lose everything already OCR'd if it were
+    interrupted partway through. Station-watermark filtering (recurring
+    lines across shots) therefore can't happen inline anymore — run
+    ``drop_ocr_watermarks`` as a separate pass once extraction is done.
     """
     frames_manifest = JsonlManifest(experiment.run_dir / "manifests" / "frames.jsonl")
     state = JobState(experiment.run_dir / "jobs.sqlite")
-    frames = [FrameRecord.from_dict(row) for row in frames_manifest.read_all()]
-    frames = [f for f in frames if not state.should_skip(f.frame_id, "EXTRACT_OCR", force=force)]
+    all_frames = [FrameRecord.from_dict(row) for row in frames_manifest.read_all()]
+    done_ids = set() if force else state.completed_ids("EXTRACT_OCR")
+    pending_frames = [f for f in all_frames if f.frame_id not in done_ids]
+
+    siblings_by_frame_id: dict[str, list[FrameRecord]] = {}
     if _ONE_FRAME_PER_SHOT:
-        before = len(frames)
-        frames = _pick_one_frame_per_shot(frames)
-        LOGGER.info("OCR one-frame-per-shot: %s frames -> %s shots", before, len(frames))
+        by_shot = _group_frames_by_shot(all_frames)
+        reps = _pick_one_frame_per_shot(all_frames)
+        pending_rep_ids = {f.frame_id for f in pending_frames}
+        reps = [f for f in reps if f.frame_id in pending_rep_ids]
+        for rep in reps:
+            shot_frames = sorted(by_shot[rep.shot_id], key=lambda f: f.timestamp_sec)
+            siblings_by_frame_id[rep.frame_id] = [
+                f for f in shot_frames if f.frame_id != rep.frame_id
+            ]
+        LOGGER.info(
+            "OCR one-frame-per-shot: %s pending frames -> %s shot(s)",
+            len(pending_frames),
+            len(reps),
+        )
+        frames = reps
+    else:
+        frames = pending_frames
+
     if not frames:
         LOGGER.warning("No frames to OCR (all done, or none found)")
         return 0
@@ -186,46 +276,98 @@ def extract_ocr(experiment, force: bool = False) -> int:
     ocr_model = VllmOcrModel()
     sink = _TextSink(experiment)
     workers = int(os.environ.get("CAPTION_WORKERS", _DEFAULT_OCR_WORKERS))
+    indexed = 0
+    indexed_lock = threading.Lock()
 
-    def _process(frame: FrameRecord) -> tuple[FrameRecord, TextDocument | None, Exception | None]:
+    def _process(frame: FrameRecord) -> None:
+        nonlocal indexed
         try:
             text = ocr_model.recognize(
                 str(require_experiment_frame_path(experiment, frame.frame_path))
             )
-            document = (
-                TextDocument(
-                    doc_id=f"{frame.frame_id}__ocr",
-                    video_id=frame.video_id,
-                    frame_id=frame.frame_id,
-                    text=text,
-                    source="ocr",
-                    timestamp_sec=frame.timestamp_sec,
-                )
-                if text
-                else None
-            )
-            return frame, document, None
         except Exception as exc:
             LOGGER.exception("OCR failed frame_id=%s", frame.frame_id)
             state.mark(frame.frame_id, "EXTRACT_OCR", "FAILED", error=str(exc))
-            return frame, None, exc
+            return
+
+        document = _document_for_ocr(frame, text)
+        documents = [document] if document else []
+        state.mark(
+            frame.frame_id, "EXTRACT_OCR", "COMPLETED" if document else "COMPLETED_NO_OUTPUT"
+        )
+        for sibling in siblings_by_frame_id.get(frame.frame_id, []):
+            sibling_document = _document_for_ocr(sibling, text)
+            if sibling_document:
+                documents.append(sibling_document)
+            state.mark(
+                sibling.frame_id,
+                "EXTRACT_OCR",
+                "COMPLETED" if sibling_document else "COMPLETED_NO_OUTPUT",
+            )
+
+        if documents:
+            sink.write(documents)
+            with indexed_lock:
+                indexed += len(documents)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        results = list(executor.map(_process, frames))
+        list(executor.map(_process, frames))
 
-    documents = [document for _, document, error in results if error is None and document]
-    if documents:
-        sink.write(documents)
-    for frame, document, error in results:
-        if error is None:
-            state.mark(
-                frame.frame_id,
-                "EXTRACT_OCR",
-                "COMPLETED" if document else "COMPLETED_NO_OUTPUT",
-            )
-    indexed = len(documents)
-    LOGGER.info("OCR extraction complete: %s frames indexed", indexed)
+    LOGGER.info("OCR extraction complete: %s documents indexed", indexed)
     return indexed
+
+
+def drop_ocr_watermarks(experiment, drop_ratio: float = _WATERMARK_DROP_RATIO) -> int:
+    """Strip station-watermark lines (recurring across many OCR'd shots) after the fact.
+
+    Run once ``extract_ocr`` has finished (or been resumed to completion):
+    watermark detection needs to see every OCR'd shot's text at once to tell
+    a recurring banner/logo from real content, which the per-shot writes in
+    ``extract_ocr`` can no longer provide now that each shot is persisted as
+    soon as it's OCR'd (see that function's docstring). Reading every row to
+    compute that is unavoidable, but writing the results back happens in
+    small batches rather than one write at the very end, so an interrupted
+    run keeps whatever it already cleaned instead of losing the whole pass.
+    """
+    partition_root = experiment.run_dir / "manifests" / "partitions" / "text" / "ocr"
+    if not partition_root.exists():
+        LOGGER.warning("No OCR partitions found at %s", partition_root)
+        return 0
+
+    rows_by_doc_id: dict[str, dict[str, object]] = {}
+    for path in sorted(partition_root.glob("*.jsonl")):
+        for row in JsonlManifest(path).read_all(strict=True):
+            rows_by_doc_id[str(row["doc_id"])] = row
+
+    texts = {doc_id: str(row["text"]) for doc_id, row in rows_by_doc_id.items()}
+    cleaned = _drop_watermark_lines(texts, drop_ratio)
+
+    sink = _TextSink(experiment)
+    batch: list[TextDocument] = []
+    changed = 0
+    for doc_id, row in rows_by_doc_id.items():
+        new_text = cleaned.get(doc_id, "")
+        if new_text == row["text"]:
+            continue
+        changed += 1
+        batch.append(
+            TextDocument(
+                doc_id=doc_id,
+                video_id=str(row["video_id"]),
+                frame_id=row.get("frame_id"),
+                text=new_text,
+                source="ocr",
+                timestamp_sec=row.get("timestamp_sec"),
+            )
+        )
+        if len(batch) >= _WATERMARK_WRITE_BATCH_SIZE:
+            sink.write(batch)
+            batch = []
+
+    if batch:
+        sink.write(batch)
+    LOGGER.info("OCR watermark pass: %s of %s document(s) updated", changed, len(rows_by_doc_id))
+    return changed
 
 
 def extract_asr(experiment, force: bool = False) -> int:
