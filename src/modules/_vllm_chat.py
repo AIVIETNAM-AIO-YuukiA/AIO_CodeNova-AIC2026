@@ -1,8 +1,6 @@
-"""Shared low-level client for OpenAI-compatible chat-completions endpoints.
+"""Shared low-level client for the OpenRouter chat-completions endpoint.
 
-Used by captioning, OCR, and the agent/query-processor LLM calls. Set
-``VLM_BACKEND=openrouter`` to call OpenRouter directly; otherwise requests go
-to the local engine and only fall back to OpenRouter when it is unreachable.
+Used by captioning, OCR, and the agent/query-processor LLM calls.
 """
 
 from __future__ import annotations
@@ -10,11 +8,10 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import threading
 
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "http://localhost:8881/v1"
-_DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 _DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 # Transient upstream failures worth retrying (rate limit, 5xx).
@@ -56,26 +53,23 @@ def _sleep_before_retry(attempt: int, retry_after: float | None) -> None:
 
 
 class VllmChatClient:
-    """Thin wrapper around an OpenAI-compatible ``/chat/completions`` endpoint."""
+    """Thin wrapper around OpenRouter's OpenAI-compatible ``/chat/completions`` endpoint."""
 
     def __init__(
         self,
-        base_url: str | None = None,
-        model_name: str | None = None,
         timeout: float = 60.0,
         openrouter_base_url: str | None = None,
         openrouter_model: str | None = None,
         openrouter_api_key: str | None = None,
-        prefer_openrouter: bool | None = None,
+        openrouter_provider: str | None = None,
+        max_retries: int | None = None,
     ) -> None:
-        self.base_url = (base_url or os.environ.get("VLLM_BASE_URL", _DEFAULT_BASE_URL)).rstrip("/")
-        self.model_name = model_name or os.environ.get("VLLM_MODEL", _DEFAULT_MODEL)
         self.timeout = timeout
+        self.max_retries = None if max_retries is None else max(0, int(max_retries))
+        self._usage_local = threading.local()
+        self.last_usage: dict[str, object] = {}
 
         self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
-        if prefer_openrouter is None:
-            prefer_openrouter = os.environ.get("VLM_BACKEND", "").lower() == "openrouter"
-        self.prefer_openrouter = prefer_openrouter
         openrouter_base_url = openrouter_base_url or os.environ.get(
             "OPENROUTER_BASE_URL", _DEFAULT_OPENROUTER_BASE_URL
         )
@@ -83,9 +77,24 @@ class VllmChatClient:
         # No default: silently falling back to some other model would change
         # what answers, so an unset OPENROUTER_MODEL must fail loudly instead.
         self.openrouter_model = openrouter_model or os.environ.get("OPENROUTER_MODEL")
+        # Pin the upstream provider (e.g. "relace") instead of letting
+        # OpenRouter auto-route across whichever providers host the model.
+        # No env fallback here on purpose: callers pass this explicitly per
+        # use case (e.g. query_processor.py's OPENROUTER_PROVIDER_FOR_CHAT)
+        # rather than one setting silently pinning every model on this client
+        # (OCR/captioning included) to a provider that may not host them.
+        self.openrouter_provider = openrouter_provider
 
-        self._client = None
         self._openrouter_client = None
+
+    @property
+    def last_usage(self) -> dict[str, object]:
+        """Return usage for the current request thread only."""
+        return getattr(self._usage_local, "value", {})
+
+    @last_usage.setter
+    def last_usage(self, value: dict[str, object]) -> None:
+        self._usage_local.value = dict(value) if isinstance(value, dict) else {}
 
     def complete_with_image(
         self,
@@ -111,10 +120,11 @@ class VllmChatClient:
             }
         )
 
-        response = self._post_with_fallback(
+        response = self._post_openrouter(
             lambda model_name: {"model": model_name, "messages": messages, **generation_params}
         )
         payload = response.json()
+        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         return payload["choices"][0]["message"]["content"].strip()
 
     def complete_text(
@@ -131,7 +141,7 @@ class VllmChatClient:
         if user_prompt:
             messages.append({"role": "user", "content": user_prompt})
 
-        response = self._post_with_fallback(
+        response = self._post_openrouter(
             lambda model_name: {
                 "model": model_name,
                 "messages": messages,
@@ -139,44 +149,24 @@ class VllmChatClient:
             }
         )
         payload = response.json()
+        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         return payload["choices"][0]["message"]["content"].strip()
-
-    def _post_with_fallback(self, build_payload):
-        """POST to the configured backend. ``build_payload(model_name)`` builds the body."""
-        import httpx
-
-        if self.prefer_openrouter:
-            if not self.openrouter_api_key:
-                raise RuntimeError(
-                    "VLM_BACKEND=openrouter but OPENROUTER_API_KEY is not set in .env."
-                )
-            if not self.openrouter_model:
-                raise RuntimeError(
-                    "VLM_BACKEND=openrouter but OPENROUTER_MODEL is not set in .env."
-                )
-            return self._post_openrouter(build_payload)
-
-        client = self._load_client()
-        try:
-            response = client.post("/chat/completions", json=build_payload(self.model_name))
-            response.raise_for_status()
-            return response
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
-            if not self.openrouter_api_key or not self.openrouter_model:
-                raise
-            LOGGER.warning(
-                "Local vLLM engine at %s unreachable (%s); falling back to OpenRouter",
-                self.base_url,
-                exc,
-            )
-        return self._post_openrouter(build_payload)
 
     def _post_openrouter(self, build_payload):
         """POST to OpenRouter, retrying transient rate-limit/5xx responses."""
         import httpx
 
+        if not self.openrouter_api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set in .env.")
+        if not self.openrouter_model:
+            raise RuntimeError("OPENROUTER_MODEL is not set in .env.")
+
         client = self._load_openrouter_client()
         payload = build_payload(self.openrouter_model)
+        if self.openrouter_provider:
+            payload.setdefault(
+                "provider", {"order": [self.openrouter_provider], "allow_fallbacks": False}
+            )
         if _DISABLE_REASONING:
             # Reasoning models spend most of their latency on thinking tokens,
             # which max_tokens does not cap. Measured on qwen3.7-flash doing
@@ -184,11 +174,12 @@ class VllmChatClient:
             # without. Captioning and OCR have nothing to reason about.
             payload.setdefault("reasoning", {"enabled": False})
         last_error: Exception | None = None
-        for attempt in range(_MAX_RETRIES):
+        max_attempts = _MAX_RETRIES if self.max_retries is None else self.max_retries + 1
+        for attempt in range(max_attempts):
             retry_after = None
             try:
                 response = client.post("/chat/completions", json=payload)
-                if response.status_code in _RETRY_STATUS and attempt < _MAX_RETRIES - 1:
+                if response.status_code in _RETRY_STATUS and attempt < max_attempts - 1:
                     last_error = httpx.HTTPStatusError(
                         f"HTTP {response.status_code}", request=response.request, response=response
                     )
@@ -197,7 +188,7 @@ class VllmChatClient:
                         "OpenRouter HTTP %s (attempt %s/%s), backing off",
                         response.status_code,
                         attempt + 1,
-                        _MAX_RETRIES,
+                        max_attempts,
                     )
                 else:
                     if response.status_code >= 400:
@@ -206,22 +197,10 @@ class VllmChatClient:
                     return response
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
                 last_error = exc
-                if attempt == _MAX_RETRIES - 1:
+                if attempt == max_attempts - 1:
                     raise
             _sleep_before_retry(attempt, retry_after)
         raise last_error if last_error else RuntimeError("OpenRouter request failed")
-
-    def _load_client(self):
-        # httpx.Client is thread-safe (each request gets a connection from the
-        # shared pool), so a single instance can be called concurrently from
-        # the ThreadPoolExecutor in VietnameseEmbedder/VllmOcrModel.
-        if self._client is not None:
-            return self._client
-        import httpx
-
-        limits = httpx.Limits(max_connections=32, max_keepalive_connections=32)
-        self._client = httpx.Client(base_url=self.base_url, timeout=self.timeout, limits=limits)
-        return self._client
 
     def _load_openrouter_client(self):
         if self._openrouter_client is not None:

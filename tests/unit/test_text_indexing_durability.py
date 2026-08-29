@@ -38,7 +38,7 @@ def test_text_sink_persists_jsonl_before_derived_index_failure(tmp_path, monkeyp
     assert [row["doc_id"] for row in rows] == ["d1"]
 
 
-def test_ocr_no_text_is_completed_without_output(tmp_path, monkeypatch):
+def test_ocr_no_text_still_writes_empty_text_document(tmp_path, monkeypatch):
     experiment = _experiment(tmp_path)
     (tmp_path / "frame.jpg").write_bytes(b"frame")
     JsonlManifest(tmp_path / "manifests" / "frames.jsonl").append(
@@ -50,14 +50,13 @@ def test_ocr_no_text_is_completed_without_output(tmp_path, monkeypatch):
             return ""
 
     monkeypatch.setattr("indexing.extract_text.VllmOcrModel", FakeOcr)
-    monkeypatch.setattr(
-        "indexing.extract_text.build_text_index", lambda experiment: FakeTextIndex()
-    )
+    fake_index = FakeTextIndex()
+    monkeypatch.setattr("indexing.extract_text.build_text_index", lambda experiment: fake_index)
 
-    assert extract_ocr(experiment) == 0
-    assert (
-        JobState(tmp_path / "jobs.sqlite").get_status("f1", "EXTRACT_OCR") == "COMPLETED_NO_OUTPUT"
-    )
+    assert extract_ocr(experiment) == 1
+    assert JobState(tmp_path / "jobs.sqlite").get_status("f1", "EXTRACT_OCR") == "COMPLETED"
+    assert [doc.frame_id for doc in fake_index.documents] == ["f1"]
+    assert fake_index.documents[0].text == ""
     assert extract_ocr(experiment) == 0
 
 

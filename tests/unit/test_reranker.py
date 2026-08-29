@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock
 from core.types import SearchResult
 from modules.reranker.base import build_reranker
 from modules.reranker.blip2_itm import Blip2ItmReranker
+from modules.reranker.qwen_vl_vllm import QwenVlVllmReranker
 
 
 def test_build_reranker():
@@ -15,6 +16,20 @@ def test_build_reranker():
     assert isinstance(reranker, Blip2ItmReranker)
     assert reranker.model_name == "Salesforce/blip2-itm-vit-g"
     assert reranker.device == "cpu"
+    assert reranker.batch_size == 4
+
+
+def test_build_reranker_qwen_vl_vllm_backend(monkeypatch):
+    """RERANKER_BACKEND=qwen-vl-vllm routes to the vLLM-backed implementation."""
+    monkeypatch.setenv("RERANKER_BACKEND", "qwen-vl-vllm")
+    monkeypatch.setenv("QWEN_VL_RERANKER_URL", "http://example:8884")
+    monkeypatch.setenv("QWEN_VL_RERANKER_MODEL", "Qwen/Qwen3-VL-Reranker-2B")
+
+    reranker = build_reranker("blip2-itm", device="cpu", batch_size=4)
+
+    assert isinstance(reranker, QwenVlVllmReranker)
+    assert reranker.base_url == "http://example:8884"
+    assert reranker.model_name == "Qwen/Qwen3-VL-Reranker-2B"
     assert reranker.batch_size == 4
 
 

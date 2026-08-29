@@ -60,7 +60,7 @@ class TestBrain:
         brain._client = client
         response = brain.reason(question="q", shot_info="s", frame_count=1)
         assert response.finished is True
-        assert "AGENT_LOCAL_ENGINE_URL" in response.answer
+        assert "OPENROUTER_MODEL" in response.answer
 
 
 class TestTools:
@@ -72,10 +72,12 @@ class TestTools:
         result = CaptionTool().run(image_path="/nonexistent/frame.jpg")
         assert "not found" in result
 
-    def test_ocr_tool_server_down_degrades(self, tmp_path) -> None:
+    def test_ocr_tool_server_down_degrades(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
         image = tmp_path / "f.jpg"
         image.write_bytes(b"fake")
-        tool = OCRTool(base_url="http://localhost:1/v1")
+        tool = OCRTool()
         result = tool.run(image_path=str(image))
         assert "unavailable" in result.lower()
 

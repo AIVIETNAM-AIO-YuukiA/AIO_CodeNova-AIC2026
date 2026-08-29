@@ -32,15 +32,14 @@ _REPETITION_REASONS = frozenset(
 
 
 class VllmOcrModel(OcrModel):
-    """Extract on-screen text from keyframes via a self-hosted vLLM endpoint."""
+    """Extract on-screen text from keyframes via OpenRouter's VLM endpoint."""
 
     def __init__(
         self,
-        base_url: str | None = None,
         model_name: str | None = None,
         timeout: float = 60.0,
     ) -> None:
-        self._client = VllmChatClient(base_url=base_url, model_name=model_name, timeout=timeout)
+        self._client = VllmChatClient(openrouter_model=model_name, timeout=timeout)
 
     def recognize(self, frame_path: str) -> str:
         """Return on-screen text for one frame image, or "" if none is visible."""

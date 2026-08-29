@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+import os
+
+_RERANKER_LABELS = {
+    "blip2": "Rerank BLIP-2",
+    "qwen-vl-vllm": "Rerank Qwen3-VL",
+    "qwen_vl_vllm": "Rerank Qwen3-VL",
+}
+_RERANKER_LABEL = _RERANKER_LABELS.get(
+    os.environ.get("RERANKER_BACKEND", "blip2").strip().lower(), "Rerank BLIP-2"
+)
+
 SIDEBAR_HTML = r"""  <aside>
     <form id="search-form">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
@@ -65,7 +76,7 @@ SIDEBAR_HTML = r"""  <aside>
           </div>
           <label class="check-switch">
             <input type="checkbox" id="use-reranker" checked>
-            <span class="switch-label">Rerank BLIP-2</span>
+            <span class="switch-label">__RERANKER_LABEL__</span>
           </label>
         </div>
       </div>
@@ -126,4 +137,4 @@ SIDEBAR_HTML = r"""  <aside>
     </div>
 
     <div id="status" class="status">Ready.</div>
-  </aside>"""
+  </aside>""".replace("__RERANKER_LABEL__", _RERANKER_LABEL)

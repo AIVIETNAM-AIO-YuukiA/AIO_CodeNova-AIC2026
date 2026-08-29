@@ -14,8 +14,9 @@ TN2_WEIGHTS ?= $(TN2_DIR)/transnetv2-pytorch-weights.pth
 
 .PHONY: help setup sync install-hooks lint format check test pre-commit precommit \
         qdrant-up qdrant-down qdrant-health \
-        elasticsearch-up elasticsearch-health \
-        vllm-index-up vllm-index-down vllm-index-health \
+        elasticsearch-up elasticsearch-down elasticsearch-health \
+        vllm-reranker-up vllm-reranker-down vllm-reranker-health \
+        infra-up infra-status \
         preflight-index validate-index repair-manifest offline-index \
         ingest detect-shots extract-frames embed-frames build-index extract-text extract-asr extract-ocr drop-ocr-watermarks export-text import-text pipeline \
         search serve-ui clean-runs clean
@@ -55,40 +56,85 @@ check: lint ## Lint + kiểm tra format (dùng cho CI gate)
 	uv run ruff format --check src tests
 
 test: ## Chạy unit test
-	uv run pytest -q
+	uv run pytest -v
 
 pre-commit: ## Chạy toàn bộ pre-commit hook
 	uv run pre-commit run --all-files
 
 precommit: pre-commit ## Alias của pre-commit
 
+## --- Backend hạ tầng: tự nhận diện docker (máy Windows/Ubuntu có Docker
+## Desktop/Engine) hay supervisorctl (instance Vast.ai này, không có Docker).
+## Ép buộc thủ công nếu cần: make qdrant-up INFRA_BACKEND=docker|supervisor
+INFRA_BACKEND ?= $(shell command -v docker >/dev/null 2>&1 && echo docker || echo supervisor)
+
 ## --- Qdrant (vector DB) ---
-qdrant-up: ## Khởi động Qdrant qua docker compose
+qdrant-up: ## Khởi động Qdrant (docker compose hoặc supervisor, xem INFRA_BACKEND)
+ifeq ($(INFRA_BACKEND),docker)
 	docker compose up -d qdrant
+else
+	supervisorctl start qdrant
+endif
 
 qdrant-down: ## Dừng Qdrant
-	docker compose down
+ifeq ($(INFRA_BACKEND),docker)
+	docker compose stop qdrant
+else
+	supervisorctl stop qdrant
+endif
 
 qdrant-health: ## Kiểm tra Qdrant có sống không
 	curl -sf http://localhost:6333/healthz && echo
 
 ## --- Elasticsearch (full-text index cho OCR/ASR) ---
-elasticsearch-up: ## Khởi động Elasticsearch + Elasticvue qua docker compose
+elasticsearch-up: ## Khởi động Elasticsearch (docker compose hoặc supervisor)
+ifeq ($(INFRA_BACKEND),docker)
 	docker compose up -d elasticsearch elasticvue
+else
+	supervisorctl start elasticsearch
+endif
+
+elasticsearch-down: ## Dừng Elasticsearch
+ifeq ($(INFRA_BACKEND),docker)
+	docker compose stop elasticsearch elasticvue
+else
+	supervisorctl stop elasticsearch
+endif
 
 elasticsearch-health: ## Kiểm tra Elasticsearch có sống không
 	curl -sf http://localhost:8882 && echo
 
-## --- vLLM captioning/OCR (Qwen3.6-35B-A3B AWQ 4bit, GB10, port 8881) ---
-vllm-index-up: ## Khởi động vLLM cho captioning/OCR offline
-	docker compose --profile vllm-index up -d vllm-index
+## --- vLLM reranker (Qwen3-VL-Reranker-2B) — chỉ cần khi RERANKER_BACKEND=qwen-vl-vllm ---
+vllm-reranker-up: ## Khởi động vLLM reranker (docker compose hoặc supervisor)
+ifeq ($(INFRA_BACKEND),docker)
+	docker compose up -d vllm-reranker
+else
+	supervisorctl start vllm-reranker
+endif
 
-vllm-index-down: ## Dừng vllm-index
-	docker compose stop vllm-index
-	docker compose rm -f vllm-index
+vllm-reranker-down: ## Dừng vLLM reranker
+ifeq ($(INFRA_BACKEND),docker)
+	docker compose stop vllm-reranker
+else
+	supervisorctl stop vllm-reranker
+endif
 
-vllm-index-health: ## Kiểm tra vllm-index có sống không
-	curl -sf http://localhost:8881/v1/models && echo
+vllm-reranker-health: ## Kiểm tra vLLM reranker có sống không
+	curl -sf http://localhost:8884/health && echo
+
+## --- Gộp: start toàn bộ infra đang cài (Qdrant + Elasticsearch) + kiểm tra ---
+infra-up: qdrant-up elasticsearch-up ## Khởi động Qdrant + Elasticsearch, rồi health-check cả hai
+	@echo "--- Backend: $(INFRA_BACKEND) — chờ service sẵn sàng ---"
+	@sleep 3
+	@$(MAKE) qdrant-health elasticsearch-health
+
+infra-status: ## Xem trạng thái các service infra (docker compose hoặc supervisor)
+	@echo "--- Backend: $(INFRA_BACKEND) ---"
+ifeq ($(INFRA_BACKEND),docker)
+	-docker compose ps
+else
+	-supervisorctl status qdrant elasticsearch vllm-reranker
+endif
 
 ## --- Pipeline index offline ---
 preflight-index: ## In inventory và tạo plan; thêm APPROVE=1 để phê duyệt plan (EXP, INPUT)
@@ -127,13 +173,13 @@ embed-frames: ## Embed keyframe bằng BEiT-3 large (EXP; EMBEDDING_MODELS để
 build-index: ## Build index Qdrant (EXP); cần Qdrant đang chạy
 	uv run codenova build-index --experiment-name $(EXP)
 
-extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
-	uv run codenova extract-text --experiment-name $(EXP)	
+extract-text: ## Chạy OCR + ASR, index vào Elasticsearch (EXP); cần Elasticsearch đang chạy
+	uv run codenova extract-text --experiment-name $(EXP)
 
-extract-asr: ## Chỉ chạy ASR, index vào Elasticsearch (EXP); cần Elasticsearch đang chạy (không cần vllm-index)
+extract-asr: ## Chỉ chạy ASR, index vào Elasticsearch (EXP); cần Elasticsearch đang chạy
 	uv run codenova extract-text --experiment-name $(EXP) --skip-ocr
 
-extract-ocr: ## Chỉ chạy OCR, index vào Elasticsearch (EXP); cần Elasticsearch + `make vllm-index-up` đang chạy
+extract-ocr: ## Chỉ chạy OCR, index vào Elasticsearch (EXP); cần Elasticsearch đang chạy
 	uv run codenova extract-text --experiment-name $(EXP) --skip-asr
 
 drop-ocr-watermarks: ## Lọc dòng watermark/logo đài lặp lại khỏi OCR đã trích (EXP); chạy sau khi extract-ocr xong hẳn

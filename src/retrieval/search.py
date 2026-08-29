@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 import os
 import sys
+from time import perf_counter
 from typing import Protocol
 
 from config.settings import Experiment
@@ -14,10 +15,9 @@ from core.errors import RetrievalError
 from indexing.validation import verify_embedding_provenance, verify_frame_files
 from modules.embedding import Embedder, build_embedder
 from modules.reranker.base import Reranker, build_reranker
-from retrieval.fusion import wsf_fuse
-import numpy as np
+from retrieval.fusion import srrf_fuse
 from retrieval.hydrator import ResultHydrator
-from retrieval.query_processor import QueryProcessor, get_query_processor
+from retrieval.query_processor import ProcessedQuery, QueryProcessor, get_query_processor
 from stores.vector.base import VectorIndex
 from stores.vector.factory import build_vector_index
 
@@ -65,14 +65,6 @@ class Retriever:
         self.query_processor = query_processor or get_query_processor()
         self.reranker = reranker
         self.fusion_pool_size = fusion_pool_size
-        self._frame_cache: dict[str, tuple[np.ndarray, list[dict]]] = {}
-
-    def _load_frame_embeddings(self, model_name: str) -> tuple[np.ndarray, list[dict]]:
-        if model_name not in self._frame_cache:
-            from retrieval.temporal_search import load_temporal_data
-
-            self._frame_cache[model_name] = load_temporal_data(self.experiment, model_name)
-        return self._frame_cache[model_name]
 
     def search(
         self,
@@ -95,28 +87,91 @@ class Retriever:
         if not isinstance(query, str):
             query = query.to_search_string()
 
+        tick = perf_counter()
         processed = self.query_processor.process(
             query, enabled_models=enabled_models, use_llm=use_llm
         )
+        LOGGER.info("event=SEARCH_TIMING timing_ms={'query_processing': %s}", _elapsed_ms(tick))
         _log_processed_query(processed)
+
+        return self.search_processed(
+            processed,
+            top_k=top_k,
+            enabled_models=enabled_models,
+            model_weights=model_weights,
+            use_reranker=use_reranker,
+        )
+
+    def search_processed(
+        self,
+        processed: ProcessedQuery,
+        top_k: int = 300,
+        enabled_models: list[str] | None = None,
+        model_weights: dict[str, float] | None = None,
+        use_reranker: bool | None = None,
+        use_expansion: bool = True,
+        num_expansions: int = 4,
+    ) -> list[SearchResult]:
+        """Search using an already decomposed query.
+
+        Intelligent search decomposes a query once for all modalities.  This
+        entry point prevents the visual branch from sending the generated
+        visual prompt through the LLM a second time.  Plain ``search`` keeps
+        its existing public behaviour and delegates here after processing.
+
+        ``use_expansion`` mirrors the AIC_2025 reference project's
+        ``auto_expand``: the LLM generates extra visually-descriptive query
+        variants, each searched independently per model, with all variants'
+        candidates pooled together before fusion — widening recall for vague
+        or single-phrasing queries. Disabled automatically when unavailable
+        (LLM circuit open) or explicitly turned off by the caller.
+        """
+
+        started = perf_counter()
+        timing_ms: dict[str, float] = {}
 
         active = self._select_embedders(enabled_models)
         apply_reranker = self.reranker is not None and use_reranker is not False
 
+        expansions: list[str] = []
+        if use_expansion:
+            tick = perf_counter()
+            expansions = self.query_processor.expand_query(
+                processed.visual_prompt, num_expansions=num_expansions
+            )
+            timing_ms["expand_query"] = _elapsed_ms(tick)
+
         pool_size = max(top_k, self.fusion_pool_size) if len(active) > 1 else top_k
-        model_data = {}
+        results_by_model = {}
         for model_name, embedder in active.items():
             if "vietnamese" in model_name.lower() or "vism" in model_name.lower():
-                visual_query = processed.visual_prompt_vi
+                visual_queries = [processed.visual_prompt_vi]
             else:
-                visual_query = processed.visual_prompt
+                visual_queries = [processed.visual_prompt, *expansions]
 
-            query_embedding = embedder.embed_text(visual_query)
-            frame_embs, frame_recs = self._load_frame_embeddings(model_name)
-            model_data[model_name] = (frame_embs, frame_recs, query_embedding)
+            tick = perf_counter()
+            best_by_frame_id: dict[str, SearchResult] = {}
+            for visual_query in visual_queries:
+                query_embedding = embedder.embed_text(visual_query)
+                for result in self.index.search(
+                    query_embedding, top_k=pool_size, model_name=model_name
+                ):
+                    # A frame_id found by more than one query variant keeps
+                    # its best score, not a summed one — SRRF fusion expects
+                    # one entry per frame_id per model.
+                    existing = best_by_frame_id.get(result.frame_id)
+                    if existing is None or result.score > existing.score:
+                        best_by_frame_id[result.frame_id] = result
+            timing_ms[f"embed_search:{model_name}"] = _elapsed_ms(tick)
+            results_by_model[model_name] = list(best_by_frame_id.values())
 
-        fused = wsf_fuse(model_data, top_k=pool_size, weights=model_weights)
+        tick = perf_counter()
+        fused = srrf_fuse(results_by_model, top_k=pool_size, weights=model_weights)
+        timing_ms["fusion"] = _elapsed_ms(tick)
+
+        tick = perf_counter()
         hydration = self.hydrator.hydrate_with_diagnostics(fused)
+        timing_ms["hydration"] = _elapsed_ms(tick)
         valid_hydrated = hydration.results
         if hydration.issues:
             reasons = Counter(issue.reason for issue in hydration.issues)
@@ -128,7 +183,8 @@ class Retriever:
             )
 
         if apply_reranker:
-            rerank_limit = min(50, len(valid_hydrated))
+            rerank_limit = min(100, len(valid_hydrated))
+            tick = perf_counter()
             try:
                 reranked_top = self.reranker.rerank(
                     query=processed.visual_prompt, results=valid_hydrated[:rerank_limit]
@@ -142,6 +198,10 @@ class Retriever:
                 self.reranker = None
             else:
                 valid_hydrated = reranked_top + valid_hydrated[rerank_limit:]
+            timing_ms["rerank"] = _elapsed_ms(tick)
+
+        timing_ms["total"] = _elapsed_ms(started)
+        LOGGER.info("event=SEARCH_TIMING timing_ms=%s", timing_ms)
         return valid_hydrated[:top_k]
 
     def _select_embedders(self, enabled_models: list[str] | None) -> dict[str, Embedder]:
@@ -153,6 +213,10 @@ class Retriever:
                 f"None of {enabled_models} match configured models {list(self.embedders)}."
             )
         return active
+
+
+def _elapsed_ms(started: float) -> float:
+    return round((perf_counter() - started) * 1000.0, 3)
 
 
 def _log_processed_query(processed) -> None:
@@ -182,9 +246,11 @@ def build_retriever(experiment: Experiment) -> Retriever:
     """Assemble a Retriever from an experiment's configuration.
 
     Builds one embedder per configured model. When more than one model is
-    configured, also builds the default reranker (BLIP-2 ITM) to score fused
-    SRRF candidates — set ``DISABLE_RERANKER=1`` to skip it, which frees the
-    ~1.5 GB of VRAM it holds so several embedders fit on a small GPU.
+    configured, also builds a reranker to score fused SRRF candidates —
+    BLIP-2 ITM by default, or Qwen3-VL via vLLM when RERANKER_BACKEND=qwen-vl-vllm
+    (see modules/reranker/base.py). Set ``DISABLE_RERANKER=1`` to skip it
+    entirely, which frees the VRAM/HTTP round-trip it costs so several
+    embedders fit on a small GPU.
     """
     frame_errors = verify_frame_files(experiment)
     if frame_errors:

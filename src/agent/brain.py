@@ -1,11 +1,7 @@
-"""Agent brain — the Docker-hosted LLM behind every agent code path.
+"""Agent brain — the LLM behind every agent code path, called via OpenRouter.
 
-One backend only: an OpenAI-compatible ``/v1/chat/completions`` server,
-not served by this repo's ``docker-compose.yml`` — point ``.env``'s
-``AGENT_LOCAL_ENGINE_URL`` at whatever OpenAI-compatible endpoint you run
-for it. The brain reasons over text (the served Qwen3.5-4B is text-only);
-anything visual reaches it through the caption/ocr tools in
-``agent/tools.py``, which call the separate vLLM VLM service, or through
+The brain reasons over text; anything visual reaches it through the
+caption/ocr tools in ``agent/tools.py`` (OpenRouter VLM), or through
 captions cached at index time.
 """
 
@@ -21,9 +17,6 @@ from prompts.agent import VQA_SYSTEM_PROMPT
 
 LOGGER = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "http://localhost:8884/v1"
-_DEFAULT_MODEL = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
-
 
 @dataclass
 class BrainResponse:
@@ -37,13 +30,10 @@ class BrainResponse:
 
 
 class AgentBrain:
-    """ReAct reasoning via the Docker-hosted agent LLM (OpenAI-compatible)."""
+    """ReAct reasoning via OpenRouter."""
 
-    def __init__(self, model_name: str | None = None, base_url: str | None = None) -> None:
-        self.base_url = base_url or os.environ.get("AGENT_LOCAL_ENGINE_URL", _DEFAULT_BASE_URL)
-        self.model_name = (
-            model_name or os.environ.get("AGENT_LOCAL_ENGINE_MODEL") or _DEFAULT_MODEL
-        )
+    def __init__(self, model_name: str | None = None) -> None:
+        self.model_name = model_name or os.environ.get("AGENT_LOCAL_ENGINE_MODEL")
         self._client = None
 
     def reset(self) -> None:
@@ -75,7 +65,7 @@ class AgentBrain:
         except Exception as exc:
             LOGGER.exception("Brain reasoning failed")
             return BrainResponse(
-                answer=f"Agent LLM unavailable ({exc}). Check AGENT_LOCAL_ENGINE_URL in .env.",
+                answer=f"Agent LLM unavailable ({exc}). Check OPENROUTER_MODEL in .env.",
                 finished=True,
             )
 
@@ -84,7 +74,7 @@ class AgentBrain:
             return self._client
         from modules._vllm_chat import VllmChatClient
 
-        self._client = VllmChatClient(base_url=self.base_url, model_name=self.model_name)
+        self._client = VllmChatClient(openrouter_model=self.model_name)
         return self._client
 
 

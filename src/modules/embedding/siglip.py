@@ -130,7 +130,9 @@ class SiglipEmbedder(Embedder):
                         inputs = processor(images=image, return_tensors="pt").to(device)
                         with torch.no_grad(), _autocast(torch, device):
                             features = projected_features(model.get_image_features(**inputs))
-                            features = torch.nn.functional.normalize(features, p=2, dim=-1, eps=1e-8)
+                            features = torch.nn.functional.normalize(
+                                features, p=2, dim=-1, eps=1e-8
+                            )
                         vector = features.detach().cpu().numpy().astype("float32").tolist()
                         vectors.extend(vector)
                     finally:
@@ -210,20 +212,25 @@ class SiglipEmbedder(Embedder):
         device = resolve_torch_device(torch, self.device)
         processor = AutoProcessor.from_pretrained(self.model_name)
         dtype = torch.float16 if device.type == "cuda" else torch.float32
-        # Nap model roi chuyen thang sang device bang .to(). Checkpoint lon
-        # co the bi transformers dat tam len "meta device"; goi .to(device)
-        # sau do se bao loi "Cannot copy out of meta tensor" - da kiem tra
-        # cach nay khong dinh loi do.
-        model = AutoModel.from_pretrained(
-            self.model_name, dtype=dtype, device_map="auto", low_cpu_mem_usage=True
-        ).to(device).eval()
+        # device_map="auto" lets accelerate offload part of the model to CPU
+        # when VRAM is tight (e.g. a 4GB laptop GPU), and a model with any
+        # offloaded module can never be .to()'d afterwards - it raises
+        # "You can't move a model that has some modules offloaded to cpu or
+        # disk." Loading straight onto one device (same as jina.py) avoids
+        # that; if it truly doesn't fit, this fails with a clear CUDA OOM
+        # instead of silently offloading.
+        model = (
+            AutoModel.from_pretrained(self.model_name, dtype=dtype).to(device).eval()
+        )
         # torch.compile giam overhead Python giua cac lan goi lien tiep -
         # chi co loi khi khong dung TensorRT (nhanh hon nhieu, khong can compile).
         if hasattr(torch, "compile") and device.type == "cuda":
             try:
                 model = torch.compile(model, mode="reduce-overhead")
             except Exception:
-                LOGGER.warning("[%s] torch.compile khong kha dung, dung eager mode", self.model_name)
+                LOGGER.warning(
+                    "[%s] torch.compile khong kha dung, dung eager mode", self.model_name
+                )
         self._model = model
         self._processor = processor
         self._torch = torch

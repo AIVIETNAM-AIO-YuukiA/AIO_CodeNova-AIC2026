@@ -114,6 +114,9 @@ def _has_repeated_ngram_run(words: list[str]) -> bool:
             continue
         for start in range(0, len(lowered) - size * 4 + 1):
             ngram = lowered[start : start + size]
-            if all(lowered[start + size * rep : start + size * (rep + 1)] == ngram for rep in range(1, 4)):
+            if all(
+                lowered[start + size * rep : start + size * (rep + 1)] == ngram
+                for rep in range(1, 4)
+            ):
                 return True
     return False

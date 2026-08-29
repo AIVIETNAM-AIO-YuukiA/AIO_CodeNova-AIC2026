@@ -12,7 +12,7 @@ from indexing.build_index import build_index
 
 class FakeVectorIndex:
     def __init__(self, *args, **kwargs) -> None:
-        self.built: tuple[dict[str, list[list[float]]], list[str]] | None = None
+        self.built: tuple[dict[str, np.ndarray], list[str]] | None = None
 
     def build(self, embeddings_by_model, frame_ids) -> None:
         self.built = (embeddings_by_model, frame_ids)
@@ -37,7 +37,7 @@ def test_build_index_single_model_reads_named_file(tmp_path, monkeypatch) -> Non
     assert count == 2
     embeddings_by_model, frame_ids = fake_index.built
     assert frame_ids == ["f1", "f2"]
-    assert embeddings_by_model["beit3"] == [[1.0, 0.0], [0.0, 1.0]]
+    assert embeddings_by_model["beit3"].tolist() == [[1.0, 0.0], [0.0, 1.0]]
 
 
 def test_build_index_rejects_multi_model_frame_set_mismatch(tmp_path, monkeypatch) -> None:
@@ -71,8 +71,8 @@ def test_build_index_joins_reordered_model_rows_by_frame_id(tmp_path, monkeypatc
 
     embeddings_by_model, frame_ids = fake_index.built
     assert frame_ids == ["f1", "f2"]
-    assert embeddings_by_model["beit3"] == [[1, 0], [0, 1]]
-    assert embeddings_by_model["siglip2"] == [[2, 0], [0, 2]]
+    assert embeddings_by_model["beit3"].tolist() == [[1, 0], [0, 1]]
+    assert embeddings_by_model["siglip2"].tolist() == [[2, 0], [0, 2]]
 
 
 def test_build_index_falls_back_to_in_progress_checkpoint(tmp_path, monkeypatch) -> None:
@@ -95,7 +95,7 @@ def test_build_index_falls_back_to_in_progress_checkpoint(tmp_path, monkeypatch)
     assert count == 1
     embeddings_by_model, frame_ids = fake_index.built
     assert frame_ids == ["f1"]
-    assert embeddings_by_model["beit3"] == [[1.0, 0.0]]
+    assert embeddings_by_model["beit3"].tolist() == [[1.0, 0.0]]
 
 
 def test_build_index_prefers_finished_file_over_checkpoint(tmp_path, monkeypatch) -> None:

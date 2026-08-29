@@ -19,6 +19,6 @@ def build_text_index(experiment: Experiment) -> TextIndex:
     base_index = os.environ.get("ELASTIC_INDEX", "codenova_text")
     return ElasticTextIndex(
         url=os.environ.get("ELASTIC_URL", "http://localhost:9200"),
-        index_name=f"{base_index}__{experiment.name}",
+        index_name=f"{base_index}_{experiment.name}",
         api_key=os.environ.get("ELASTIC_API_KEY") or None,
     )

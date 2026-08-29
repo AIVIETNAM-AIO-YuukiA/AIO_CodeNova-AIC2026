@@ -92,11 +92,13 @@ def build_index(experiment: Experiment, force: bool = False) -> int:
     if not frame_ids:
         raise IndexBuildError("Embedding artifacts contain no frame IDs.")
 
-    embeddings_by_model: dict[str, list[list[float]]] = {}
+    # Keep vectors as numpy arrays (not `.tolist()`) — converting ~300k rows to
+    # nested Python lists inflates RAM 6-8x (each float becomes its own object).
+    embeddings_by_model: dict[str, "np.ndarray"] = {}
     for model_name in models:
         id_to_row = {fid: row for row, fid in enumerate(per_model_ids[model_name])}
         rows = [id_to_row[fid] for fid in frame_ids]
-        embeddings_by_model[model_name] = per_model_vectors[model_name][rows].tolist()
+        embeddings_by_model[model_name] = per_model_vectors[model_name][rows]
 
     index = build_vector_index(experiment)
     index.build(embeddings_by_model, frame_ids)

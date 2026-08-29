@@ -48,7 +48,6 @@ from indexing.state import JobState  # noqa: E402
 from indexing.validation import validate_experiment_artifacts  # noqa: E402
 from modules.reranker.base import build_reranker  # noqa: E402
 from retrieval import build_retriever  # noqa: E402
-from ui.server import serve_ui  # noqa: E402
 
 LOGGER = get_logger(__name__)
 
@@ -131,14 +130,19 @@ def build_parser() -> ArgumentParser:
     )
 
     export_text_parser = subparsers.add_parser(
-        "export-text", help="Dump OCR/ASR documents from Elasticsearch to manifests/text.jsonl"
+        "export-text", help="Dump text documents from Elasticsearch to manifests/text.jsonl"
     )
     add_run_args(export_text_parser)
 
     import_text_parser = subparsers.add_parser(
-        "import-text", help="Load manifests/text.jsonl into Elasticsearch"
+        "import-text", help="Load text.jsonl into Elasticsearch"
     )
     add_run_args(import_text_parser)
+    import_text_parser.add_argument(
+        "--include-captions",
+        action="store_true",
+        help="Also import manifests/captions.jsonl (unused by Intelligent Search routing)",
+    )
 
     preflight_parser = subparsers.add_parser(
         "preflight-index", help="Inventory config, device and dataset before indexing"
@@ -658,7 +662,7 @@ def handle_drop_ocr_watermarks(args: Namespace) -> int:
 
 
 def handle_export_text(args: Namespace) -> int:
-    """Dump OCR/ASR documents from Elasticsearch to a local JSONL file."""
+    """Dump text documents from Elasticsearch to a local JSONL file."""
     experiment = load_experiment(args)
     count = export_text(experiment=experiment)
     print(json.dumps({"experiment": experiment.name, "exported": count}))
@@ -668,7 +672,7 @@ def handle_export_text(args: Namespace) -> int:
 def handle_import_text(args: Namespace) -> int:
     """Load a local JSONL text export into Elasticsearch."""
     experiment = load_experiment(args)
-    count = import_text(experiment=experiment)
+    count = import_text(experiment=experiment, include_captions=args.include_captions)
     print(json.dumps({"experiment": experiment.name, "imported": count}))
     return 0
 
@@ -700,15 +704,18 @@ def handle_serve_ui(args: Namespace) -> int:
     else:
         LOGGER.info("Reranker: disabled (no --reranker-model supplied)")
 
-    print(f"Serving retrieval UI at http://{args.host}:{args.port}")
-    serve_ui(
+    import uvicorn
+
+    from api.app import create_app
+
+    app = create_app(
         experiment=experiment,
-        host=args.host,
-        port=args.port,
         default_top_k=args.top_k,
         reranker=reranker,
         reranker_top_k=getattr(args, "reranker_top_k", 10),
     )
+    print(f"Serving retrieval UI at http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
 

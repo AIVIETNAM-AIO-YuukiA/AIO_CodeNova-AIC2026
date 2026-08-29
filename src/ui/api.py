@@ -13,8 +13,7 @@ from core.logging import get_logger
 from core.types import SearchResult
 from retrieval.intelligent_search import intelligent_search
 from retrieval.kis_detail_search import kis_detail_2stage_search
-from retrieval.temporal_search import load_temporal_data
-from retrieval.text_search import text_search
+from retrieval.text_search import AsrTemporalMapper, text_search
 from retrieval.tracks import SUPPORTED_TRACKS, TrackQuery, build_retrieval_text
 from retrieval.vqa import enhanced_temporal_search, trake_search, vqa_search
 import numpy as np
@@ -390,8 +389,10 @@ def handle_intelligent_search(payload: dict, experiment: Experiment, default_top
     if use_reranker is not None:
         use_reranker = bool(use_reranker)
     use_llm = payload.get("use_llm")
-    if use_llm is not None:
-        use_llm = bool(use_llm)
+    use_llm = True if use_llm is None else bool(use_llm)
+    use_evidence_reranker = payload.get("use_evidence_reranker")
+    if use_evidence_reranker is not None:
+        use_evidence_reranker = bool(use_evidence_reranker)
 
     result = intelligent_search(
         experiment,
@@ -403,6 +404,11 @@ def handle_intelligent_search(payload: dict, experiment: Experiment, default_top
         enabled_models=enabled_models,
         use_reranker=use_reranker,
         use_llm=use_llm,
+        fusion_mode=str(payload.get("fusion_mode", "adaptive")),
+        text_search_mode=str(payload.get("text_search_mode", "separate")),
+        temporal_asr=bool(payload.get("temporal_asr", True)),
+        use_evidence_reranker=use_evidence_reranker,
+        max_frames_per_shot=int(payload.get("max_frames_per_shot", 2)),
     )
     for r in result.get("results", []):
         if r.get("frame_path"):
@@ -446,17 +452,15 @@ def handle_compute_sub_score(
     if not frame_id or not sub_text:
         raise ValueError("frame_id and sub_text are required.")
 
-    frame_embeddings, frame_records = load_temporal_data(experiment)
-    idx = None
-    for i, rec in enumerate(frame_records):
-        if rec.get("frame_id") == frame_id:
-            idx = i
-            break
-    if idx is None:
+    model_name = next(iter(retriever.embedders))
+    frame_vec = retriever.index.get_vector(frame_id, model_name)
+    if frame_vec is None:
         return {"error": "frame_id not found"}, HTTPStatus.NOT_FOUND
 
-    frame_vec = frame_embeddings[idx]
-    sub_vec = np.asarray(retriever.embedder.embed_text(sub_text), dtype="float32").flatten()
+    frame_vec = np.asarray(frame_vec, dtype="float32")
+    sub_vec = np.asarray(
+        retriever.embedders[model_name].embed_text(sub_text), dtype="float32"
+    ).flatten()
     nrm = np.linalg.norm(sub_vec)
     if nrm > 1e-12:
         sub_vec /= nrm
@@ -562,14 +566,24 @@ def _get_video_text_texts(experiment: Experiment, video_id: str) -> tuple[list[d
                 _VIDEO_TEXT_CACHE[vid] = ([], [])
             src = txt.get("source", "asr")
             rec = {
+                "doc_id": txt.get("doc_id"),
+                "video_id": vid,
                 "text": txt.get("text"),
                 "timestamp_sec": txt.get("timestamp_sec", 0.0),
                 "frame_id": txt.get("frame_id"),
             }
             if src == "ocr":
                 _VIDEO_TEXT_CACHE[vid][1].append(rec)
-            else:
+            elif src == "asr":
                 _VIDEO_TEXT_CACHE[vid][0].append(rec)
+        temporal_mapper = AsrTemporalMapper(experiment)
+        for asr, _ in _VIDEO_TEXT_CACHE.values():
+            for record in asr:
+                interval = temporal_mapper.interval_for(record)
+                record["start_time_sec"], record["end_time_sec"] = interval
+                record["mapped_frame_ids"] = {
+                    frame_id for frame_id, _ in temporal_mapper.map_document(record)
+                }
     return _VIDEO_TEXT_CACHE.get(video_id, ([], []))
 
 
@@ -600,7 +614,7 @@ def handle_video_shots(query: dict, experiment: Experiment) -> tuple[dict, HTTPS
                     a["text"]
                     for a in video_asr_texts
                     if a.get("frame_id") == fid
-                    or (not a.get("frame_id") and a.get("timestamp_sec") == fts)
+                    or (not a.get("frame_id") and fid in a.get("mapped_frame_ids", set()))
                 ]
                 matched_ocr = [
                     o["text"]

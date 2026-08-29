@@ -159,7 +159,9 @@ class JinaClipEmbedder(Embedder):
                 raw = model.encode_image([images[i] for i in indices], batch_size=len(indices))
             repaired = _l2_normalize(raw)
         finally:
-            model.to(device, dtype=torch_ref.float16 if device.type == "cuda" else torch_ref.float32)
+            model.to(
+                device, dtype=torch_ref.float16 if device.type == "cuda" else torch_ref.float32
+            )
 
         for slot, vector in zip(indices, repaired):
             batch_vectors[slot] = vector
@@ -211,9 +213,11 @@ class JinaClipEmbedder(Embedder):
         # co the bi transformers dat tam len "meta device"; goi .to(device)
         # sau do se bao loi "Cannot copy out of meta tensor" - da kiem tra
         # cach nay khong dinh loi do.
-        model = AutoModel.from_pretrained(
-            self.model_name, trust_remote_code=True, dtype=dtype
-        ).to(device).eval()
+        model = (
+            AutoModel.from_pretrained(self.model_name, trust_remote_code=True, dtype=dtype)
+            .to(device)
+            .eval()
+        )
 
         # processor co the da duoc _load_preprocessing() nap truoc do (khi
         # dung duong TensorRT); chi nap moi neu chua co.

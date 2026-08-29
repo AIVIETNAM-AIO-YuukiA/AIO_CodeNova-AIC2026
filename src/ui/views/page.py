@@ -7,13 +7,16 @@ from ui.views.scripts import APP_JS
 from ui.views.sidebar import SIDEBAR_HTML
 from ui.views.styles import CSS_STYLES
 
-INDEX_HTML = r"""<!doctype html>
+INDEX_HTML = (
+    r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>CodeNova Multimodal Retriever</title>
-  <style>""" + CSS_STYLES + r"""
+  <style>"""
+    + CSS_STYLES
+    + r"""
   </style>
 </head>
 <body>
@@ -43,10 +46,16 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 </header>
 <main>
-""" + SIDEBAR_HTML + MAIN_GRID_HTML + r"""
+"""
+    + SIDEBAR_HTML
+    + MAIN_GRID_HTML
+    + r"""
   </main>
-  <script>""" + APP_JS + r"""
+  <script>"""
+    + APP_JS
+    + r"""
   </script>
 </body>
 </html>
 """
+)

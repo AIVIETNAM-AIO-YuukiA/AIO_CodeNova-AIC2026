@@ -95,7 +95,7 @@ class TestTurnLoop:
         agent._client = client
         result = agent.run_turn([{"role": "user", "content": "q"}])
         assert result["done"] is True
-        assert "AGENT_LOCAL_ENGINE_URL" in result["message"]
+        assert "OPENROUTER_MODEL" in result["message"]
 
 
 class TestHelpers:

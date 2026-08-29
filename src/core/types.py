@@ -116,7 +116,6 @@ class RetrievalQuery:
         return self.text
 
 
-
 def _optional_float(value: object) -> float | None:
     if value is None:
         return None

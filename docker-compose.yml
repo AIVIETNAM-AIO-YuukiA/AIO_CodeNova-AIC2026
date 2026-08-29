@@ -9,39 +9,6 @@ services:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
 
-  vllm-index:
-    image: vllm/vllm-openai:cu130-nightly
-    container_name: codenova-vllm-index
-    profiles: ["vllm-index"]
-    environment:
-      - VLLM_DISABLED_KERNELS=cutlass_moe_mm,cutlass_scaled_mm
-      - TORCH_CUDA_ARCH_LIST=12.0
-      - PYTORCH_ALLOC_CONF=expandable_segments:True
-    command: >
-      ${VLLM_INDEX_MODEL:-cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit}
-      --host 0.0.0.0
-      --port 8881
-      --max-model-len 8192
-      --gpu-memory-utilization 0.5
-      --max-num-seqs 16
-      --moe-backend marlin
-      --reasoning-parser qwen3
-      --default-chat-template-kwargs '{"enable_thinking": false}'
-    ports:
-      - "8881:8881"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    ipc: host
-    shm_size: "64gb"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    restart: unless-stopped
-
   # Full-text index for OCR/ASR search (BM25).
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
@@ -67,5 +34,33 @@ services:
       - "8883:8080"
     restart: unless-stopped
 
+  # Second-stage reranker, served via vLLM's OpenAI-compatible /v1/score (or
+  # /rerank) endpoint. GPU-hosted, so this is meant for a machine with real
+  # VRAM headroom (e.g. a rented Vast.ai GPU) rather than a 4GB laptop GPU
+  # already carrying the embedders (jina, siglip2) in the same process.
+  vllm-reranker:
+    image: vllm/vllm-openai:latest
+    container_name: codenova-vllm-reranker
+    command:
+      - --model=Qwen/Qwen3-VL-Reranker-2B
+      - --task=score
+      - --port=8000
+      - --gpu-memory-utilization=0.3
+      - --max-model-len=8192
+      - --dtype=bfloat16
+    ports:
+      - "8884:8000"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
 volumes:
   elasticsearch_data:
+  huggingface_cache:

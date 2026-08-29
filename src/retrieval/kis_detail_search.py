@@ -1,12 +1,10 @@
-"""KIS Detail search — in-memory multi-concept sum fusion.
+"""KIS Detail 2-Stage search — Qdrant candidate retrieval + multi-concept sum fusion.
 
-Pipeline:
-  1. Load frame_embeddings (N × D)
-  2. Embed từng subquery → vectors
-  3. scores = frame_embeddings @ [q1, q2, ...].T  → N × K
-  4. final_score = scores.sum(axis=1)
-  5. Top-K frame theo final_score
-  6. Hydrate frame info + return
+Pipeline (kis_detail_2stage_search):
+  Stage 1 (general): each subquery searched via Qdrant → union candidates by
+    frame_id → weighted normalized sum fusion → top_k_stage1.
+  Stage 2 (specific): fetch each candidate's real vector by id, re-score
+    against specific subqueries → weighted normalized sum fusion → top_k_stage2.
 """
 
 from __future__ import annotations
@@ -16,110 +14,11 @@ import logging
 import numpy as np
 
 from config.settings import Experiment
-from retrieval.temporal_search import load_temporal_data
 from retrieval.hydrator import ResultHydrator
 from retrieval.vqa import _get_retriever
 from stores.vector.base import frame_result
 
 LOGGER = logging.getLogger(__name__)
-
-
-def kis_detail_search(
-    experiment: Experiment,
-    subqueries: list[str],
-    top_k: int = 300,
-) -> dict:
-    """KIS Detail pipeline — sum fusion in-memory.
-
-    Args:
-        experiment: Experiment instance.
-        subqueries: List of atomic detail descriptions (already static).
-        top_k: Number of top frames to return (default 300).
-
-    Returns:
-        Dict with "results" (list of hydrated frames + scores) and "total".
-    """
-    if not subqueries:
-        return {"results": [], "total": 0}
-
-    clean = [s.strip() for s in subqueries if s.strip()]
-    if not clean:
-        return {"results": [], "total": 0}
-
-    # 1. Load frame_embeddings + metadata
-    try:
-        frame_embeddings, frame_records = load_temporal_data(experiment)
-    except FileNotFoundError as exc:
-        return {"error": str(exc), "results": [], "total": 0}
-
-    if frame_embeddings.shape[0] == 0 or not frame_records:
-        return {"results": [], "total": 0}
-
-    # 2. Embed từng subquery
-    # Reuse the cached retriever's embedder rather than building a fresh one —
-    # this function runs twice per request (general + specific stages), and a
-    # fresh full model load each time exhausts a small GPU within a few calls.
-    embedder = _get_retriever(experiment).embedders[experiment.config.embedding_models[0]]
-    query_embs = np.stack(
-        [np.asarray(embedder.embed_text(q), dtype="float32").flatten() for q in clean]
-    )
-
-    # Normalize L2 cho mỗi query embedding
-    for i in range(query_embs.shape[0]):
-        norm = np.linalg.norm(query_embs[i])
-        if norm > 1e-12:
-            query_embs[i] /= norm
-
-    # 3. Compute cosine similarity
-    scores = frame_embeddings @ query_embs.T  # N × K
-    if scores.shape[1] == 0:
-        return {"results": [], "total": 0}
-
-    # 4. Final score = sum
-    final_scores = scores.sum(axis=1)
-
-    # 5. Top-K
-    n = min(top_k, len(final_scores))
-    if n == 0:
-        return {"results": [], "total": 0}
-
-    top_indices = np.argpartition(final_scores, -n)[-n:]
-    top_indices = top_indices[np.argsort(final_scores[top_indices])[::-1]]
-
-    # 6. Hydrate frame info
-    hydrator = ResultHydrator(experiment)
-    results = []
-    for idx in top_indices:
-        rec = frame_records[idx]
-        frame_id = rec.get("frame_id")
-        if not frame_id:
-            continue
-
-        hydrated = hydrator.hydrate([frame_result(frame_id, float(final_scores[idx]))])
-        if not hydrated:
-            continue
-        sr = hydrated[0]
-
-        sub_scores = {}
-        for i, q in enumerate(clean):
-            sub_scores[f"sub_{i}"] = round(float(scores[idx, i]), 4)
-
-        results.append(
-            {
-                "frame_id": sr.frame_id,
-                "video_id": sr.video_id,
-                "video_name": sr.video_name or sr.video_id,
-                "frame_path": sr.frame_path,
-                "frame_index": sr.frame_index,
-                "shot_id": sr.shot_id,
-                "timestamp_sec": sr.timestamp_sec,
-                "score": round(float(final_scores[idx]), 4),
-                "sub_scores": sub_scores,
-            }
-        )
-
-    LOGGER.info("KIS Detail: %d subqueries → %d frames (top %d)", len(clean), len(results), n)
-    return {"results": results, "total": len(results)}
 
 
 def _weighted_sum_fusion(scores: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
@@ -197,21 +96,17 @@ def kis_detail_2stage_search(
     if not clean_gen or not clean_spec:
         return {"results": [], "total": 0}
 
-    # 1. Load data
-    try:
-        frame_embeddings, frame_records = load_temporal_data(experiment)
-    except FileNotFoundError as exc:
-        return {"error": str(exc), "results": [], "total": 0}
-
-    if frame_embeddings.shape[0] == 0 or not frame_records:
-        return {"results": [], "total": 0}
-
     # Reuse the cached retriever's embedder rather than building a fresh one —
     # this function runs twice per request (general + specific stages), and a
     # fresh full model load each time exhausts a small GPU within a few calls.
-    embedder = _get_retriever(experiment).embedders[experiment.config.embedding_models[0]]
+    retriever = _get_retriever(experiment)
+    model_name = experiment.config.embedding_models[0]
+    embedder = retriever.embedders[model_name]
 
-    # ── Stage 1: general weighted normalized sum fusion ─────────────
+    # ── Stage 1: general weighted normalized sum fusion via Qdrant ──
+    # Each subquery is a separate Qdrant ANN search (fast, no full-corpus
+    # load); candidates are unioned by frame_id, missing entries score 0
+    # for that column (same as a brute-force row that never appears).
     gen_embs = np.stack(
         [np.asarray(embedder.embed_text(q), dtype="float32").flatten() for q in clean_gen]
     )
@@ -220,7 +115,20 @@ def kis_detail_2stage_search(
         if norm > 1e-12:
             gen_embs[i] /= norm
 
-    scores1 = frame_embeddings @ gen_embs.T  # [all, K_gen]
+    per_query_hits = [
+        retriever.index.search(gen_embs[i].tolist(), top_k=top_k_stage1, model_name=model_name)
+        for i in range(gen_embs.shape[0])
+    ]
+    frame_ids = list({hit.frame_id for hits in per_query_hits for hit in hits})
+    if not frame_ids:
+        return {"results": [], "total": 0}
+    frame_id_to_row = {fid: row for row, fid in enumerate(frame_ids)}
+
+    scores1 = np.zeros((len(frame_ids), len(clean_gen)), dtype="float32")
+    for col, hits in enumerate(per_query_hits):
+        for hit in hits:
+            scores1[frame_id_to_row[hit.frame_id], col] = hit.score
+
     gen_weights_arr = np.array(general_weights, dtype="float32") if general_weights else None
     final1 = _weighted_sum_fusion(scores1, weights=gen_weights_arr)
 
@@ -229,8 +137,17 @@ def kis_detail_2stage_search(
         return {"results": [], "total": 0}
     top_idx1 = np.argpartition(final1, -n1)[-n1:]
     top_idx1 = top_idx1[np.argsort(final1[top_idx1])[::-1]]
+    top_frame_ids1 = [frame_ids[i] for i in top_idx1]
 
-    cached_embs = frame_embeddings[top_idx1]  # [n1, D]
+    # Stage 2 re-scores the same subset against different (specific)
+    # queries, so it needs each candidate's real vector — fetched by id,
+    # not the full corpus.
+    cached_embs = np.stack(
+        [
+            np.asarray(retriever.index.get_vector(fid, model_name), dtype="float32")
+            for fid in top_frame_ids1
+        ]
+    )
 
     LOGGER.info(
         "KIS Detail 2-Stage | Stage 1: %d general → %d candidates",
@@ -257,17 +174,12 @@ def kis_detail_2stage_search(
     top_idx2 = np.argpartition(final2, -n2)[-n2:]
     top_idx2 = top_idx2[np.argsort(final2[top_idx2])[::-1]]
 
-    final_indices = top_idx1[top_idx2]
+    final_frame_ids = [top_frame_ids1[i] for i in top_idx2]
 
     # ── Hydrate ─────────────────────────────────────────────────────
     hydrator = ResultHydrator(experiment)
     results = []
-    for rank, idx in enumerate(final_indices, start=1):
-        rec = frame_records[idx]
-        frame_id = rec.get("frame_id")
-        if not frame_id:
-            continue
-
+    for rank, frame_id in enumerate(final_frame_ids, start=1):
         hydrated = hydrator.hydrate([frame_result(frame_id, float(final2[rank - 1]))])
         if not hydrated:
             continue

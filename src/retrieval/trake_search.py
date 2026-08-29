@@ -83,13 +83,11 @@ def _fetch_text_scores_to_ram(experiment: Experiment, processed) -> dict:
 
     ocr_d, max_ocr = _fetch(processed.ocr_keywords, "ocr")
     asr_d, max_asr = _fetch(processed.asr_keywords, "asr")
-    cap_d, max_cap = _fetch(processed.caption_keywords, "caption")
 
     weights = processed.weights
     fusion_weights = {
         "ocr": weights.get("ocr_bonus", 0.0),
         "asr": weights.get("asr_bonus", 0.0),
-        "caption": weights.get("caption_bonus", 0.0),
     }
 
     return {
@@ -97,8 +95,6 @@ def _fetch_text_scores_to_ram(experiment: Experiment, processed) -> dict:
         "max_ocr": max_ocr,
         "asr_dict": asr_d,
         "max_asr": max_asr,
-        "cap_dict": cap_d,
-        "max_cap": max_cap,
         "fusion_weights": fusion_weights,
     }
 
@@ -126,7 +122,6 @@ def _search_event_intelligent(
         enable_kis=True,
         enable_ocr=True,
         enable_asr=True,
-        enable_caption=True,
         enabled_models=enabled_models,
         use_reranker=use_reranker,
         use_llm=use_llm,
@@ -223,11 +218,9 @@ def _window_search_fwd(
     if text_context:
         w_ocr = text_context["fusion_weights"]["ocr"]
         w_asr = text_context["fusion_weights"]["asr"]
-        w_cap = text_context["fusion_weights"]["caption"]
 
         m_ocr = max(text_context["max_ocr"], 15.0)
         m_asr = max(text_context["max_asr"], 15.0)
-        m_cap = max(text_context["max_cap"], 15.0)
 
         for i, pos in enumerate(idxs):
             rec = frame_records[pos]
@@ -237,12 +230,11 @@ def _window_search_fwd(
 
             ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
             asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
-            cap_s = text_context["cap_dict"].get(fid, 0.0) / m_cap
 
-            bonus = (w_ocr * ocr_s) + (w_asr * asr_s) + (w_cap * cap_s)
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s)
             final_scores[i] += bonus
 
-        global_max_possible = 1.0 + w_ocr + w_asr + w_cap
+        global_max_possible = 1.0 + w_ocr + w_asr
         if global_max_possible > 0:
             final_scores = final_scores / global_max_possible
 
@@ -324,11 +316,9 @@ def _window_search_bwd(
     if text_context:
         w_ocr = text_context["fusion_weights"]["ocr"]
         w_asr = text_context["fusion_weights"]["asr"]
-        w_cap = text_context["fusion_weights"]["caption"]
 
         m_ocr = max(text_context["max_ocr"], 15.0)
         m_asr = max(text_context["max_asr"], 15.0)
-        m_cap = max(text_context["max_cap"], 15.0)
 
         for i, pos in enumerate(idxs):
             rec = frame_records[pos]
@@ -338,12 +328,11 @@ def _window_search_bwd(
 
             ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
             asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
-            cap_s = text_context["cap_dict"].get(fid, 0.0) / m_cap
 
-            bonus = (w_ocr * ocr_s) + (w_asr * asr_s) + (w_cap * cap_s)
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s)
             final_scores[i] += bonus
 
-        global_max_possible = 1.0 + w_ocr + w_asr + w_cap
+        global_max_possible = 1.0 + w_ocr + w_asr
         if global_max_possible > 0:
             final_scores = final_scores / global_max_possible
 

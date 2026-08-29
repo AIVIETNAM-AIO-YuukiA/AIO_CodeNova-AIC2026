@@ -1,10 +1,10 @@
-"""Agent tools — caption/OCR over a frame image, served by the Docker VLM.
+"""Agent tools — caption/OCR over a frame image, via OpenRouter's VLM.
 
-Both tools call the vLLM VLM service (``VLLM_BASE_URL``, port 8881 — the same
-server the offline captioning/OCR indexing modules use) instead of loading
-any model in-process. When that server isn't running they degrade to a
-descriptive error string rather than raising, so the agent can still finish a
-turn from cached captions and text-index context.
+Both tools call the same OpenRouter VLM (``OPENROUTER_MODEL``) the offline
+captioning/OCR indexing modules use, instead of loading any model in-process.
+When that call fails they degrade to a descriptive error string rather than
+raising, so the agent can still finish a turn from cached captions and
+text-index context.
 """
 
 from __future__ import annotations
@@ -28,10 +28,9 @@ class Tool(ABC):
 
 
 class _VlmTool(Tool):
-    """Shared plumbing for tools that send one image to the Docker VLM."""
+    """Shared plumbing for tools that send one image to OpenRouter's VLM."""
 
-    def __init__(self, base_url: str | None = None, model_name: str | None = None) -> None:
-        self._base_url = base_url
+    def __init__(self, model_name: str | None = None) -> None:
         self._model_name = model_name
         self._client = None
 
@@ -39,7 +38,7 @@ class _VlmTool(Tool):
         if self._client is None:
             from modules._vllm_chat import VllmChatClient
 
-            self._client = VllmChatClient(base_url=self._base_url, model_name=self._model_name)
+            self._client = VllmChatClient(openrouter_model=self._model_name)
         return self._client
 
     def _complete(self, system_prompt: str, user_prompt: str, image_path: str, max_tokens: int):
@@ -54,11 +53,11 @@ class _VlmTool(Tool):
             )
         except Exception as exc:
             LOGGER.exception("%s tool failed", self.name)
-            return f"[{self.name} unavailable: {exc}. Start the VLM with `make vllm-index-up`.]"
+            return f"[{self.name} unavailable: {exc}. Check OPENROUTER_MODEL in .env.]"
 
 
 class CaptionTool(_VlmTool):
-    """Describe an image in detail via the Docker VLM."""
+    """Describe an image in detail via OpenRouter's VLM."""
 
     name = "caption"
     description = "Describe an image in detail. Input: image_path. Output: detailed description."
@@ -78,7 +77,7 @@ class CaptionTool(_VlmTool):
 
 
 class OCRTool(_VlmTool):
-    """Extract visible text from an image via the Docker VLM."""
+    """Extract visible text from an image via OpenRouter's VLM."""
 
     name = "ocr"
     description = "Read all visible text from an image. Input: image_path. Output: extracted text."

@@ -58,15 +58,14 @@ _SANITIZE_GENERATION_PARAMS = {
 
 
 class VllmCaptioningModel(CaptioningModel):
-    """Caption keyframes by calling a self-hosted vLLM chat-completions endpoint."""
+    """Caption keyframes by calling OpenRouter's VLM chat-completions endpoint."""
 
     def __init__(
         self,
-        base_url: str | None = None,
         model_name: str | None = None,
         timeout: float = 60.0,
     ) -> None:
-        self._client = VllmChatClient(base_url=base_url, model_name=model_name, timeout=timeout)
+        self._client = VllmChatClient(openrouter_model=model_name, timeout=timeout)
 
     def caption(self, frame_path: str) -> str:
         """Return a structured Vietnamese caption for one keyframe image."""
@@ -75,11 +74,7 @@ class VllmCaptioningModel(CaptioningModel):
             last_reasons: tuple[str, ...] = ()
             last_caption = ""
             for attempt in range(_SEMANTIC_RETRIES + 1):
-                prompt = (
-                    user_prompt
-                    if attempt == 0
-                    else f"{_CORRECTIVE_PROMPT}\n\n{user_prompt}"
-                )
+                prompt = user_prompt if attempt == 0 else f"{_CORRECTIVE_PROMPT}\n\n{user_prompt}"
                 caption = self._client.complete_with_image(
                     system_prompt=system_prompt,
                     user_prompt=prompt,

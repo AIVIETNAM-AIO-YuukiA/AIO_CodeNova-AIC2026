@@ -7,6 +7,7 @@ function to instantiate the appropriate implementation by model name.
 from __future__ import annotations
 
 import logging
+import os
 
 from core.types import SearchResult
 
@@ -32,7 +33,8 @@ def build_reranker(
         model_name: Short alias or HuggingFace model ID.
                     e.g. ``"blip2-itm"`` or ``"Salesforce/blip2-itm-vit-b"``.
                     Pass ``None`` to disable reranking.
-        device:     Target device – ``"auto"``, ``"cuda"``, or ``"cpu"``.
+        device:     Target device – ``"auto"``, ``"cuda"``, or ``"cpu"`` (BLIP-2 only;
+                    the vLLM backend runs in its own container regardless of this value).
         batch_size: Images per inference batch; reduce if VRAM is limited.
 
     Returns:
@@ -40,6 +42,16 @@ def build_reranker(
     """
     if model_name is None:
         return None
+
+    # RERANKER_BACKEND picks the implementation; model_name/alias handling
+    # below is BLIP-2-specific and doesn't apply to the vLLM backend, which
+    # is configured entirely through QWEN_VL_RERANKER_URL/_MODEL env vars.
+    backend = os.environ.get("RERANKER_BACKEND", "blip2").strip().lower()
+    if backend in ("qwen-vl-vllm", "qwen_vl_vllm"):
+        from modules.reranker.qwen_vl_vllm import QwenVlVllmReranker
+
+        LOGGER.info("Reranker: initializing Qwen3-VL reranker via vLLM")
+        return QwenVlVllmReranker(batch_size=batch_size)
 
     from modules.reranker.blip2_itm import Blip2ItmReranker, _default_model_name
 

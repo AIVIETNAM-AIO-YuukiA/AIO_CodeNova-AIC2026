@@ -24,6 +24,6 @@ def build_vector_index(experiment: Experiment) -> VectorIndex:
     base_collection = os.environ.get("QDRANT_COLLECTION", "codenova_frames")
     return QdrantVectorIndex(
         url=os.environ.get("QDRANT_URL", "http://localhost:6333"),
-        collection=f"{base_collection}__{experiment.name}",
+        collection=f"{base_collection}_{experiment.name}",
         api_key=os.environ.get("QDRANT_API_KEY") or None,
     )

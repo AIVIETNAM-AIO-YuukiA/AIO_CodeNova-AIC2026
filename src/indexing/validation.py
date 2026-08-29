@@ -86,8 +86,10 @@ def validate_experiment_artifacts(experiment: Experiment) -> ExperimentValidatio
         _unique(report, text, "doc_id", "TEXT")
     if captions:
         _unique(report, captions, "frame_id", "CAPTION")
-    if embedding_records:
-        _unique(report, embedding_records, "model_name", "EMBED")
+    # embeddings.jsonl is an append-only progress log (one row per
+    # embed-frames checkpoint/resume, not one row per model), so unlike the
+    # ID manifests above it legitimately repeats a model_name across rows —
+    # provenance_by_model below already keys off the last row per model.
 
     missing_video_files = 0
     for video in videos:
@@ -96,7 +98,9 @@ def validate_experiment_artifacts(experiment: Experiment) -> ExperimentValidatio
         path = Path(str(raw_path)) if raw_path else None
         if path is None or not path.is_file():
             missing_video_files += 1
-            report.add("ERROR", "MISSING_VIDEO_FILE", "DISCOVER", str(raw_path), item_id=video_id)
+            # WARNING không ERROR: file video gốc chỉ cần cho preview/replay
+            # trong UI, không ảnh hưởng search (frame/embedding/text vẫn đủ).
+            report.add("WARNING", "MISSING_VIDEO_FILE", "DISCOVER", str(raw_path), item_id=video_id)
             continue
         try:
             expected_size = int(video["size_bytes"])

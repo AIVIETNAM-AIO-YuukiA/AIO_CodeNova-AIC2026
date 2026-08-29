@@ -1,15 +1,20 @@
 """Elasticsearch-backed text index.
 
-Indexes OCR (``modules/ocr/vllm.py``) and ASR (``modules/asr/gipformer.py``)
-documents under one mapping (same convention as the AIC 2025 reference
-project's ``elasticsearch_service.py``: one index, ``source`` field
-distinguishes OCR vs ASR rather than separate indices per modality).
+Indexes OCR (``modules/ocr/vllm.py``), ASR (``modules/asr/gipformer.py``), and
+caption documents under one mapping (same convention as the AIC 2025
+reference project's ``elasticsearch_service.py``: one index, ``source``
+distinguishes modalities rather than using separate indices).
 """
 
 from __future__ import annotations
 
 from core.errors import IndexBuildError
 from stores.text.base import TextDocument, TextIndex
+
+# Keep each HTTP bulk request comfortably below Elasticsearch's default
+# ``http.max_content_length`` (100 MB). ASR segments can be several KB each,
+# so sending a whole 100k+ document manifest in one request is not safe.
+BULK_INDEX_BATCH_SIZE = 500
 
 # Custom analyzer for Vietnamese/multilingual text: lowercases, strips
 # diacritics-as-separate-chars (asciifolding), and drops English stopwords —
@@ -59,24 +64,39 @@ class ElasticTextIndex(TextIndex):
         self._client = None
 
     def index_documents(self, documents: list[TextDocument]) -> None:
-        """Bulk-index text documents into Elasticsearch."""
+        """Bulk-index text documents in bounded requests.
+
+        ``import-text`` may contain more than 100k OCR/ASR/caption records.
+        A single bulk payload can exceed Elasticsearch's HTTP request limit and
+        fail with HTTP 413, so each batch is sent independently. Refresh only
+        after the final batch to avoid one costly refresh per request.
+        """
         if not documents:
             return
         client = self._connect()
         self._ensure_index(client)
-        operations = []
-        for doc in documents:
-            operations.append({"index": {"_index": self.index_name, "_id": doc.doc_id}})
-            operations.append(
-                {
-                    "video_id": doc.video_id,
-                    "frame_id": doc.frame_id,
-                    "text": doc.text,
-                    "source": doc.source,
-                    "timestamp_sec": doc.timestamp_sec,
-                }
+        for offset in range(0, len(documents), BULK_INDEX_BATCH_SIZE):
+            batch = documents[offset : offset + BULK_INDEX_BATCH_SIZE]
+            operations = []
+            for doc in batch:
+                operations.append({"index": {"_index": self.index_name, "_id": doc.doc_id}})
+                operations.append(
+                    {
+                        "video_id": doc.video_id,
+                        "frame_id": doc.frame_id,
+                        "text": doc.text,
+                        "source": doc.source,
+                        "timestamp_sec": doc.timestamp_sec,
+                    }
+                )
+            response = client.bulk(
+                operations=operations,
+                refresh=offset + BULK_INDEX_BATCH_SIZE >= len(documents),
             )
-        client.bulk(operations=operations, refresh=True)
+            if response.get("errors"):
+                raise IndexBuildError(
+                    "Elasticsearch rejected one or more text documents in bulk indexing."
+                )
 
     def search(self, query: str, top_k: int) -> list[tuple[str, float]]:
         """Run a multi-strategy BM25 query and return ``(doc_id, score)`` pairs.
@@ -88,14 +108,26 @@ class ElasticTextIndex(TextIndex):
         hits = self._query(query, top_k)
         return [(hit["_id"], float(hit["_score"])) for hit in hits]
 
-    def search_documents(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
-        """Return full matching documents, optionally restricted to one source."""
+    def search_documents(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
+        """Return full matching documents, optionally restricted by source."""
+        if source is not None and not isinstance(source, str) and not source:
+            return []
         hits = self._query(query, top_k, source=source)
         return [
             {"doc_id": hit["_id"], "score": float(hit["_score"]), **hit["_source"]} for hit in hits
         ]
 
-    def _query(self, query: str, top_k: int, source: str | None = None) -> list[dict]:
+    def _query(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
         client = self._connect()
         should = [
             {"match_phrase": {"text": {"query": query, "boost": 8.0}}},
@@ -113,8 +145,10 @@ class ElasticTextIndex(TextIndex):
             {"match": {"text": {"query": query, "fuzziness": "AUTO", "boost": 2.0}}},
         ]
         bool_query: dict = {"should": should, "minimum_should_match": 1}
-        if source is not None:
+        if isinstance(source, str):
             bool_query["filter"] = [{"term": {"source": source}}]
+        elif source is not None:
+            bool_query["filter"] = [{"terms": {"source": list(source)}}]
         response = client.search(index=self.index_name, query={"bool": bool_query}, size=top_k)
         return response["hits"]["hits"]
 

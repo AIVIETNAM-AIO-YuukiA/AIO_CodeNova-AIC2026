@@ -149,7 +149,9 @@ def _validate_experiment_for_serving(experiment: Experiment) -> dict[str, object
     """Require a fresh offline readiness report without mutating indexing artifacts."""
     readiness = read_readiness(experiment)
     status = str(readiness.get("status", "INVALID"))
-    if status != "READY":
+    # DEGRADED được chấp nhận: chỉ có WARNING (vd thiếu video gốc, không cần
+    # cho search/keyframe) — chỉ chặn khi INVALID (còn ERROR thật sự).
+    if status not in ("READY", "DEGRADED"):
         raise RuntimeError(
             f"Experiment {experiment.name!r} is not ready: status={status}. "
             "Run validate-index and resolve the reported issues first."
@@ -265,7 +267,9 @@ def build_handler(
             if parsed.path == "/api/vqa-search":
                 try:
                     payload = self._read_json()
-                    res = handle_vqa_search(payload, experiment, default_top_k, reranker, reranker_top_k)
+                    res = handle_vqa_search(
+                        payload, experiment, default_top_k, reranker, reranker_top_k
+                    )
                     self._send_json(res)
                 except Exception as exc:
                     LOGGER.exception("VQA search failed")
@@ -396,4 +400,3 @@ def _render_index_html(experiment: Experiment, default_top_k: int) -> str:
             html_lib.escape(", ".join(experiment.config.embedding_models)),
         )
     )
-

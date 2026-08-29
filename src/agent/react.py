@@ -17,7 +17,7 @@ class Agent:
     """ReAct Agent for VQA answer generation.
 
     Args:
-        brain: AgentBrain instance (Docker-hosted LLM).
+        brain: AgentBrain instance (OpenRouter LLM).
         tools: Dict of tool_name → Tool instance.
         max_steps: Maximum ReAct iterations before forced answer.
     """
@@ -137,16 +137,11 @@ class Agent:
 
 
 def create_agent(backend: str = "local") -> Agent:
-    """Create the Agent over the Docker-hosted LLM.
+    """Create the Agent over OpenRouter (AGENT_LOCAL_ENGINE_MODEL, falls back to OPENROUTER_MODEL).
 
-    There is exactly one backend: an OpenAI-compatible server on port 8884,
-    not served by this repo's `docker-compose.yml` — point `.env`'s
-    `AGENT_LOCAL_ENGINE_URL` at whatever OpenAI-compatible endpoint you run
-    for it. ``backend`` is accepted for API compatibility with older callers
-    but no longer selects anything.
+    ``backend`` is accepted for API compatibility with older callers but no
+    longer selects anything.
     """
     if backend not in ("local", ""):
-        LOGGER.info(
-            "Agent backend %r requested; only the Docker engine exists — using it.", backend
-        )
+        LOGGER.info("Agent backend %r requested; only OpenRouter exists — using it.", backend)
     return Agent(brain=AgentBrain(), tools=default_tools(), max_steps=MAX_STEPS)

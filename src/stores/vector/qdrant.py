@@ -10,9 +10,16 @@ point id is just the row position, so searches return frame ids directly.
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
+
 from core.errors import IndexBuildError
 from core.types import SearchResult
 from stores.vector.base import VectorIndex, frame_result
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class QdrantVectorIndex(VectorIndex):
@@ -25,22 +32,24 @@ class QdrantVectorIndex(VectorIndex):
         api_key: str | None = None,
         distance: str = "Cosine",
         upsert_batch_size: int = 256,
+        upsert_workers: int = 4,
+        upsert_max_retries: int = 3,
     ) -> None:
         self.url = url
         self.collection = collection
         self.api_key = api_key
         self.distance = distance
         self.upsert_batch_size = upsert_batch_size
+        self.upsert_workers = upsert_workers
+        self.upsert_max_retries = upsert_max_retries
         self._client = None
 
-    def build(
-        self, embeddings_by_model: dict[str, list[list[float]]], frame_ids: list[str]
-    ) -> None:
+    def build(self, embeddings_by_model: dict[str, "np.ndarray"], frame_ids: list[str]) -> None:
         """Create the collection (one named vector per model) and upsert all points."""
         if not embeddings_by_model:
             raise IndexBuildError("Cannot build a Qdrant index with no embedding models.")
         for model_name, embeddings in embeddings_by_model.items():
-            if not embeddings:
+            if len(embeddings) == 0:
                 raise IndexBuildError(f"Model '{model_name}' has zero embeddings.")
             if len(embeddings) != len(frame_ids):
                 raise IndexBuildError(
@@ -54,7 +63,7 @@ class QdrantVectorIndex(VectorIndex):
             collection_name=self.collection,
             vectors_config={
                 model_name: models.VectorParams(
-                    size=len(embeddings[0]),
+                    size=embeddings.shape[1],
                     distance=models.Distance[self.distance.upper()],
                 )
                 for model_name, embeddings in embeddings_by_model.items()
@@ -62,20 +71,49 @@ class QdrantVectorIndex(VectorIndex):
         )
 
         num_points = len(frame_ids)
-        for start in range(0, num_points, self.upsert_batch_size):
+        batch_starts = range(0, num_points, self.upsert_batch_size)
+
+        def upsert_batch(start: int) -> None:
             stop = min(start + self.upsert_batch_size, num_points)
+            # .tolist() only on the slice being upserted, not the whole array,
+            # so peak RAM stays close to the numpy arrays' own footprint.
+            batch_by_model = {
+                model_name: embeddings[start:stop].tolist()
+                for model_name, embeddings in embeddings_by_model.items()
+            }
             points = [
                 models.PointStruct(
-                    id=index,
+                    id=start + offset,
                     vector={
-                        model_name: embeddings[index]
-                        for model_name, embeddings in embeddings_by_model.items()
+                        model_name: batch[offset] for model_name, batch in batch_by_model.items()
                     },
-                    payload={"frame_id": frame_ids[index]},
+                    payload={"frame_id": frame_ids[start + offset]},
                 )
-                for index in range(start, stop)
+                for offset in range(stop - start)
             ]
-            client.upsert(collection_name=self.collection, points=points)
+            # Each concurrent worker adds load on top of the others, so a
+            # transient read timeout under that load is retried rather than
+            # failing the whole multi-hour build over one slow batch.
+            last_error: Exception | None = None
+            for attempt in range(self.upsert_max_retries):
+                try:
+                    client.upsert(collection_name=self.collection, points=points)
+                    return
+                except Exception as exc:  # noqa: BLE001 - qdrant/httpx raise several types
+                    last_error = exc
+                    if attempt < self.upsert_max_retries - 1:
+                        time.sleep(2.0 * (attempt + 1))
+            raise IndexBuildError(
+                f"Upsert failed for points [{start}, {stop}) after "
+                f"{self.upsert_max_retries} attempts: {last_error}"
+            ) from last_error
+
+        # Upsert is I/O-bound (waiting on Qdrant per batch), so a thread pool
+        # overlaps requests instead of waiting on each round-trip in turn.
+        # Kept small (default 4) since a local Qdrant instance can time out
+        # under too many concurrent large-payload upserts.
+        with ThreadPoolExecutor(max_workers=self.upsert_workers) as pool:
+            list(pool.map(upsert_batch, batch_starts))
 
     def search(
         self, query_embedding: list[float], top_k: int, model_name: str | None = None
@@ -106,6 +144,22 @@ class QdrantVectorIndex(VectorIndex):
             results.append(res)
         return results
 
+    def get_vector(self, frame_id: str, model_name: str) -> list[float] | None:
+        """Fetch one point's named vector via a payload filter, not a full scan."""
+        client, models = self._connect()
+        points, _ = client.scroll(
+            collection_name=self.collection,
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(key="frame_id", match=models.MatchValue(value=frame_id))]
+            ),
+            with_vectors=[model_name],
+            limit=1,
+        )
+        if not points:
+            return None
+        vector = points[0].vector
+        return vector.get(model_name) if isinstance(vector, dict) else vector
+
     def _connect(self):
         if self._client is not None:
             return self._client, self._models
@@ -115,6 +169,8 @@ class QdrantVectorIndex(VectorIndex):
         except ImportError as exc:
             raise IndexBuildError("Install qdrant-client before using the Qdrant index.") from exc
 
-        self._client = QdrantClient(url=self.url, api_key=self.api_key)
+        # Default client timeout (5s) is too short once several upsert workers
+        # are hitting the same instance concurrently with large payloads.
+        self._client = QdrantClient(url=self.url, api_key=self.api_key, timeout=60)
         self._models = models
         return self._client, self._models

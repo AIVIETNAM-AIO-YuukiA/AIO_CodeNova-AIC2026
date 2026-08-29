@@ -269,13 +269,18 @@ APP_JS = r"""
       } else if (track === "intelligent") {
         const results = data.results || [];
         const a = data.analysis || {};
-        const w = a.weights || {};
+        const w = data.fusion_weights || {};
         const counts = data.component_counts || {};
-        const parts = ["kis", "ocr", "asr"]
+        const parts = ["kis", "ocr", "asr", "caption", "joint_text"]
           .filter(k => (w[k] || 0) > 0)
           .map(k => `${k.toUpperCase()} ${(w[k]).toFixed(2)} (${counts[k] || 0} hit)`);
+        const routing = a.routing_mode ? ` · route=${escapeHtml(a.routing_mode)}` : "";
+        const latency = data.timing_ms && data.timing_ms.total != null
+          ? ` · ${Number(data.timing_ms.total).toFixed(0)} ms`
+          : "";
         statusEl.innerHTML = `<strong>${results.length}</strong> results <span class="pill">Intelligent</span>`
-          + (parts.length ? ` · ${escapeHtml(parts.join(" + "))}` : "");
+          + (parts.length ? ` · ${escapeHtml(parts.join(" + "))}` : "")
+          + routing + latency;
         renderResults(results);
       } else {
         const trackLabels = {
@@ -590,7 +595,10 @@ APP_JS = r"""
     const searchRes = lastSearchResultsMap[frame.frame_id] || {};
     const subs = searchRes.sub_scores || searchRes.subquery_scores || {};
     const subKeys = Object.keys(subs);
-    const hasComps = searchRes.kis_score || searchRes.ocr_score || searchRes.asr_score;
+    const comps = searchRes.component_scores || {};
+    const compKeys = Object.keys(comps);
+    const hasLegacyComps = searchRes.kis_score || searchRes.ocr_score || searchRes.asr_score;
+    const hasComps = compKeys.length > 0 || hasLegacyComps;
 
     const scoresSec = eid("modal-scores-section");
     const scoresText = eid("modal-scores-text");
@@ -600,7 +608,15 @@ APP_JS = r"""
         if (subKeys.length > 0) {
           html += `<div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:4px;">${subKeys.map(k => `<span class="pill" style="font-size:11px;background:#eef2ff;color:#4338ca;">${esc(k.replace('sub_',''))}: ${Number(subs[k]).toFixed(4)}</span>`).join('')}</div>`;
         }
-        if (hasComps) {
+        if (compKeys.length > 0) {
+          html += `<div style="display:flex;gap:4px;flex-wrap:wrap;">${compKeys.map(k => {
+            const item = comps[k] || {};
+            const score = item.normalized_score != null ? item.normalized_score : item.raw_score;
+            const rank = item.rank != null ? ` #${Number(item.rank)}` : "";
+            return `<span class="pill" style="font-size:11px;background:#eef2ff;color:#4338ca;">${esc(k.toUpperCase())}${rank} · ${Number(score || 0).toFixed(4)}</span>`;
+          }).join('')}</div>`;
+        }
+        if (hasLegacyComps) {
           html += `<div style="display:flex;gap:4px;flex-wrap:wrap;">
             ${searchRes.kis_score ? `<span class="pill" style="font-size:11px;background:#e0f2fe;color:#0369a1;">KIS ${Number(searchRes.kis_score).toFixed(4)}</span>` : ""}
             ${searchRes.ocr_score ? `<span class="pill" style="font-size:11px;background:#fef3c7;color:#b45309;">OCR ${Number(searchRes.ocr_score).toFixed(4)}</span>` : ""}

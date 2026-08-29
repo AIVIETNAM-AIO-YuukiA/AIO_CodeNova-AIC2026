@@ -107,21 +107,24 @@ def test_retriever_reranker_runtime_failure_returns_pre_rerank_results(tmp_path)
                 metadata={},
             )
 
+        def expand_query(self, visual_prompt, num_expansions=4):
+            return []
+
     class _Hydrator:
         def hydrate_with_diagnostics(self, results):
             return HydrationBatch([result], [])
 
+    class _Index:
+        def search(self, query_embedding, top_k, model_name):
+            return [SearchResult("f1", "v1", 1.0)]
+
     retriever = Retriever(
         experiment=_experiment(tmp_path),
         embedders={"model": _Embedder([], "model")},
-        index=SimpleNamespace(),
+        index=_Index(),
         hydrator=_Hydrator(),
         query_processor=_Processor(),
         reranker=reranker,
-    )
-    retriever._load_frame_embeddings = lambda model: (
-        __import__("numpy").asarray([[1.0]], dtype="float32"),
-        [{"frame_id": "f1"}],
     )
 
     assert retriever.search("query", top_k=1) == [result]

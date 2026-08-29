@@ -25,6 +25,8 @@ dependencies = [
     "bitsandbytes>=0.46.1",
     "fairscale>=0.4.13",
     "sentence-transformers>=5.6.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 
 [project.optional-dependencies]
@@ -76,8 +78,10 @@ packages = [
     "src/retrieval",
     "src/stores",
     "src/ui",
+    "src/api",
     "src/video",
     "src/agent",
+    "src/evaluation",
 ]
 
 [tool.pytest.ini_options]

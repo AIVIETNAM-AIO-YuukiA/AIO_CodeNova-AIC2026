@@ -1,4 +1,4 @@
-"""Interactive search agent — the AIC_2025 narrowing-loop flow, Docker-served.
+"""Interactive search agent — the AIC_2025 narrowing-loop flow, via OpenRouter.
 
 Ported from the AIC_2025 reference project's ``online/backend/agent.py``: the
 LLM holds five tools (search_kis / search_asr / search_ocr /
@@ -8,8 +8,7 @@ question that narrows the search. Stateless — the frontend keeps the
 conversation and re-sends it every turn.
 
 Differences from the reference (see ``prompts/agent.py`` for why): tool calls
-are JSON-in-text rather than the OpenAI ``tools`` API, and the backend is the
-Docker-hosted Qwen3.5-4B on port 8888 instead of GPT-4o.
+are JSON-in-text rather than the OpenAI ``tools`` API.
 """
 
 from __future__ import annotations
@@ -51,10 +50,7 @@ class InteractiveAgent:
             from modules._vllm_chat import VllmChatClient
 
             self._client = VllmChatClient(
-                base_url=os.environ.get("AGENT_LOCAL_ENGINE_URL", "http://localhost:8884/v1"),
-                model_name=os.environ.get(
-                    "AGENT_LOCAL_ENGINE_MODEL", "cyankiwi/Qwen3.5-4B-AWQ-4bit"
-                ),
+                openrouter_model=os.environ.get("AGENT_LOCAL_ENGINE_MODEL")
             )
         return self._client
 
@@ -110,7 +106,7 @@ class InteractiveAgent:
             except Exception as exc:
                 LOGGER.exception("Interactive agent LLM call failed")
                 return _turn(
-                    f"Agent LLM chưa sẵn sàng ({exc}). Kiểm tra AGENT_LOCAL_ENGINE_URL trong .env.",
+                    f"Agent LLM chưa sẵn sàng ({exc}). Kiểm tra OPENROUTER_MODEL trong .env.",
                     results,
                     actions,
                     done=True,
