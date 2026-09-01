@@ -9,6 +9,8 @@ import base64
 import logging
 import os
 import threading
+from pathlib import Path
+from typing import Sequence
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,6 +24,9 @@ _RETRY_MAX_SECONDS = 60.0
 
 # Set VLM_DISABLE_REASONING=0 to let reasoning models think (much slower).
 _DISABLE_REASONING = os.environ.get("VLM_DISABLE_REASONING", "1") != "0"
+
+_MAX_IMAGES_PER_REQUEST = 6
+_IMAGE_DETAIL_VALUES = frozenset({"auto", "low", "high"})
 
 
 def _retry_after_seconds(response) -> float | None:
@@ -86,6 +91,7 @@ class VllmChatClient:
         self.openrouter_provider = openrouter_provider
 
         self._openrouter_client = None
+        self._openrouter_client_lock = threading.Lock()
 
     @property
     def last_usage(self) -> dict[str, object]:
@@ -124,7 +130,74 @@ class VllmChatClient:
             lambda model_name: {"model": model_name, "messages": messages, **generation_params}
         )
         payload = response.json()
-        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        self._store_response_usage(payload)
+        return payload["choices"][0]["message"]["content"].strip()
+
+    def complete_with_images(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_paths: Sequence[str | os.PathLike[str]],
+        generation_params: dict[str, object] | None = None,
+        extra_messages: list[dict[str, object]] | None = None,
+        image_labels: Sequence[str] | None = None,
+        detail: str | None = "high",
+    ) -> str:
+        """Send an ordered, labelled set of images in one completion request.
+
+        Images are represented as alternating label and ``image_url`` content
+        blocks.  This keeps labels such as ``F1 @ 12.3s`` adjacent to the image
+        they identify, which is important when the caller later asks the model
+        to cite supporting frames.
+        """
+        paths = [Path(image_path) for image_path in image_paths]
+        if not paths:
+            raise ValueError("complete_with_images requires at least one image")
+        if len(paths) > _MAX_IMAGES_PER_REQUEST:
+            raise ValueError(
+                f"complete_with_images accepts at most {_MAX_IMAGES_PER_REQUEST} images"
+            )
+
+        if image_labels is None:
+            labels = [f"F{index}" for index in range(1, len(paths) + 1)]
+        else:
+            labels = [str(label).strip() for label in image_labels]
+            if len(labels) != len(paths):
+                raise ValueError("image_labels must contain exactly one label per image")
+            if any(not label for label in labels):
+                raise ValueError("image labels must not be empty")
+
+        if detail is not None and detail not in _IMAGE_DETAIL_VALUES:
+            allowed = ", ".join(sorted(_IMAGE_DETAIL_VALUES))
+            raise ValueError(f"detail must be one of {allowed}, or None")
+
+        missing_paths = [str(path) for path in paths if not path.is_file()]
+        if missing_paths:
+            missing = ", ".join(missing_paths)
+            raise FileNotFoundError(f"Image file(s) not found: {missing}")
+
+        content: list[dict[str, object]] = [{"type": "text", "text": user_prompt}]
+        for label, path in zip(labels, paths, strict=True):
+            content.append({"type": "text", "text": f"[{label}]"})
+            image_url: dict[str, object] = {"url": _encode_image_data_url(str(path))}
+            if detail is not None:
+                image_url["detail"] = detail
+            content.append({"type": "image_url", "image_url": image_url})
+
+        messages: list[dict[str, object]] = [{"role": "system", "content": system_prompt}]
+        if extra_messages:
+            messages.extend(extra_messages)
+        messages.append({"role": "user", "content": content})
+
+        response = self._post_openrouter(
+            lambda model_name: {
+                "model": model_name,
+                "messages": messages,
+                **(generation_params or {}),
+            }
+        )
+        payload = response.json()
+        self._store_response_usage(payload)
         return payload["choices"][0]["message"]["content"].strip()
 
     def complete_text(
@@ -149,13 +222,27 @@ class VllmChatClient:
             }
         )
         payload = response.json()
-        self.last_usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        self._store_response_usage(payload)
         return payload["choices"][0]["message"]["content"].strip()
+
+    def _store_response_usage(self, payload: dict[str, object]) -> None:
+        """Keep provider token usage together with the real HTTP attempt count."""
+        previous = self.last_usage
+        request_count = previous.get("request_count") if isinstance(previous, dict) else None
+        provider_usage = payload.get("usage")
+        usage = dict(provider_usage) if isinstance(provider_usage, dict) else {}
+        if isinstance(request_count, int) and request_count > 0:
+            usage["request_count"] = request_count
+        self.last_usage = usage
 
     def _post_openrouter(self, build_payload):
         """POST to OpenRouter, retrying transient rate-limit/5xx responses."""
         import httpx
 
+        # Thread-local because one shared client can verify VQA candidates in
+        # parallel. A missing key/model or image validation failure therefore
+        # correctly reports zero HTTP requests rather than one logical call.
+        self.last_usage = {"request_count": 0}
         if not self.openrouter_api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not set in .env.")
         if not self.openrouter_model:
@@ -178,6 +265,7 @@ class VllmChatClient:
         for attempt in range(max_attempts):
             retry_after = None
             try:
+                self.last_usage = {"request_count": attempt + 1}
                 response = client.post("/chat/completions", json=payload)
                 if response.status_code in _RETRY_STATUS and attempt < max_attempts - 1:
                     last_error = httpx.HTTPStatusError(
@@ -205,13 +293,19 @@ class VllmChatClient:
     def _load_openrouter_client(self):
         if self._openrouter_client is not None:
             return self._openrouter_client
-        import httpx
+        with self._openrouter_client_lock:
+            if self._openrouter_client is not None:
+                return self._openrouter_client
+            import httpx
 
-        limits = httpx.Limits(max_connections=32, max_keepalive_connections=32)
-        headers = {"Authorization": f"Bearer {self.openrouter_api_key}"}
-        self._openrouter_client = httpx.Client(
-            base_url=self.openrouter_base_url, timeout=self.timeout, limits=limits, headers=headers
-        )
+            limits = httpx.Limits(max_connections=32, max_keepalive_connections=32)
+            headers = {"Authorization": f"Bearer {self.openrouter_api_key}"}
+            self._openrouter_client = httpx.Client(
+                base_url=self.openrouter_base_url,
+                timeout=self.timeout,
+                limits=limits,
+                headers=headers,
+            )
         return self._openrouter_client
 
 

@@ -23,10 +23,10 @@ Bạn có các công cụ sau:
 ## Định dạng JSON (Luôn trả về JSON hợp lệ)
 
 - Khi cần gọi tool:
-{{"thought": "Câu hỏi hỏi về tên xã, mình cần đọc chữ trong ảnh để tìm tên", "action": "ocr", "action_input": {{"image_path": "file.jpg"}}}}
+{"thought": "Câu hỏi hỏi về tên xã, mình cần đọc chữ trong ảnh để tìm tên", "action": "ocr", "action_input": {"image_path": "file.jpg"}}
 
 - Khi đã có thông tin để trả lời:
-{{"thought": "Kết quả OCR trả về có nhắc đến 'Xã Diên Điền', vậy đây là đáp án", "answer": "Xã Diên Điền", "finished": true}}
+{"thought": "Kết quả OCR trả về có nhắc đến 'Xã Diên Điền', vậy đây là đáp án", "answer": "Xã Diên Điền", "finished": true}
 """
 
 

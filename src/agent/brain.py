@@ -88,10 +88,22 @@ def parse_brain_response(text: str) -> BrainResponse:
     json_match = re.search(r"\{.*\}", text, re.DOTALL)
     if not json_match:
         return BrainResponse(answer=text.strip(), finished=True)
+    candidate = json_match.group()
     try:
-        data = json.loads(json_match.group())
+        data = json.loads(candidate)
     except json.JSONDecodeError:
-        return BrainResponse(answer=text.strip(), finished=True)
+        # Older prompt versions accidentally demonstrated JSON as ``{{...}}``.
+        # Some models copy that shape verbatim, so unwrap one redundant brace
+        # pair before falling back to treating the response as plain text.
+        if candidate.startswith("{{") and candidate.endswith("}}"):
+            try:
+                # The old example doubled *every* object brace, including a
+                # nested ``action_input`` object, not only the outer pair.
+                data = json.loads(candidate.replace("{{", "{").replace("}}", "}"))
+            except json.JSONDecodeError:
+                return BrainResponse(answer=text.strip(), finished=True)
+        else:
+            return BrainResponse(answer=text.strip(), finished=True)
     if data.get("finished") or data.get("answer"):
         return BrainResponse(
             thought=data.get("thought", ""), answer=data.get("answer", ""), finished=True

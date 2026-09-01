@@ -22,6 +22,13 @@ class TestParseBrainResponse:
         assert result.action == "caption"
         assert result.action_input == {"image_path": "f.jpg"}
 
+    def test_double_wrapped_action_is_unwrapped(self) -> None:
+        text = '{{"thought": "look", "action": "caption", "action_input": {{"image_path": "guessed.jpg"}}}}'
+        result = parse_brain_response(text)
+        assert result.finished is False
+        assert result.action == "caption"
+        assert result.action_input == {"image_path": "guessed.jpg"}
+
     def test_no_json_is_final_answer(self) -> None:
         result = parse_brain_response("I think the answer is 42")
         assert result.finished is True
@@ -104,14 +111,18 @@ class TestAgentLoop:
     def test_answer_runs_tool_then_finishes(self) -> None:
         brain = MagicMock()
         brain.reason.side_effect = [
-            BrainResponse(action="ocr", action_input={}, finished=False),
+            BrainResponse(
+                action="ocr",
+                action_input={"image_path": "hallucinated-frame.jpg"},
+                finished=False,
+            ),
             BrainResponse(answer="done", finished=True),
         ]
         tool = MagicMock()
         tool.run.return_value = "ocr text"
         agent = Agent(brain=brain, tools={"ocr": tool})
         assert agent.answer(shot=_shot(), question="q") == "done"
-        # image_path auto-injected from the shot's centre frame
+        # A model-proposed path is replaced by the shot's real centre frame.
         assert tool.run.call_args.kwargs["image_path"] == "/tmp/f1.jpg"
 
     def test_answer_context_reaches_brain(self) -> None:

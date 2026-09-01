@@ -106,10 +106,10 @@ class Agent:
                 raw = response.action_input
                 tool_input = dict(raw) if isinstance(raw, dict) else {}
 
-                # Luôn gắn image_path mặc định nếu tool cần ảnh và chưa có
+                # The model only sees text metadata and may invent a basename.
+                # Always use the validated shot's real centre frame path.
                 if response.action in ("caption", "ocr"):
-                    if "image_path" not in tool_input or not tool_input["image_path"]:
-                        tool_input["image_path"] = first_frame_path
+                    tool_input["image_path"] = first_frame_path
                     # Truyền câu hỏi làm prompt cho caption
                     if response.action == "caption":
                         tool_input["prompt"] = question
