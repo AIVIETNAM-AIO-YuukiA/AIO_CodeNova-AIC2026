@@ -21,6 +21,39 @@ import numpy as np
 LOGGER = get_logger(__name__)
 
 
+def _parse_json_bool(value: object, *, field: str, default: bool | None) -> bool | None:
+    """Accept JSON booleans only; avoid Python's ``bool("false")`` trap."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field} must be a boolean")
+
+
+def _attach_nested_frame_image_urls(value: object) -> None:
+    """Add ``image_url`` to nested frame references in a JSON response."""
+    if isinstance(value, list):
+        for item in value:
+            _attach_nested_frame_image_urls(item)
+        return
+    if not isinstance(value, dict):
+        return
+
+    frame_path = value.get("frame_path")
+    if isinstance(frame_path, str) and frame_path:
+        value.setdefault("image_url", f"/frame?path={quote(frame_path)}")
+
+    frame_paths = value.get("frame_paths")
+    if isinstance(frame_paths, list):
+        value.setdefault(
+            "image_urls",
+            [f"/frame?path={quote(fp)}" for fp in frame_paths if isinstance(fp, str) and fp],
+        )
+
+    for nested in value.values():
+        _attach_nested_frame_image_urls(nested)
+
+
 def warmup_models(reranker, experiment: Experiment, retriever=None) -> None:
     """Pre-load heavy models before the server starts accepting requests.
 
@@ -333,9 +366,34 @@ def handle_vqa_search(
 ) -> dict:
     """Process /api/vqa-search."""
     top_k = int(payload.get("top_k") or default_top_k)
+    if not 1 <= top_k <= 100:
+        raise ValueError("top_k must be between 1 and 100")
     req_reranker_top_k = payload.get("reranker_top_k")
     req_reranker_top_k = int(req_reranker_top_k) if req_reranker_top_k else None
+    if req_reranker_top_k is not None and not 1 <= req_reranker_top_k <= 100:
+        raise ValueError("reranker_top_k must be between 1 and 100")
     vqa_backend = payload.get("vqa_backend", "local")
+    enabled_models = payload.get("enabled_models")
+    if enabled_models is not None and not isinstance(enabled_models, list):
+        raise ValueError("enabled_models must be an array")
+    if isinstance(enabled_models, list):
+        enabled_models = list(
+            dict.fromkeys(str(model).strip() for model in enabled_models if str(model).strip())
+        )
+        if not enabled_models:
+            raise ValueError("enabled_models must contain at least one model")
+    use_reranker = _parse_json_bool(
+        payload.get("use_reranker"), field="use_reranker", default=None
+    )
+    use_llm = _parse_json_bool(
+        payload.get("use_llm"), field="use_llm", default=True
+    )
+    pipeline_mode = str(payload.get("pipeline_mode") or "grounded").strip().lower()
+    if pipeline_mode not in {"grounded", "legacy"}:
+        raise ValueError("pipeline_mode must be 'grounded' or 'legacy'")
+    reranker_requested = (
+        use_reranker if use_reranker is not None else req_reranker_top_k is not None
+    )
 
     result = vqa_search(
         experiment=experiment,
@@ -343,13 +401,15 @@ def handle_vqa_search(
         question=str(payload.get("question", "")),
         context=str(payload.get("context", "")),
         top_k=top_k,
-        reranker=reranker if req_reranker_top_k else None,
+        reranker=reranker if reranker_requested else None,
         reranker_top_k=req_reranker_top_k or reranker_top_k,
         vqa_backend=vqa_backend,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
+        pipeline_mode=pipeline_mode,
     )
-    for r in result.get("results", []):
-        if r.get("frame_path"):
-            r["image_url"] = f"/frame?path={quote(r['frame_path'])}"
+    _attach_nested_frame_image_urls(result)
     return result
 
 

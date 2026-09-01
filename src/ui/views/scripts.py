@@ -146,6 +146,7 @@ APP_JS = r"""
     form.querySelector("label[for=query]").style.display = usesEvents || is2Stage ? "none" : "";
     eid("question").style.display = isV ? "" : "none";
     form.querySelector("label[for=question]").style.display = isV ? "" : "none";
+    eid("vqa-pipeline-control").style.display = isV ? "" : "none";
     eid("top-k").style.display = isT || is2Stage ? "none" : "";
     form.querySelector("label[for=top-k]").style.display = isT || is2Stage ? "none" : "";
     EVENTS_SEC.style.display = usesEvents ? "" : "none";
@@ -167,9 +168,19 @@ APP_JS = r"""
     resultsEl.innerHTML = ""; answerBox.innerHTML = ""; pipelineBox.innerHTML = ""; eventsEl.innerHTML = "";
     sidebarAnswer.style.display = "none";
     const track = form.track.value;
+    const enabledModels = getEnabledModels();
+    const embeddingTracks = new Set([
+      "textual_kis", "vqa", "trake", "intelligent", "temporal_enhanced"
+    ]);
+    if (embeddingTracks.has(track) && enabledModels.length === 0) {
+      statusEl.className = "status warn";
+      statusEl.textContent = "Select at least one embedding model.";
+      submitEl.disabled = false;
+      return;
+    }
     let endpoint, payload;
     const globalParams = {
-      enabled_models: getEnabledModels(),
+      enabled_models: enabledModels,
       use_reranker: eid("use-reranker").checked,
       use_llm: eid("use-llm").checked,
     };
@@ -192,7 +203,14 @@ APP_JS = r"""
       endpoint = "/api/kis-detail-2stage"; payload = { general, specific, ...globalParams };
     } else if (track === "vqa") {
       endpoint = "/api/vqa-search";
-      payload = { query: form.query.value, context: form.context.value, question: form.question.value, top_k: Number(form["top_k"].value||20), ...globalParams };
+      payload = {
+        query: form.query.value,
+        context: form.context.value,
+        question: form.question.value,
+        top_k: Number(form["top_k"].value||20),
+        pipeline_mode: eid("vqa-pipeline-mode").value,
+        ...globalParams
+      };
     } else if (track === "asr_search" || track === "ocr_search") {
       endpoint = track === "asr_search" ? "/api/asr-search" : "/api/ocr-search";
       payload = { query: form.query.value, top_k: 300, ...globalParams };
@@ -222,28 +240,14 @@ APP_JS = r"""
       });
       const data = await response.json();
       if (!response.ok || data.error) {
-        throw new Error(data.error || "Search failed");
+        const detail = typeof data.detail === "string"
+          ? data.detail
+          : (data.detail ? JSON.stringify(data.detail) : "");
+        throw new Error(data.error || detail || "Search failed");
       }
 
-      if (track === "vqa" && data.agent_error) {
-        statusEl.className = "status warn";
-        statusEl.textContent = "Agent failed (see error below)";
-        answerBox.innerHTML = `<div class="answer-box" style="border-color:#e55;background:#fff5f5">
-          <div class="label" style="color:#c00">Agent Error</div>
-          <div class="answer-text" style="color:#c00;font-size:13px;font-family:monospace">${escapeHtml(data.agent_error)}</div>
-        </div>`;
-        renderPipeline(data);
-        renderResults(data.results || []);
-        return;
-      }
-
-      if (track === "vqa" && data.answer) {
-        statusEl.innerHTML = `<strong>Answer received</strong> via 3-stage pipeline <span class="pill">VQA</span>`;
-        renderAnswer(data.answer);
-        renderPipeline(data);
-        renderResults(data.results || []);
-        sidebarAnswer.style.display = "block";
-        sidebarAnswerText.textContent = data.answer;
+      if (track === "vqa") {
+        renderVqaResponse(data);
       } else if (track === "trake" || track === "temporal_enhanced") {
         if (data.videos) {
           const chains = data.videos || [];
@@ -298,16 +302,159 @@ APP_JS = r"""
     }
   });
 
-    function renderAnswer(answer) {
+    function renderAnswer(answer, data = {}) {
+      const confidence = data.answer_confidence == null ? NaN : Number(data.answer_confidence);
+      const confidenceText = Number.isFinite(confidence)
+        ? `<span class="pill">Confidence ${(confidence * 100).toFixed(0)}%</span>`
+        : "";
+      const selected = data.selected_candidate || {};
+      const selectedName = cleanVideoName(selected.video_name || selected.video_id || "");
+      const hasMoment = selected.start_sec != null || selected.end_sec != null;
+      const selectedText = selectedName
+        ? `<span><strong>${escapeHtml(selectedName)}</strong>${hasMoment ? ` &middot; ${formatTime(selected.start_sec)}&ndash;${formatTime(selected.end_sec)}` : ""}</span>`
+        : "";
+      const evidenceSummary = data.answer_evidence_summary
+        ? `<div style="margin-top:8px;font-size:12px;color:var(--muted);">${escapeHtml(data.answer_evidence_summary)}</div>`
+        : "";
       answerBox.innerHTML = `
         <div class="answer-box">
           <div class="label">Answer</div>
           <div class="answer-text">${escapeHtml(answer)}</div>
+          ${evidenceSummary}
+          ${(confidenceText || selectedText) ? `<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;font-size:12px;color:var(--muted);">${confidenceText}${selectedText}</div>` : ""}
         </div>`;
+    }
+
+    function isGroundedVqaResponse(data) {
+      const pipeline = data.pipeline || {};
+      return data.pipeline_mode === "grounded"
+        || Object.prototype.hasOwnProperty.call(pipeline, "query_planning")
+        || Object.prototype.hasOwnProperty.call(pipeline, "event_retrieval")
+        || Object.prototype.hasOwnProperty.call(pipeline, "evidence_selection")
+        || Object.prototype.hasOwnProperty.call(pipeline, "candidate_verification")
+        || Object.prototype.hasOwnProperty.call(pipeline, "final_verification");
+    }
+
+    function renderVqaResponse(data) {
+      const isGrounded = isGroundedVqaResponse(data);
+      const answerStatus = data.answer_status || (data.answer ? "answered" : "no_candidates");
+      const labels = {
+        answered: isGrounded ? "Grounded answer received" : "Answer received",
+        insufficient_evidence: "Insufficient evidence",
+        no_candidates: "No grounded candidate found",
+        degraded: "VQA completed in degraded mode",
+      };
+      const confidence = data.answer_confidence == null ? NaN : Number(data.answer_confidence);
+      const confidenceNote = Number.isFinite(confidence)
+        ? ` | confidence ${(confidence * 100).toFixed(0)}%`
+        : "";
+      statusEl.className = answerStatus === "answered" ? "status" : "status warn";
+      statusEl.innerHTML = `<strong>${escapeHtml(labels[answerStatus] || "VQA completed")}</strong>`
+        + ` <span class="pill">${isGrounded ? "Grounded multi-frame VQA" : "Legacy VQA"}</span>${escapeHtml(confidenceNote)}`;
+
+      const fallback = answerStatus === "insufficient_evidence"
+        ? "Ch\u01b0a \u0111\u1ee7 b\u1eb1ng ch\u1ee9ng \u0111\u1ec3 x\u00e1c \u0111\u1ecbnh c\u00e2u tr\u1ea3 l\u1eddi."
+        : "No grounded answer available.";
+      renderAnswer(data.answer || fallback, data);
+      if (data.agent_error) {
+        answerBox.insertAdjacentHTML("beforeend", `<div style="margin-top:8px;padding:9px 11px;border:1px solid #e55;border-radius:7px;background:#fff5f5;color:#c00;font-size:12px;font-family:monospace;">VQA verification warning: ${escapeHtml(data.agent_error)}</div>`);
+      }
+
+      renderVqaEvidence(data);
+      renderPipeline(data);
+      renderResults(data.results || []);
+      if (data.answer) {
+        sidebarAnswer.style.display = "block";
+        sidebarAnswerText.textContent = data.answer;
+      }
+    }
+
+    function renderVqaEvidence(data) {
+      const selected = data.selected_candidate || {};
+      const rawEvidence = data.evidence_frames || selected.evidence_frames || [];
+      const rawCandidates = data.candidate_answers || [];
+      const evidence = Array.isArray(rawEvidence) ? rawEvidence : [];
+      const candidates = Array.isArray(rawCandidates) ? rawCandidates : [];
+      if (!evidence.length && !candidates.length) {
+        eventsEl.innerHTML = "";
+        return;
+      }
+
+      const evidenceHtml = evidence.length ? `
+        <div style="margin-bottom:12px;font-weight:700;">Evidence frames</div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;">
+          ${evidence.map((frame, i) => `
+            <article style="border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--panel);">
+              <img src="${escapeHtml(frame.image_url || "")}" alt="Evidence frame ${i + 1}" loading="lazy" style="width:100%;aspect-ratio:16/9;object-fit:cover;display:block;">
+              <div style="padding:8px;font-size:12px;line-height:1.4;">
+                <strong>${escapeHtml(frame.evidence_label || `F${i + 1}`)}</strong> &middot; ${formatTime(frame.timestamp_sec || 0)}
+                ${frame.role ? `<div style="color:var(--muted);">${escapeHtml(frame.role)}</div>` : ""}
+                ${frame.frame_id ? `<div style="color:var(--muted);overflow-wrap:anywhere;">${escapeHtml(frame.frame_id)}</div>` : ""}
+              </div>
+            </article>`).join("")}
+        </div>` : "";
+
+      const candidatesHtml = candidates.length ? `
+        <details style="margin-top:14px;">
+          <summary style="cursor:pointer;font-weight:700;">Candidate verification (${candidates.length})</summary>
+          <div style="display:grid;gap:8px;margin-top:8px;">
+            ${candidates.map((candidate, i) => {
+              const c = candidate || {};
+              const score = c.confidence == null ? NaN : Number(c.confidence);
+              const scoreText = Number.isFinite(score) ? `${(score * 100).toFixed(0)}%` : "N/A";
+              const name = cleanVideoName(c.video_name || c.video_id || c.candidate_id || `Candidate ${i + 1}`);
+              const contradictions = Array.isArray(c.contradictions) ? c.contradictions : [];
+              const candidateFrames = Array.isArray(c.evidence_frames) ? c.evidence_frames : [];
+              return `<div style="padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px;line-height:1.45;">
+                <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
+                  <strong>#${i + 1} ${escapeHtml(name)}</strong>
+                  <span class="pill">${escapeHtml(c.verdict || "unknown")} &middot; ${scoreText}</span>
+                </div>
+                <div style="margin-top:5px;"><strong>${escapeHtml(c.answer || "No answer")}</strong></div>
+                ${c.evidence_summary ? `<div style="color:var(--muted);margin-top:3px;">${escapeHtml(c.evidence_summary)}</div>` : ""}
+                ${c.error ? `<div style="color:var(--warn);margin-top:3px;">Verifier error: ${escapeHtml(c.error)}</div>` : ""}
+                ${contradictions.length ? `<div style="color:var(--warn);margin-top:3px;">Contradictions: ${escapeHtml(contradictions.join("; "))}</div>` : ""}
+                ${candidateFrames.length ? `<div style="display:flex;gap:5px;margin-top:7px;overflow-x:auto;">${candidateFrames.slice(0, 6).map(frame => `<img src="${escapeHtml(frame.image_url || "")}" title="${escapeHtml(frame.frame_id || "")}" loading="lazy" style="width:92px;height:52px;object-fit:cover;border:1px solid var(--line);border-radius:4px;">`).join("")}</div>` : ""}
+              </div>`;
+            }).join("")}
+          </div>
+        </details>` : "";
+
+      eventsEl.innerHTML = `<div style="margin-bottom:18px;padding:14px;border:1px solid var(--line);border-radius:10px;background:#fafafa;">${evidenceHtml}${candidatesHtml}</div>`;
     }
 
     function renderPipeline(data) {
       const pipeline = data.pipeline || {};
+      const isGrounded = isGroundedVqaResponse(data);
+      if (isGrounded) {
+        const plan = pipeline.query_planning || {};
+        const retrieval = pipeline.event_retrieval || {};
+        const selection = pipeline.evidence_selection || {};
+        const verification = pipeline.candidate_verification || {};
+        const finalVerification = pipeline.final_verification || {};
+        const eventCount = plan.event_count ?? plan.events?.length ?? data.query_plan?.events?.length ?? 0;
+        const candidateCount = retrieval.candidate_count ?? verification.candidate_count ?? data.candidate_answers?.length ?? 0;
+        const evidenceCount = selection.frame_count ?? selection.evidence_frame_count ?? data.evidence_frames?.length ?? 0;
+        const supportedCount = verification.supported_count ?? (data.candidate_answers || []).filter(c => c.verdict === "supported").length;
+        const groundedStages = [
+          { label: "Query Planning", desc: `${eventCount} ordered event(s) &middot; ${escapeHtml(plan.mode || plan.routing_mode || (plan.llm_used ? "LLM" : "heuristic"))}` },
+          { label: "Ordered-event Retrieval", desc: `${candidateCount} candidate moment(s) retrieved` },
+          { label: "Evidence Selection", desc: `${evidenceCount} evidence frame(s) selected` },
+          { label: "Candidate Verification", desc: `${supportedCount} supported candidate(s)` },
+          { label: "Final Verification", desc: `${escapeHtml(finalVerification.status || data.answer_status || "completed")} &middot; confidence ${Number(data.answer_confidence || 0).toFixed(2)}` },
+        ];
+        const finalError = finalVerification.error
+          ? `<div style="margin-top:8px;color:var(--warn);"><strong>Final verifier error:</strong> ${escapeHtml(finalVerification.error)}</div>`
+          : "";
+        pipelineBox.innerHTML = `
+          <button class="pipeline-toggle" onclick="togglePipeline()">Show Grounded VQA Pipeline</button>
+          <div id="pipeline-detail" class="pipeline-detail">
+            ${groundedStages.map((s, i) => `<div style="margin-bottom:8px;"><strong>Stage ${i + 1}: ${s.label}</strong><br>${s.desc}</div>`).join("")}
+            ${finalError}
+            ${data.reasoning ? `<hr style="margin:10px 0;border-color:var(--line);"><div><strong>Reasoning:</strong></div><code>${escapeHtml(data.reasoning)}</code>` : ""}
+          </div>`;
+        return;
+      }
       const hasAgent = pipeline.agent;
       const stages = hasAgent ? [
         { key: "embed_search", label: "Embedding Search", desc: `Top-${pipeline.embed_search?.top_k} frames retrieved` },

@@ -30,6 +30,7 @@ from ui.api import (
     handle_vqa_search,
 )
 from ui.views.page import INDEX_HTML
+from ui.views.sidebar import render_model_checkboxes
 
 LOGGER = get_logger(__name__)
 
@@ -271,9 +272,14 @@ def build_handler(
                         payload, experiment, default_top_k, reranker, reranker_top_k
                     )
                     self._send_json(res)
-                except Exception as exc:
-                    LOGGER.exception("VQA search failed")
+                except ValueError as exc:
                     self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except Exception:
+                    LOGGER.exception("VQA search failed")
+                    self._send_json(
+                        {"error": "VQA request failed"},
+                        status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                    )
                 return
 
             if parsed.path == "/api/agent/chat":
@@ -398,5 +404,9 @@ def _render_index_html(experiment: Experiment, default_top_k: int) -> str:
         .replace(
             "__ACTIVE_MODELS__",
             html_lib.escape(", ".join(experiment.config.embedding_models)),
+        )
+        .replace(
+            "__MODEL_CHECKBOXES__",
+            render_model_checkboxes(experiment.config.embedding_models),
         )
     )

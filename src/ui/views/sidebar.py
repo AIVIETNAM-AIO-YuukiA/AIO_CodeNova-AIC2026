@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import os
 
 _RERANKER_LABELS = {
@@ -12,6 +13,29 @@ _RERANKER_LABELS = {
 _RERANKER_LABEL = _RERANKER_LABELS.get(
     os.environ.get("RERANKER_BACKEND", "blip2").strip().lower(), "Rerank BLIP-2"
 )
+
+_MODEL_LABELS = {
+    "jina-clip-v2": "Jina-CLIP-v2",
+    "siglip2-so400m": "SigLIP2",
+    "vietnamese-embedding": "Vietnamese-Embed",
+    "beit3-large": "BEiT-3",
+}
+
+
+def render_model_checkboxes(model_names: tuple[str, ...] | list[str]) -> str:
+    """Render only the embedding models persisted by the active experiment."""
+    controls: list[str] = []
+    for model_name in model_names:
+        escaped_name = html.escape(str(model_name), quote=True)
+        label = html.escape(_MODEL_LABELS.get(str(model_name), str(model_name)))
+        controls.append(
+            '<label class="chip-item">'
+            f'<input type="checkbox" name="model_{escaped_name}" checked>'
+            f'<span class="chip-badge">{label}</span>'
+            "</label>"
+        )
+    return "".join(controls)
+
 
 SIDEBAR_HTML = r"""  <aside>
     <form id="search-form">
@@ -43,18 +67,7 @@ SIDEBAR_HTML = r"""  <aside>
             <span class="config-card-title">🧬 Vector Embedding Models</span>
           </div>
           <div class="chips-group">
-            <label class="chip-item">
-              <input type="checkbox" name="model_jina-clip-v2" checked>
-              <span class="chip-badge">Jina-CLIP-v2</span>
-            </label>
-            <label class="chip-item">
-              <input type="checkbox" name="model_siglip2-so400m" checked>
-              <span class="chip-badge">SigLIP2</span>
-            </label>
-            <label class="chip-item">
-              <input type="checkbox" name="model_vietnamese-embedding" checked>
-              <span class="chip-badge">Vietnamese-Embed</span>
-            </label>
+            __MODEL_CHECKBOXES__
           </div>
         </div>
 
@@ -88,6 +101,15 @@ SIDEBAR_HTML = r"""  <aside>
 
         <label for="question">Question</label>
         <textarea id="question" name="question" placeholder="Use this for VQA or QA tracks"></textarea>
+
+        <div id="vqa-pipeline-control" style="display:none;margin-top:10px;">
+          <label for="vqa-pipeline-mode">VQA Pipeline</label>
+          <select id="vqa-pipeline-mode" name="vqa_pipeline_mode">
+            <option value="grounded" selected>Grounded multi-frame</option>
+            <option value="legacy">Legacy single-shot</option>
+          </select>
+          <div class="hint" style="margin-top:4px;font-size:12px;">Legacy chỉ dùng để rollback/chẩn đoán.</div>
+        </div>
       </div>
 
       <div id="events-section" style="display:none;">

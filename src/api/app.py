@@ -21,6 +21,7 @@ from core.logging import get_logger
 from ui.api import ensure_manifests
 from ui.server import _validate_experiment_for_serving, _warmup_models
 from ui.views.page import INDEX_HTML
+from ui.views.sidebar import render_model_checkboxes
 
 LOGGER = get_logger(__name__)
 
@@ -28,8 +29,17 @@ LOGGER = get_logger(__name__)
 def _render_index_html(experiment: Experiment, default_top_k: int) -> str:
     import html as html_lib
 
-    return INDEX_HTML.replace('value="20"', f'value="{default_top_k}"').replace(
-        "__ACTIVE_EXPERIMENT__", html_lib.escape(experiment.name)
+    return (
+        INDEX_HTML.replace('value="20"', f'value="{default_top_k}"')
+        .replace("__ACTIVE_EXPERIMENT__", html_lib.escape(experiment.name))
+        .replace(
+            "__ACTIVE_MODELS__",
+            html_lib.escape(", ".join(experiment.config.embedding_models)),
+        )
+        .replace(
+            "__MODEL_CHECKBOXES__",
+            render_model_checkboxes(experiment.config.embedding_models),
+        )
     )
 
 
