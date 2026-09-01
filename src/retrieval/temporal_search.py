@@ -62,7 +62,7 @@ def temporal_search_forward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
-        frame_records: Danh sách metadata frame để check video_id (optional).
+        frame_records: Metadata frame để chặn ranh giới video/shot (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -75,13 +75,19 @@ def temporal_search_forward(
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
     start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
+    start_shot_id = frame_records[start_idx].get("shot_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx + 1, n):
-        # Chặn nếu chuyển sang video khác
-        if frame_records and frame_records[idx].get("video_id") != start_video_id:
-            return idx - 1
+        # Không để một segment vô tình đi xuyên video hoặc shot khác.
+        if frame_records:
+            current_record = frame_records[idx]
+            if (
+                current_record.get("video_id") != start_video_id
+                or current_record.get("shot_id") != start_shot_id
+            ):
+                return idx - 1
 
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
@@ -105,7 +111,7 @@ def temporal_search_backward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
-        frame_records: Danh sách metadata frame để check video_id (optional).
+        frame_records: Metadata frame để chặn ranh giới video/shot (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -117,13 +123,19 @@ def temporal_search_backward(
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
     start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
+    start_shot_id = frame_records[start_idx].get("shot_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx - 1, -1, -1):
-        # Chặn nếu chuyển sang video khác
-        if frame_records and frame_records[idx].get("video_id") != start_video_id:
-            return idx + 1
+        # Không để một segment vô tình đi xuyên video hoặc shot khác.
+        if frame_records:
+            current_record = frame_records[idx]
+            if (
+                current_record.get("video_id") != start_video_id
+                or current_record.get("shot_id") != start_shot_id
+            ):
+                return idx + 1
 
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
@@ -179,7 +191,15 @@ def find_segments(
     merged: list[tuple[int, int, int]] = [raw_segments[0]]
     for start, end, center in raw_segments[1:]:
         prev_start, prev_end, prev_center = merged[-1]
-        if start <= prev_end + min_gap:
+        same_group = True
+        if frame_records:
+            previous_record = frame_records[prev_center]
+            current_record = frame_records[center]
+            same_group = (
+                previous_record.get("video_id") == current_record.get("video_id")
+                and previous_record.get("shot_id") == current_record.get("shot_id")
+            )
+        if same_group and start <= prev_end + min_gap:
             new_start = min(prev_start, start)
             new_end = max(prev_end, end)
             merged[-1] = (new_start, new_end, prev_center)

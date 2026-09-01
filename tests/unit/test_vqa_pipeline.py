@@ -115,6 +115,7 @@ class TestVqaSearch:
                 question="What color is the shirt?",
                 context="outdoor scene",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert "answer" in result
@@ -143,6 +144,7 @@ class TestVqaSearch:
                 query="nothing",
                 question="Any?",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert result["answer"] == "No relevant frames found."
@@ -164,7 +166,45 @@ class TestVqaSearch:
                 query="test",
                 question="Q?",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert "Could not find" in result["answer"] or "not" in result["answer"]
         assert len(result["results"]) == 5
+
+    def test_grounded_mode_propagates_controls_and_never_falls_back_to_react(
+        self, mock_experiment
+    ):
+        from retrieval.vqa import vqa_search
+
+        abstention = {
+            "answer": "Chưa đủ bằng chứng để xác định X.",
+            "answer_status": "insufficient_evidence",
+            "results": [],
+        }
+        with (
+            patch("retrieval.vqa._get_retriever", return_value=object()),
+            patch(
+                "retrieval.grounded_vqa.grounded_vqa_search",
+                return_value=abstention,
+            ) as grounded_search,
+            patch("retrieval.vqa.create_agent") as create_agent,
+        ):
+            result = vqa_search(
+                experiment=mock_experiment,
+                query="đặt bốn con X lên đĩa",
+                question="X là con gì?",
+                top_k=50,
+                enabled_models=["siglip2-large"],
+                use_reranker=False,
+                use_llm=False,
+                pipeline_mode="grounded",
+            )
+
+        assert result["answer_status"] == "insufficient_evidence"
+        assert result["pipeline_mode"] == "grounded"
+        create_agent.assert_not_called()
+        assert grounded_search.call_args.kwargs["top_k"] == 50
+        assert grounded_search.call_args.kwargs["enabled_models"] == ["siglip2-large"]
+        assert grounded_search.call_args.kwargs["use_reranker"] is False
+        assert grounded_search.call_args.kwargs["use_llm"] is False

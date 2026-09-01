@@ -84,6 +84,31 @@ def test_find_segments_separate() -> None:
     assert len(segments) >= 2
 
 
+def test_find_segments_does_not_merge_different_shots() -> None:
+    embeddings = np.ones((6, 8), dtype="float32")
+    embeddings /= np.linalg.norm(embeddings, axis=1, keepdims=True)
+    records = [
+        {
+            "frame_id": f"f{index}",
+            "video_id": "v1",
+            "shot_id": "s1" if index < 3 else "s2",
+        }
+        for index in range(6)
+    ]
+
+    segments = find_segments(
+        [2, 3],
+        embeddings,
+        frame_records=records,
+        tolerance_threshold=2,
+        min_gap=2,
+    )
+
+    assert len(segments) == 2
+    assert (segments[0]["start_pos"], segments[0]["end_pos"]) == (0, 2)
+    assert (segments[1]["start_pos"], segments[1]["end_pos"]) == (3, 5)
+
+
 def test_gather_frame_s_returns_shot_input() -> None:
     records = [
         {

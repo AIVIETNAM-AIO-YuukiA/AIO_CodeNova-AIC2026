@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+from threading import Lock
 
 import numpy as np
 
@@ -31,14 +32,31 @@ LOGGER = logging.getLogger(__name__)
 # event within a multi-event TRAKE query, exhausts a small GPU within a couple
 # of searches, so keep one instance per experiment.
 _RETRIEVER_CACHE: dict[str, object] = {}
+_RETRIEVER_CACHE_LOCK = Lock()
+
+
+def _retriever_cache_key(experiment: Experiment) -> str:
+    """Identify the concrete persisted run, not only its display name."""
+    try:
+        config_hash = experiment.config.config_hash()
+    except (AttributeError, TypeError):
+        config_hash = "unknown"
+    return f"{experiment.run_dir.resolve()}::{config_hash}"
 
 
 def _get_retriever(experiment: Experiment):
     """Return a cached retriever for ``experiment``, building it on first use."""
-    cached = _RETRIEVER_CACHE.get(experiment.name)
-    if cached is None:
-        cached = build_retriever(experiment)
-        _RETRIEVER_CACHE[experiment.name] = cached
+    cache_key = _retriever_cache_key(experiment)
+    cached = _RETRIEVER_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    # UI requests are threaded. Building the same multi-GB retriever twice can
+    # exhaust VRAM, so serialize only the cold initialization path.
+    with _RETRIEVER_CACHE_LOCK:
+        cached = _RETRIEVER_CACHE.get(cache_key)
+        if cached is None:
+            cached = build_retriever(experiment)
+            _RETRIEVER_CACHE[cache_key] = cached
     return cached
 
 
@@ -48,6 +66,9 @@ def _run_temporal_pipeline(
     top_k: int = 20,
     reranker: Reranker | None = None,
     reranker_top_k: int = 10,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> dict:
     """Run embedding search, optional reranking, and temporal expansion.
 
@@ -64,7 +85,13 @@ def _run_temporal_pipeline(
 
     # Stage 1: fast bi-encoder retrieval via SigLIP + Qdrant.
     retriever = _get_retriever(experiment)
-    embed_results = retriever.search(query=query, top_k=top_k)
+    embed_results = retriever.search(
+        query=query,
+        top_k=top_k,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
+    )
     pipeline_stages["embed_search"] = {
         "top_k": top_k,
         "results_count": len(embed_results),
@@ -147,13 +174,16 @@ def _run_temporal_pipeline(
     query_embedding = embedder.embed_text(query)
 
     # Gather shot cho mỗi segment
+    video_names = {
+        result.video_id: result.video_name
+        for result in embed_results
+        if result.video_name
+    }
     shots = []
     for seg in segments:
         shot = gather_frame_s(seg, frame_records)
         if shot and shot.frame_count > 0:
-            # Gán video_name từ embedding search result đầu tiên
-            if embed_results:
-                shot.video_name = embed_results[0].video_name or ""
+            shot.video_name = video_names.get(shot.video_id, shot.video_name or shot.video_id)
             shots.append((shot, seg))
 
     pipeline_stages["gather_shot"] = {
@@ -192,7 +222,7 @@ def _cached_captions_context(experiment: Experiment, shot) -> str:
     return "\n".join(lines)
 
 
-def vqa_search(
+def _legacy_vqa_search(
     experiment: Experiment,
     query: str,
     question: str,
@@ -201,6 +231,9 @@ def vqa_search(
     reranker=None,
     reranker_top_k: int = 10,
     vqa_backend: str = "local",
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> dict:
     """VQA pipeline: Embedding search → (rerank) → temporal → shot validation → agent answer.
 
@@ -218,7 +251,14 @@ def vqa_search(
     """
     retrieval_text = f"{context} {query}".strip()
     data = _run_temporal_pipeline(
-        experiment, retrieval_text, top_k, reranker=reranker, reranker_top_k=reranker_top_k
+        experiment,
+        retrieval_text,
+        top_k,
+        reranker=reranker,
+        reranker_top_k=reranker_top_k,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
     )
     pipeline_stages = data.get("pipeline", {})
     embed_results = data.get("embed_results", [])
@@ -292,6 +332,66 @@ def vqa_search(
     }
     if agent_error:
         result["agent_error"] = agent_error
+    return result
+
+
+def vqa_search(
+    experiment: Experiment,
+    query: str,
+    question: str,
+    context: str = "",
+    top_k: int = 20,
+    reranker=None,
+    reranker_top_k: int = 10,
+    vqa_backend: str = "local",
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
+    pipeline_mode: str = "grounded",
+) -> dict:
+    """Run grounded multi-frame VQA, with an explicit legacy rollback mode.
+
+    ``top_k`` controls only how many retrieval cards are returned by the
+    grounded pipeline. Candidate recall uses a fixed internal pool so changing
+    the UI display count does not silently change which evidence answers the
+    question.
+    """
+    normalized_mode = pipeline_mode.strip().lower()
+    if normalized_mode not in {"grounded", "legacy"}:
+        raise ValueError("pipeline_mode must be 'grounded' or 'legacy'")
+    if normalized_mode == "legacy":
+        result = _legacy_vqa_search(
+            experiment=experiment,
+            query=query,
+            question=question,
+            context=context,
+            top_k=top_k,
+            reranker=reranker,
+            reranker_top_k=reranker_top_k,
+            vqa_backend=vqa_backend,
+            enabled_models=enabled_models,
+            use_reranker=use_reranker,
+            use_llm=use_llm,
+        )
+        result["pipeline_mode"] = "legacy"
+        return result
+
+    # Imported lazily to keep the existing retrieval import graph free of a
+    # vqa -> grounded_vqa -> text_search -> retrieval cycle during startup.
+    from retrieval.grounded_vqa import grounded_vqa_search
+
+    result = grounded_vqa_search(
+        experiment=experiment,
+        retriever=_get_retriever(experiment),
+        query=query,
+        question=question,
+        context=context,
+        top_k=top_k,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
+    )
+    result["pipeline_mode"] = "grounded"
     return result
 
 
