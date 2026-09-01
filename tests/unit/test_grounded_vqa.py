@@ -15,11 +15,14 @@ from retrieval.grounded_vqa import (
     GroundedVqaPipeline,
     GroundedVqaPlanner,
     VqaCandidateMoment,
+    VqaConstraint,
     VqaEvent,
     VqaQueryPlan,
     VqaVerification,
     _evidence_prompt,
     _heuristic_plan,
+    _normalize_text,
+    _union_variant_branches,
     _verification_from_payload,
     build_candidate_moments,
 )
@@ -71,19 +74,32 @@ def _conflicting_final_fixture() -> tuple[
 ]:
     plan = _plan()
     first_result = _result("f1", "v1", 10.0)
+    first_result_later = _result("f1-later", "v1", 11.0)
     second_result = _result("f2", "v2", 20.0)
+    second_result_later = _result("f2-later", "v2", 21.0)
     first = VqaCandidateMoment(
         candidate_id="c1",
         video_id="v1",
         video_name="v1.mp4",
         start_sec=10.0,
         end_sec=10.0,
-        event_hits=(EventHit(0, first_result, 1, 1.0),),
+        event_hits=(
+            EventHit(0, first_result, 1, 1.0),
+            EventHit(1, first_result_later, 1, 1.0),
+        ),
         event_coverage=1.0,
         chain_score=1.0,
         global_rank_score=1.0,
         retrieval_score=0.9,
-        evidence_frames=[{"frame_id": "f1", "frame_path": "f1.jpg"}],
+        required_event_coverage=1.0,
+        evidence_frames=[
+            {"frame_id": "f1", "frame_path": "f1.jpg", "timestamp_sec": 10.0},
+            {
+                "frame_id": "f1-later",
+                "frame_path": "f1-later.jpg",
+                "timestamp_sec": 11.0,
+            },
+        ],
     )
     second = VqaCandidateMoment(
         candidate_id="c2",
@@ -91,12 +107,23 @@ def _conflicting_final_fixture() -> tuple[
         video_name="v2.mp4",
         start_sec=20.0,
         end_sec=20.0,
-        event_hits=(EventHit(0, second_result, 1, 1.0),),
+        event_hits=(
+            EventHit(0, second_result, 1, 1.0),
+            EventHit(1, second_result_later, 1, 1.0),
+        ),
         event_coverage=1.0,
         chain_score=1.0,
         global_rank_score=1.0,
         retrieval_score=0.8,
-        evidence_frames=[{"frame_id": "f2", "frame_path": "f2.jpg"}],
+        required_event_coverage=1.0,
+        evidence_frames=[
+            {"frame_id": "f2", "frame_path": "f2.jpg", "timestamp_sec": 20.0},
+            {
+                "frame_id": "f2-later",
+                "frame_path": "f2-later.jpg",
+                "timestamp_sec": 21.0,
+            },
+        ],
     )
     verifications = [
         VqaVerification(
@@ -105,11 +132,12 @@ def _conflicting_final_fixture() -> tuple[
             answer="con nghêu",
             entity_type="food",
             confidence=0.9,
-            supporting_frame_ids=("f1",),
+            supporting_frame_ids=("f1", "f1-later"),
             matched_event_indices=(0, 1, 2),
             supported_constraints=plan.constraints,
             contradictions=(),
             evidence_summary="shellfish",
+            event_support={0: ("f1",), 1: ("f1-later",)},
         ),
         VqaVerification(
             candidate_id="c2",
@@ -117,11 +145,12 @@ def _conflicting_final_fixture() -> tuple[
             answer="nấm",
             entity_type="food",
             confidence=0.85,
-            supporting_frame_ids=("f2",),
+            supporting_frame_ids=("f2", "f2-later"),
             matched_event_indices=(0, 1, 2),
             supported_constraints=plan.constraints,
             contradictions=(),
             evidence_summary="mushroom",
+            event_support={0: ("f2",), 1: ("f2-later",)},
         ),
     ]
     return plan, [first, second], verifications
@@ -161,36 +190,94 @@ def test_evidence_prompt_keeps_asr_ocr_and_caption_sections() -> None:
     assert len(prompt) < 5000
 
 
-def test_explicit_unknown_uses_answer_neutral_guard_without_llm_call() -> None:
-    class FailingClient:
-        def complete_text(self, **kwargs):
-            raise AssertionError("The LLM must not receive an explicit unknown target")
+def test_explicit_unknown_is_masked_before_llm_translation() -> None:
+    class TranslatingClient:
+        last_usage = {}
+        user_prompt = ""
 
-    plan = GroundedVqaPlanner(client=FailingClient()).plan(
+        def complete_text(self, **kwargs):
+            self.user_prompt = kwargs["user_prompt"]
+            return json.dumps(
+                {
+                    "answer_guess": None,
+                    "answer_type": "food",
+                    "discriminative_cues": ["clam shell"],
+                    "events": [
+                        {
+                            "index": 0,
+                            "text_en": "woman placing four clam [TARGET] on a white plate",
+                            "text_vi": "ignored",
+                            "ocr_keywords": ["clam"],
+                            "asr_keywords": ["nghêu"],
+                            "answer_bearing": True,
+                        },
+                        {
+                            "index": 1,
+                            "text_en": "woman holding two [TARGET]",
+                            "text_vi": "ignored",
+                            "answer_bearing": True,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+
+    client = TranslatingClient()
+    plan = GroundedVqaPlanner(client=client).plan(
         query="Cô gái đặt 4 con X lên đĩa, sau đó cầm 2 con X.",
         question="X là con gì?",
         use_llm=True,
     )
 
-    assert plan.llm_status == "heuristic_target_guard"
-    assert plan.llm_calls == 0
+    assert plan.llm_status == "llm"
+    assert plan.llm_calls == 1
+    assert "[TARGET]" in client.user_prompt
+    assert "con X" not in client.user_prompt
     assert all("[TARGET]" in event.text_vi for event in plan.events)
+    assert "woman placing four [TARGET]" in plan.events[0].text_en
+    serialized_plan = json.dumps(plan.to_dict(), ensure_ascii=False).lower()
+    assert "clam" not in serialized_plan
+    assert "nghêu" not in serialized_plan
+    assert "nghêu" not in client.user_prompt.lower()
 
 
-def test_unknown_mentioned_only_in_question_still_blocks_planner_guess() -> None:
-    class FailingClient:
+def test_unknown_mentioned_only_in_question_is_bound_and_translated() -> None:
+    class TranslatingClient:
+        last_usage = {}
+
         def complete_text(self, **kwargs):
-            raise AssertionError("The LLM must not receive an explicit unknown target")
+            assert "[TARGET]" in kwargs["user_prompt"]
+            return json.dumps(
+                {
+                    "answer_guess": None,
+                    "answer_type": "object",
+                    "events": [
+                        {
+                            "index": 0,
+                            "text_en": "woman placing four [TARGET] on a plate",
+                            "text_vi": "ignored",
+                            "answer_bearing": True,
+                        },
+                        {
+                            "index": 1,
+                            "text_en": "woman holding two [TARGET]",
+                            "text_vi": "ignored",
+                            "answer_bearing": True,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
 
-    plan = GroundedVqaPlanner(client=FailingClient()).plan(
+    plan = GroundedVqaPlanner(client=TranslatingClient()).plan(
         query="Cô gái đặt bốn con vật lên đĩa rồi cầm hai con vật.",
         question="X là con gì?",
         use_llm=True,
     )
 
     assert plan.target_reference == "X"
-    assert plan.llm_status == "heuristic_target_guard"
-    assert plan.llm_calls == 0
+    assert plan.llm_status == "llm"
+    assert plan.llm_calls == 1
     assert any("[TARGET]" in event.text_vi for event in plan.events)
     assert any(event.answer_bearing for event in plan.events)
 
@@ -234,12 +321,7 @@ def test_candidate_builder_never_chains_across_videos() -> None:
 
     candidates = build_candidate_moments(plan, [], event_results)
 
-    assert candidates
-    assert all(
-        len({hit.result.video_id for hit in candidate.event_hits}) == 1
-        for candidate in candidates
-    )
-    assert all(candidate.event_coverage < 1.0 for candidate in candidates)
+    assert candidates == []
 
 
 def test_same_frame_cannot_satisfy_multiple_ordered_events() -> None:
@@ -252,8 +334,7 @@ def test_same_frame_cannot_satisfy_multiple_ordered_events() -> None:
         [[repeated], [repeated], [repeated]],
     )
 
-    assert candidates
-    assert all(candidate.event_coverage <= 1 / 3 for candidate in candidates)
+    assert candidates == []
 
 
 def test_low_rank_distractors_do_not_change_best_candidate() -> None:
@@ -277,6 +358,108 @@ def test_low_rank_distractors_do_not_change_best_candidate() -> None:
 
     assert before[0].video_id == "right"
     assert after[0].video_id == "right"
+
+
+def test_beam_search_keeps_a_lower_early_hit_that_forms_a_complete_chain() -> None:
+    plan = _plan()
+    event_results = [
+        [
+            _result("dead-end", "right", 100.0),
+            _result("chain-start", "right", 10.0),
+        ],
+        [_result("chain-end", "right", 20.0)],
+        [],
+    ]
+
+    candidates = build_candidate_moments(
+        plan,
+        [],
+        event_results,
+        beam_width=2,
+    )
+
+    assert candidates
+    assert [
+        hit.result.frame_id
+        for hit in candidates[0].event_hits
+        if hit.event_index in {0, 1}
+    ] == ["chain-start", "chain-end"]
+    assert candidates[0].required_event_coverage == 1.0
+
+
+def test_full_query_video_rank_counts_without_adding_a_far_frame_to_evidence() -> None:
+    plan = _plan()
+    candidates = build_candidate_moments(
+        plan,
+        [_result("far-full-hit", "right", 300.0)],
+        [
+            [_result("required-0", "right", 10.0)],
+            [_result("required-1", "right", 20.0)],
+            [],
+        ],
+    )
+
+    assert candidates
+    assert candidates[0].global_rank_score == 1.0
+    assert candidates[0].global_hit is None
+
+
+def test_variant_union_retains_a_hit_strong_in_only_one_model() -> None:
+    target = _result("target", "L26_V254", 12.0)
+    distractor = _result("distractor", "other", 10.0)
+
+    merged = _union_variant_branches(
+        {
+            "jina-clip-v2:en:0": [distractor],
+            "siglip2-so400m:en:0": [target],
+        },
+        top_k=10,
+        max_hits_per_video=8,
+    )
+
+    assert {result.frame_id for result in merged} == {"target", "distractor"}
+    target_result = next(result for result in merged if result.frame_id == "target")
+    assert target_result.model_query_consensus == 0.5
+    assert target_result.score == 0.9
+
+
+def test_variant_retrieval_honors_enabled_reranker() -> None:
+    class Reranker:
+        query = ""
+
+        def rerank(self, *, query, results):
+            self.query = query
+            return list(reversed(results))
+
+    class BranchRetriever:
+        reranker = Reranker()
+
+        def search_variant_branches(self, query_variants, **kwargs):
+            return {
+                "siglip:en:0": [
+                    _result("first", "v1", 10.0),
+                    _result("second", "v2", 20.0),
+                ]
+            }
+
+    pipeline = GroundedVqaPipeline(object(), BranchRetriever())
+    results, trace = pipeline._search_visual_variants(
+        {
+            "full_en": ["long full query"],
+            "target_sequence_en": ["four ingredients then two ingredients"],
+        },
+        pool_size=500,
+        enabled_models=["siglip"],
+        use_reranker=True,
+    )
+
+    assert [result.frame_id for result in results] == ["second", "first"]
+    assert pipeline.retriever.reranker.query == "four ingredients then two ingredients"
+    assert trace["reranker_applied"] is True
+
+
+def test_vietnamese_normalization_maps_d_stroke() -> None:
+    assert _normalize_text("Đĩa đỏ") == "dia do"
 
 
 def test_person_answer_is_rejected_for_food_target() -> None:
@@ -317,14 +500,15 @@ def test_person_answer_is_rejected_for_food_target() -> None:
 
 def test_supported_food_answer_requires_real_evidence_frame() -> None:
     plan = _plan()
-    result = _result("f1", "v1", 10.0)
+    first = _result("f1", "v1", 10.0)
+    second = _result("f2", "v1", 15.0)
     candidate = VqaCandidateMoment(
         candidate_id="c1",
         video_id="v1",
         video_name="L26_V254.mp4",
         start_sec=8.0,
         end_sec=18.0,
-        event_hits=(EventHit(0, result, 1, 1.0), EventHit(1, result, 1, 1.0)),
+        event_hits=(EventHit(0, first, 1, 1.0), EventHit(1, second, 1, 1.0)),
         event_coverage=2 / 3,
         chain_score=1.0,
         global_rank_score=1.0,
@@ -339,11 +523,14 @@ def test_supported_food_answer_requires_real_evidence_frame() -> None:
             "answer": "con nghêu",
             "entity_type": "food",
             "confidence": 0.9,
-            "supporting_frames": ["F1"],
-            "matched_event_indices": [0, 1, 2],
+            "supporting_frames": ["F1", "F2"],
+            "matched_event_indices": [0, 1],
+            "event_support": {"0": ["F1"], "1": ["F2"]},
             "supported_constraints": list(plan.constraints),
         },
-        frame_map={"F1": "f1"},
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
         usage={},
     )
     fabricated = _verification_from_payload(
@@ -355,29 +542,36 @@ def test_supported_food_answer_requires_real_evidence_frame() -> None:
             "entity_type": "food",
             "confidence": 0.9,
             "supporting_frames": ["not-supplied"],
-            "matched_event_indices": [0, 1, 2],
+            "matched_event_indices": [0, 1],
+            "event_support": {
+                "0": ["not-supplied"],
+                "1": ["not-supplied"],
+            },
             "supported_constraints": list(plan.constraints),
         },
-        frame_map={"F1": "f1"},
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
         usage={},
     )
 
     assert valid.verdict == "supported"
-    assert valid.supporting_frame_ids == ("f1",)
+    assert valid.supporting_frame_ids == ("f1", "f2")
     assert fabricated.verdict == "partial"
     assert fabricated.supporting_frame_ids == ()
 
 
 def test_food_name_containing_man_is_not_rejected_as_person() -> None:
     plan = _plan()
-    result = _result("f1", "v1", 10.0)
+    first = _result("f1", "v1", 10.0)
+    second = _result("f2", "v1", 15.0)
     candidate = VqaCandidateMoment(
         candidate_id="c1",
         video_id="v1",
         video_name="v1.mp4",
         start_sec=8.0,
         end_sec=12.0,
-        event_hits=(EventHit(0, result, 1, 1.0), EventHit(1, result, 1, 1.0)),
+        event_hits=(EventHit(0, first, 1, 1.0), EventHit(1, second, 1, 1.0)),
         event_coverage=2 / 3,
         chain_score=1.0,
         global_rank_score=1.0,
@@ -392,11 +586,14 @@ def test_food_name_containing_man_is_not_rejected_as_person() -> None:
             "answer": "mango",
             "entity_type": "food",
             "confidence": 0.9,
-            "supporting_frames": ["F1"],
-            "matched_event_indices": [0, 1, 2],
+            "supporting_frames": ["F1", "F2"],
+            "matched_event_indices": [0, 1],
+            "event_support": {"0": ["F1"], "1": ["F2"]},
             "supported_constraints": list(plan.constraints),
         },
-        frame_map={"F1": "f1"},
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
         usage={},
     )
 
@@ -435,8 +632,124 @@ def test_unrelated_constraint_text_cannot_satisfy_grounding() -> None:
         usage={},
     )
 
-    assert verification.verdict == "partial"
+    assert verification.verdict == "not_supported"
     assert verification.supported_constraints == ()
+
+
+def test_structured_event_support_and_constraints_are_backend_validated() -> None:
+    plan = replace(
+        _plan(),
+        constraint_specs=(
+            VqaConstraint("TARGET_ENTITY_TYPE", "entity_type", "food target", value="food"),
+            VqaConstraint("E0_COUNT_4", "count", "four targets", event_index=0, value=4),
+            VqaConstraint("E1_COUNT_2", "count", "two targets", event_index=1, value=2),
+            VqaConstraint("ORDER_0_1", "order", "event order", value="0_1"),
+        ),
+    )
+    first = _result("f1", "v1", 10.0)
+    second = _result("f2", "v1", 15.0)
+    candidate = VqaCandidateMoment(
+        candidate_id="c1",
+        video_id="v1",
+        video_name="L26_V254.mp4",
+        start_sec=10.0,
+        end_sec=15.0,
+        event_hits=(EventHit(0, first, 1, 1.0), EventHit(1, second, 1, 1.0)),
+        event_coverage=2 / 3,
+        chain_score=1.0,
+        global_rank_score=0.0,
+        retrieval_score=0.9,
+        required_event_coverage=1.0,
+    )
+    common = {
+        "verdict": "supported",
+        "answer": "nghêu",
+        "entity_type": "food",
+        "confidence": 1.0,
+        "supporting_frames": ["F1", "F2"],
+        "matched_event_indices": [0, 1],
+        "supported_constraint_ids": [
+            "TARGET_ENTITY_TYPE",
+            "E0_COUNT_4",
+            "E1_COUNT_2",
+            "ORDER_0_1",
+        ],
+    }
+
+    valid = _verification_from_payload(
+        candidate=candidate,
+        plan=plan,
+        payload={**common, "event_support": {"0": ["F1"], "1": ["F2"]}},
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
+        usage={},
+    )
+    wrong_event = _verification_from_payload(
+        candidate=candidate,
+        plan=plan,
+        payload={**common, "event_support": {"0": ["F1"], "1": ["F1"]}},
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
+        usage={},
+    )
+    missing_event_support = _verification_from_payload(
+        candidate=candidate,
+        plan=plan,
+        payload=common,
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
+        usage={},
+    )
+
+    assert valid.verdict == "supported"
+    assert valid.effective_confidence == 1.0
+    assert set(valid.validated_constraint_ids) == {
+        "TARGET_ENTITY_TYPE",
+        "E0_COUNT_4",
+        "E1_COUNT_2",
+        "ORDER_0_1",
+    }
+    assert wrong_event.verdict == "partial"
+    assert wrong_event.valid_citation_coverage == 0.5
+    assert missing_event_support.verdict == "partial"
+    assert missing_event_support.valid_citation_coverage == 0.0
+
+
+def test_partial_required_candidate_is_rejected_before_openrouter() -> None:
+    plan = _plan()
+    first = _result("f1", "v1", 10.0)
+    candidate = VqaCandidateMoment(
+        candidate_id="c1",
+        video_id="v1",
+        video_name="v1.mp4",
+        start_sec=10.0,
+        end_sec=10.0,
+        event_hits=(EventHit(0, first, 1, 1.0),),
+        event_coverage=1 / 3,
+        chain_score=1.0,
+        global_rank_score=0.0,
+        retrieval_score=0.5,
+        evidence_frames=[
+            {"frame_id": f"f{index}", "frame_path": f"f{index}.jpg"}
+            for index in range(1, 5)
+        ],
+    )
+
+    pipeline = object.__new__(GroundedVqaPipeline)
+    verification = pipeline._verify_one(
+        plan=plan,
+        query="query",
+        question="question",
+        context="",
+        candidate=candidate,
+    )
+
+    assert verification.verdict == "not_supported"
+    assert verification.logical_calls == 0
+    assert verification.effective_confidence == 0.0
 
 
 def test_final_judge_cannot_select_candidate_with_other_candidates_frame() -> None:
@@ -449,7 +762,7 @@ def test_final_judge_cannot_select_candidate_with_other_candidates_frame() -> No
             return (
                 '{"status":"answered","selected_candidate_id":"c1",'
                 '"answer":"con nghêu","confidence":0.9,'
-                '"supporting_frames":["F2"]}'
+                '"supporting_frames":["F3"]}'
             )
 
     pipeline = object.__new__(GroundedVqaPipeline)
@@ -479,7 +792,7 @@ def test_final_judge_can_select_supported_conflicting_candidate() -> None:
             return (
                 '{"status":"answered","selected_candidate_id":"c1",'
                 '"answer":"con nghêu","confidence":0.91,'
-                '"supporting_frames":["F1"],"evidence_summary":"visible shellfish"}'
+                '"supporting_frames":["F1","F2"],"evidence_summary":"visible shellfish"}'
             )
 
     pipeline = object.__new__(GroundedVqaPipeline)
@@ -496,15 +809,27 @@ def test_final_judge_can_select_supported_conflicting_candidate() -> None:
 
     assert selection["status"] == "answered"
     assert selection["candidate_id"] == "c1"
-    assert selection["supporting_frame_ids"] == ("f1",)
+    assert selection["supporting_frame_ids"] == ("f1", "f1-later")
     assert usage["_logical_calls"] == 1
     assert error is None
 
 
-def test_agreeing_candidates_skip_extra_final_openrouter_call() -> None:
+def test_hidden_target_runs_final_visual_judge_even_when_candidates_agree() -> None:
     plan, candidates, verifications = _conflicting_final_fixture()
     verifications[1] = replace(verifications[1], answer="con nghêu")
+
+    class AgreeingClient:
+        last_usage = {}
+
+        def complete_with_images(self, **kwargs):
+            return (
+                '{"status":"answered","selected_candidate_id":"c1",'
+                '"answer":"con nghêu","confidence":0.9,'
+                '"supporting_frames":["F1","F2"]}'
+            )
+
     pipeline = object.__new__(GroundedVqaPipeline)
+    pipeline._vlm_client = AgreeingClient()
 
     selection, usage, error = pipeline._select_final_answer(
         plan=plan,
@@ -517,8 +842,8 @@ def test_agreeing_candidates_skip_extra_final_openrouter_call() -> None:
 
     assert selection["status"] == "answered"
     assert selection["candidate_id"] == "c1"
-    assert selection["supporting_frame_ids"] == ("f1",)
-    assert usage == {}
+    assert selection["supporting_frame_ids"] == ("f1", "f1-later")
+    assert usage["_logical_calls"] == 1
     assert error is None
 
 
@@ -564,14 +889,20 @@ def test_display_top_k_does_not_change_fixed_retrieval_pool() -> None:
     pipeline._retrieve = no_results
     first = pipeline.run(query="query", question="question", top_k=20)
     second = pipeline.run(query="query", question="question", top_k=50)
+    third = pipeline.run(query="query", question="question", top_k=100)
 
-    assert requested_pools == [100, 100]
-    assert first["answer_status"] == second["answer_status"] == "no_candidates"
-    assert first["query_plan"] == second["query_plan"]
+    assert requested_pools == [500, 500, 500]
+    assert (
+        first["answer_status"]
+        == second["answer_status"]
+        == third["answer_status"]
+        == "no_candidates"
+    )
+    assert first["query_plan"] == second["query_plan"] == third["query_plan"]
 
 
 def test_display_top_k_keeps_answer_candidate_and_citations_stable() -> None:
-    plan = _plan()
+    plan = replace(_plan(), target_reference="")
 
     class Planner:
         def plan(self, **kwargs):
@@ -579,7 +910,9 @@ def test_display_top_k_keeps_answer_candidate_and_citations_stable() -> None:
 
     pipeline = GroundedVqaPipeline(object(), object(), planner=Planner())
     requested_pools: list[int] = []
-    full_results = [_result("global", "right", 20.0)]
+    # The answer video is deliberately absent from raw full-query cards. The
+    # response must still put the ordered-event candidate in display_results.
+    full_results = [_result("global-distractor", "wrong", 20.0)]
     event_results = [
         [_result("right-1", "right", 10.0)],
         [_result("right-2", "right", 20.0)],
@@ -636,12 +969,20 @@ def test_display_top_k_keeps_answer_candidate_and_citations_stable() -> None:
 
     first = pipeline.run(query="query", question="question", top_k=20)
     second = pipeline.run(query="query", question="question", top_k=50)
+    third = pipeline.run(query="query", question="question", top_k=100)
 
-    assert requested_pools == [100, 100]
-    assert first["answer"] == second["answer"] == "con nghêu"
+    assert requested_pools == [500, 500, 500]
+    assert first["answer"] == second["answer"] == third["answer"] == "con nghêu"
     assert first["selected_candidate"]["video_id"] == "right"
     assert second["selected_candidate"]["video_id"] == "right"
-    assert first["supporting_frame_ids"] == second["supporting_frame_ids"]
+    assert third["selected_candidate"]["video_id"] == "right"
+    assert (
+        first["supporting_frame_ids"]
+        == second["supporting_frame_ids"]
+        == third["supporting_frame_ids"]
+    )
+    assert first["display_results"][0]["video_id"] == "right"
+    assert first["display_results"][0]["candidate_source"] == "ordered_event_union"
 
 
 def test_low_confidence_candidate_causes_abstention() -> None:
