@@ -14,21 +14,21 @@ OFFLINE (indexing)
     → ingest → detect-shots → extract-frames → embed-frames → build-index
     → validate-index → readiness.json (READY/DEGRADED/INVALID)
   extract-text  (separate stage: OCR per keyframe + ASR per video → Elasticsearch;
-                 needs `make vllm-index-up` + `make elasticsearch-up`)
+                 OCR uses OpenRouter; ASR runs locally via gipformer)
 
 ONLINE (retrieval)
   text query → [LLM translate/expand] → embed (BEiT-3) → Qdrant search
-    → temporal search (frame-to-frame walk → segments) → shot validation
-    → track shaping (textual KIS / VQA / TRAKE)
-    → [VQA] agent answer  /  [chat] interactive agent loop
+    → track shaping (textual KIS / TRAKE / legacy VQA)
+  grounded VQA → ordered-event retrieval → 3 candidate moments
+    → 4-6 evidence frames/candidate → OpenRouter multi-image verification
+    → cited answer or abstention
+  interactive chat → ReAct agent loop
 ```
 
-Generative models (LLM/VLM) are **Docker-served over OpenAI-compatible
-HTTP** — no model checkpoint is loaded inside the Python process for
-captioning, OCR, or query processing. Embedders/rerankers (BEiT-3, SigLIP2,
-BLIP-2) run in-process as batch encoders. The agent LLM itself is not
-served by this repo's `docker-compose.yml` (point `.env` at whatever
-OpenAI-compatible endpoint you run for it).
+Generative models (LLM/VLM) are accessed through OpenRouter's
+OpenAI-compatible HTTP endpoint for grounded VQA, query services, captioning,
+and OCR. No generative checkpoint is loaded inside the Python process.
+Embedders/rerankers (BEiT-3, SigLIP2, BLIP-2) run in-process as batch encoders.
 
 ## Models
 
@@ -36,17 +36,17 @@ OpenAI-compatible endpoint you run for it).
 |------|-------|---------------|
 | Visual embedding (default) | BEiT-3 `beit3_large_patch16_384_coco_retrieval` (dim 1024) | in-process, TensorRT FP16 (~27x vs PyTorch, benchmarked on GB10) |
 | Visual embedding (opt-in) | SigLIP2 `google/siglip2-so400m-patch14-384` (dim 1152) | in-process, TensorRT FP16 (~3.5x vs PyTorch, benchmarked on GB10) |
-| Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via Docker VLM; embedding in-process |
+| Caption-text embedding (opt-in) | `AITeamVN/Vietnamese_Embedding_v2` over VLM captions | captions via OpenRouter; embedding in-process |
 | Reranker (opt-in, multi-model runs) | BLIP-2 ITM `Salesforce/blip2-itm-vit-g` | in-process |
-| Captioning + OCR (indexing & agent tools) | `cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit` | Docker `vllm-index` (vLLM, AWQ/Marlin, **GB10 only**), port 8881 |
-| Agent LLM (VQA answer, chat, query expand) | **Qwen3.5-4B 4-bit** | not served by this repo's docker-compose — point `.env` at your own OpenAI-compatible endpoint |
+| Captioning + OCR (indexing & agent tools) | vision-capable model from `OPENROUTER_MODEL` | OpenRouter |
+| Grounded VQA answer verification | vision-capable model from `VQA_OPENROUTER_MODEL` | OpenRouter, multi-image requests |
+| Legacy ReAct Agent/chat/query planning | model configured by the corresponding `.env` setting | OpenRouter or another OpenAI-compatible endpoint |
 | ASR | gipformer-65M-rnnt + Silero-VAD | subprocess into `external/gipformer/` |
 | Shot detection | TransNetV2 (PyTorch) | in-process |
 
-`vllm-index` (35B-A3B, port 8881) is the only vLLM container this repo's
-`docker-compose.yml` runs. Captioning/OCR has **no non-GB10 fallback**:
-`vllm-index` needs GB10's Blackwell (SM121) GPU for its AWQ/Marlin kernel.
-Override its model via `VLLM_INDEX_MODEL` in `.env`.
+Captioning, OCR, and Grounded VQA require `OPENROUTER_API_KEY` plus a
+vision-capable model. Grounded VQA can use a dedicated model through
+`VQA_OPENROUTER_MODEL`; when it is empty, it inherits `OPENROUTER_MODEL`.
 
 ### TensorRT-accelerated embedding
 
@@ -62,14 +62,22 @@ for BEiT-3 and ~3.5x for SigLIP2. Text queries stay on PyTorch (a single
 short sequence per call has no batching gain to capture). Disable per-model
 with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
 
-## Agent
+## Agent and VQA
 
-Two agent paths, one LLM backend (endpoint set via `.env`, not docker-compose):
-
-- **VQA answering** (`agent/react.py`): ReAct loop (max 5 steps) with
-  `caption`/`ocr` tools that call the Docker VLM on port 8881. Cached
-  index-time captions are passed as context, so the text-only LLM can answer
-  even when the VLM service is down.
+- **Grounded VQA** (`retrieval/grounded_vqa.py`): plans ordered events, keeps
+  three candidate moments, selects 4-6 timestamped frames for each, and asks
+  an OpenRouter vision model to return an answer with cited evidence. It
+  abstains when confidence or visual grounding is insufficient. Configure the
+  model with `VQA_OPENROUTER_MODEL` (empty means `OPENROUTER_MODEL`). Explicit
+  unknowns such as `X` use a deterministic answer-neutral plan so a planner
+  cannot leak a guessed noun into retrieval before the images are inspected.
+- **Legacy VQA** remains available with `pipeline_mode=legacy` for manual
+  rollback. It is not used as an automatic fallback because a text-only guess
+  would hide missing visual evidence.
+- In Grounded VQA, the UI's **Query Enhancement (LLM)** switch controls only
+  query planning. Multi-image verification still requires the configured
+  OpenRouter vision model; disabling the planner does not turn VQA into a
+  non-LLM answerer.
 - **Interactive search chat** (`agent/interactive.py`, `POST /api/agent/chat`
   + chat panel in the UI): the AIC_2025-style narrowing loop — tools
   `search_kis`, `search_asr`, `search_ocr`, `subagent_summarize`, `ask_user`;
@@ -77,8 +85,9 @@ Two agent paths, one LLM backend (endpoint set via `.env`, not docker-compose):
 
 Query processing (`retrieval/query_processor.py`) uses the same LLM to
 translate Vietnamese → English and extract OCR/ASR keywords; it silently
-degrades to pass-through when the server is down and disables itself for the
-session after the first failure (a competition run must never block on it).
+degrades to heuristic routing when the server is down. Transient failures are
+retried once; a circuit breaker opens after three consecutive failures, cools
+down for 60 seconds, then probes the service again.
 
 ## Project layout
 
@@ -91,11 +100,11 @@ src/
   indexing/       # offline pipeline stages + manifests + SQLite job state
   retrieval/      # online search: Retriever, SRRF fusion, temporal search, tracks, VQA/TRAKE
   modules/        # model backends: embedding (beit3/siglip/vietnamese),
-                  #   reranker (blip2_itm/vietnamese), captioning+ocr (vLLM), asr (gipformer)
+                  #   reranker, captioning+ocr (OpenRouter), asr (gipformer)
   agent/          # brain (Docker LLM), ReAct VQA loop, interactive chat agent, tools
   stores/
     vector/       # Qdrant vector index
-    text/         # Elasticsearch BM25 (OCR/ASR), wired in via `extract-text`
+    text/         # Elasticsearch BM25 (OCR/ASR/caption), wired via import/extract-text
   repository/     # data access over run manifests (frames, videos, captions)
   prompts/        # LLM/VLM prompt templates (captioning, ocr, agent)
   ui/             # local browser UI (tracks + agent chat)
@@ -107,7 +116,7 @@ docs/vi/          # Vietnamese documentation
 
 - Python ≥ 3.13, managed with [uv](https://docs.astral.sh/uv/)
 - NVIDIA GPU + CUDA (embedders + TransNetV2 need CUDA when `--device auto`)
-- Docker (Qdrant, Elasticsearch, all LLM/VLM serving)
+- Docker (Qdrant and Elasticsearch)
 - `git` and `uv` on PATH — `detect-shots` uses them to fetch and convert the
   TransNetV2 weights on first run (see [TransNetV2 weights](#transnetv2-weights))
 - For ASR: one-time `cd external/gipformer && uv sync` (isolated repo+venv),
@@ -125,7 +134,7 @@ docs/vi/          # Vietnamese documentation
 make setup                    # deps + GPU extras + external repos/weights
 cp .env.example .env          # configure endpoints (defaults work locally)
 make qdrant-up qdrant-health  # vector DB
-make elasticsearch-up         # OCR/ASR
+make elasticsearch-up         # OCR/ASR/caption BM25 index
 ```
 
 `make setup` runs `uv sync`, installs the optional GPU extras (onnxruntime,
@@ -175,11 +184,13 @@ make embed-frames   EXP=demo      # BEiT-3 large; ~2GB checkpoint auto-downloads
 make build-index    EXP=demo      # needs Qdrant running
 make validate-index EXP=demo      # writes readiness.json; non-zero unless READY
 
-# OCR/ASR text branch (separate; needs vllm-index + Elasticsearch — GB10 only)
-make vllm-index-up elasticsearch-up
+# OCR/ASR text branch (separate; load OPENROUTER_API_KEY/MODEL from .env first)
+make elasticsearch-up
+set -a; source .env; set +a
 make extract-text EXP=demo
 make export-text  EXP=demo        # dump ES -> manifests/text.jsonl (shareable)
-make import-text  EXP=demo        # load text.jsonl back into ES
+make import-text  EXP=demo        # load OCR/ASR text.jsonl back into ES
+uv run codenova import-text --experiment-name demo --include-captions  # also captions.jsonl
 
 # Search / UI
 make search   EXP=demo QUERY="a person riding a motorbike"
@@ -321,8 +332,10 @@ cross-encoder rerank stage in the UI.
   named vector per embedding model. One collection per experiment:
   `{QDRANT_COLLECTION}__{experiment}`. Metadata is hydrated from manifests at
   query time.
-- **`stores/text`** — Elasticsearch (BM25) for OCR/ASR documents, one index,
-  `source` field distinguishes ocr/asr. Populated by `make extract-text`.
+- **`stores/text`** — Elasticsearch (BM25) for OCR/ASR/caption documents, one
+  index; `source` distinguishes `ocr`, `asr`, and `caption`. OCR/ASR are
+  produced by `make extract-text`; pass `--include-captions` to `import-text`
+  when `captions.jsonl` should also be indexed.
 
 ## Development
 
