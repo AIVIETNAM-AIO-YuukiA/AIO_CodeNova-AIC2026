@@ -204,6 +204,64 @@ class Retriever:
         LOGGER.info("event=SEARCH_TIMING timing_ms=%s", timing_ms)
         return valid_hydrated[:top_k]
 
+    def search_variant_branches(
+        self,
+        query_variants: dict[str, list[str] | tuple[str, ...]],
+        *,
+        top_k: int = 500,
+        enabled_models: list[str] | None = None,
+    ) -> dict[str, list[SearchResult]]:
+        """Search explicit bilingual variants without cross-model fusion.
+
+        Grounded VQA needs high recall before it can assemble an ordered
+        moment.  SRRF is still appropriate for the normal KIS result list,
+        but it can push a frame that is strong in only one model out of the
+        candidate pool.  This additive API exposes every model/variant branch
+        independently so the VQA layer can union hits at video level first.
+
+        ``query_variants`` is keyed by a descriptive language/source label
+        (normally ``"en"`` and ``"vi"``).  The label is included in the
+        returned branch key for diagnostics; all non-empty variants are sent
+        to every enabled embedder because both Jina CLIP v2 and SigLIP2 can
+        contribute useful multilingual hits in practice.
+        """
+        if top_k < 1:
+            raise ValueError("top_k must be positive")
+
+        active = self._select_embedders(enabled_models)
+        branches: dict[str, list[SearchResult]] = {}
+        for model_name, embedder in active.items():
+            for variant_group, raw_variants in query_variants.items():
+                seen_queries: set[str] = set()
+                for variant_index, raw_query in enumerate(raw_variants):
+                    query = str(raw_query).strip()
+                    if not query or query in seen_queries:
+                        continue
+                    seen_queries.add(query)
+                    query_embedding = embedder.embed_text(query)
+                    raw_results = self.index.search(
+                        query_embedding,
+                        top_k=top_k,
+                        model_name=model_name,
+                    )
+                    hydration = self.hydrator.hydrate_with_diagnostics(raw_results)
+                    if hydration.issues:
+                        reasons = Counter(issue.reason for issue in hydration.issues)
+                        LOGGER.error(
+                            "event=RETRIEVAL_CANDIDATES_DROPPED branch=%s:%s:%d "
+                            "count=%d reasons=%s frame_ids=%s",
+                            model_name,
+                            variant_group,
+                            variant_index,
+                            len(hydration.issues),
+                            dict(sorted(reasons.items())),
+                            [issue.frame_id for issue in hydration.issues[:20]],
+                        )
+                    branches[
+                        f"{model_name}:{variant_group}:{variant_index}"
+                    ] = hydration.results[:top_k]
+        return branches
+
     def _select_embedders(self, enabled_models: list[str] | None) -> dict[str, Embedder]:
         if enabled_models is None:
             return self.embedders
