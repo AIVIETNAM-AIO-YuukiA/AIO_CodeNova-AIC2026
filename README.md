@@ -64,13 +64,16 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
 
 ## Agent and VQA
 
-- **Grounded VQA** (`retrieval/grounded_vqa.py`): plans ordered events, keeps
-  three candidate moments, selects 4-6 timestamped frames for each, and asks
+- **Grounded VQA** (`retrieval/grounded_vqa.py`): translates and labels an
+  answer-neutral ordered event plan, searches English/Vietnamese variants per
+  embedding model, keeps up to five complete candidate moments, selects 4-6
+  timestamped frames for each, and asks
   an OpenRouter vision model to return an answer with cited evidence. It
   abstains when confidence or visual grounding is insufficient. Configure the
   model with `VQA_OPENROUTER_MODEL` (empty means `OPENROUTER_MODEL`). Explicit
-  unknowns such as `X` use a deterministic answer-neutral plan so a planner
-  cannot leak a guessed noun into retrieval before the images are inspected.
+  unknowns such as `X` are replaced with `[TARGET]` before planning. The LLM
+  may translate and classify those source events, but cannot rename the target
+  or change which target events are required.
 - **Legacy VQA** remains available with `pipeline_mode=legacy` for manual
   rollback. It is not used as an automatic fallback because a text-only guess
   would hide missing visual evidence.
