@@ -50,6 +50,9 @@ def test_fastapi_service_forwards_grounded_controls_and_nested_frame_urls(monkey
         captured.update(kwargs)
         return {
             "results": [{"frame_path": "runs/exp/frames/result.jpg"}],
+            "display_results": [
+                {"frame_path": "runs/exp/frames/display-candidate.jpg"}
+            ],
             "evidence_frames": [{"frame_path": "runs/exp/frames/evidence.jpg"}],
             "selected_candidate": {
                 "evidence_frames": [{"frame_path": "runs/exp/frames/selected.jpg"}]
@@ -85,6 +88,9 @@ def test_fastapi_service_forwards_grounded_controls_and_nested_frame_urls(monkey
     assert captured["use_llm"] is False
     assert captured["pipeline_mode"] == "grounded"
     assert response["results"][0]["image_url"].endswith("runs/exp/frames/result.jpg")
+    assert response["display_results"][0]["image_url"].endswith(
+        "runs/exp/frames/display-candidate.jpg"
+    )
     assert response["evidence_frames"][0]["image_url"].endswith(
         "runs/exp/frames/evidence.jpg"
     )
@@ -160,6 +166,7 @@ def test_vqa_frontend_sends_and_renders_grounded_contract() -> None:
     assert 'id="vqa-pipeline-mode"' in SIDEBAR_HTML
     assert '<option value="legacy">' in SIDEBAR_HTML
     assert "renderVqaResponse(data)" in APP_JS
+    assert "data.display_results || data.results" in APP_JS
     assert "Grounded multi-frame VQA" in APP_JS
     assert "Evidence frames" in APP_JS
     assert "Candidate verification" in APP_JS
@@ -167,6 +174,21 @@ def test_vqa_frontend_sends_and_renders_grounded_contract() -> None:
     assert "frame.evidence_label" in APP_JS
     assert "Verifier error:" in APP_JS
     assert "Select at least one embedding model." in APP_JS
+
+
+def test_video_name_map_handles_windows_paths_on_linux(tmp_path) -> None:
+    experiment = _experiment(tmp_path)
+    manifests = experiment.run_dir / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "videos.jsonl").write_text(
+        '{"video_id":"target","path":"data\\\\raw_videos\\\\L26_V254.mp4"}\n',
+        encoding="utf-8",
+    )
+    legacy_ui_api._VIDEO_NAME_CACHE.clear()
+
+    names = legacy_ui_api._get_video_name_map(experiment)
+
+    assert names["target"] == "L26_V254.mp4"
 
 
 def test_fastapi_index_renders_active_model_names(tmp_path) -> None:

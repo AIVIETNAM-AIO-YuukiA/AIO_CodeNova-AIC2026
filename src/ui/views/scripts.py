@@ -362,7 +362,7 @@ APP_JS = r"""
 
       renderVqaEvidence(data);
       renderPipeline(data);
-      renderResults(data.results || []);
+      renderResults(data.display_results || data.results || []);
       if (data.answer) {
         sidebarAnswer.style.display = "block";
         sidebarAnswerText.textContent = data.answer;
@@ -394,22 +394,27 @@ APP_JS = r"""
             </article>`).join("")}
         </div>` : "";
 
+      const candidatesOpen = data.answer_status === "answered" ? "" : " open";
       const candidatesHtml = candidates.length ? `
-        <details style="margin-top:14px;">
+        <details${candidatesOpen} style="margin-top:14px;">
           <summary style="cursor:pointer;font-weight:700;">Candidate verification (${candidates.length})</summary>
           <div style="display:grid;gap:8px;margin-top:8px;">
             ${candidates.map((candidate, i) => {
               const c = candidate || {};
-              const score = c.confidence == null ? NaN : Number(c.confidence);
+              const scoreValue = c.effective_confidence ?? c.confidence;
+              const score = scoreValue == null ? NaN : Number(scoreValue);
               const scoreText = Number.isFinite(score) ? `${(score * 100).toFixed(0)}%` : "N/A";
               const name = cleanVideoName(c.video_name || c.video_id || c.candidate_id || `Candidate ${i + 1}`);
               const contradictions = Array.isArray(c.contradictions) ? c.contradictions : [];
               const candidateFrames = Array.isArray(c.evidence_frames) ? c.evidence_frames : [];
+              const requiredCoverage = Number(c.required_event_coverage || 0);
+              const contextCoverage = Number(c.optional_context_coverage || 0);
               return `<div style="padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px;line-height:1.45;">
                 <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
                   <strong>#${i + 1} ${escapeHtml(name)}</strong>
                   <span class="pill">${escapeHtml(c.verdict || "unknown")} &middot; ${scoreText}</span>
                 </div>
+                <div style="color:var(--muted);margin-top:4px;">Required events ${(requiredCoverage * 100).toFixed(0)}% &middot; optional context ${(contextCoverage * 100).toFixed(0)}%</div>
                 <div style="margin-top:5px;"><strong>${escapeHtml(c.answer || "No answer")}</strong></div>
                 ${c.evidence_summary ? `<div style="color:var(--muted);margin-top:3px;">${escapeHtml(c.evidence_summary)}</div>` : ""}
                 ${c.error ? `<div style="color:var(--warn);margin-top:3px;">Verifier error: ${escapeHtml(c.error)}</div>` : ""}
@@ -575,6 +580,9 @@ APP_JS = r"""
         const scoreStr = result.score != null ? Number(result.score).toFixed(4) : "1.0000";
         const frameNum = result.frame_index != null ? `f${result.frame_index}` : "f0";
         const timeStr = formatTime(result.timestamp_sec || 0);
+        const candidateBadge = result.candidate_id
+          ? `<span class="pill">${escapeHtml(result.candidate_id)} &middot; ${escapeHtml(result.candidate_source || "ordered events")} &middot; required ${(Number(result.required_event_coverage || 0) * 100).toFixed(0)}% &middot; context ${(Number(result.optional_context_coverage || 0) * 100).toFixed(0)}%</span>`
+          : "";
 
         return `
         <article class="card">
@@ -585,6 +593,7 @@ APP_JS = r"""
               <span class="card-rank">#${index + 1}</span>
               <span class="card-score">score ${scoreStr}</span>
             </div>
+            ${candidateBadge}
             <div class="card-vname" title="${escapeHtml(videoName)}">📹 ${escapeHtml(videoName)}</div>
             <div class="card-info-row">
               <span class="card-frame-badge">${frameNum}</span>

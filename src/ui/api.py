@@ -213,14 +213,16 @@ def events_to_query(payload: dict) -> str:
     return "\n".join(lines)
 
 
-_VIDEO_NAME_CACHE: dict[str, str] = {}
+_VIDEO_NAME_CACHE: dict[str, dict[str, str]] = {}
 _CAPTIONS_CACHE: dict[str, str] = {}
 _TEXT_CACHE: list[dict] = []
 
 
 def _get_video_name_map(experiment: Experiment) -> dict[str, str]:
     global _VIDEO_NAME_CACHE
-    if not _VIDEO_NAME_CACHE:
+    cache_key = str(experiment.run_dir.resolve())
+    if cache_key not in _VIDEO_NAME_CACHE:
+        names: dict[str, str] = {}
         v_file = experiment.run_dir / "manifests" / "videos.jsonl"
         if v_file.is_file():
             try:
@@ -232,10 +234,12 @@ def _get_video_name_map(experiment: Experiment) -> dict[str, str]:
                         vid = rec.get("video_id")
                         vpath = rec.get("path")
                         if vid and vpath:
-                            _VIDEO_NAME_CACHE[vid] = Path(vpath).name
+                            normalized = str(vpath).replace("\\", "/")
+                            names[str(vid)] = normalized.rsplit("/", 1)[-1]
             except Exception:
                 pass
-    return _VIDEO_NAME_CACHE
+        _VIDEO_NAME_CACHE[cache_key] = names
+    return _VIDEO_NAME_CACHE[cache_key]
 
 
 def _get_captions_map(experiment: Experiment) -> dict[str, str]:
