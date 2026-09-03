@@ -53,6 +53,7 @@ DEFAULT_EVENT_GAP_SEC = 60.0
 DEFAULT_MOMENT_SPAN_SEC = 180.0
 DEFAULT_EVIDENCE_PADDING_SEC = 2.0
 DEFAULT_MIN_CONFIDENCE = 0.65
+DEFAULT_BRANCH_CONSENSUS_WINDOW_SEC = 3.0
 
 _TEXT_EVIDENCE_CACHE: dict[
     str,
@@ -708,10 +709,18 @@ class GroundedVqaPipeline:
                 auxiliary.append(hits)
                 trace.setdefault("text_sources", []).append(source)
         if auxiliary:
+            # ``pool_size`` limits every visual/text branch independently.
+            # Do not collapse their union back to the same size: a frame that
+            # is strong in only one model/source is exactly the evidence this
+            # high-recall stage is intended to preserve.
+            auxiliary_union_limit = max(
+                pool_size,
+                len(visual_results) + sum(len(rows) for rows in auxiliary),
+            )
             visual_results = _merge_auxiliary_results(
                 visual_results,
                 auxiliary,
-                top_k=pool_size,
+                top_k=auxiliary_union_limit,
             )
         return visual_results, trace
 
@@ -755,9 +764,16 @@ class GroundedVqaPipeline:
                         use_reranker=use_reranker,
                         use_expansion=False,
                     )
+        # ``pool_size`` is a per-model/per-query-variant limit.  A second
+        # global ``[:pool_size]`` here used to discard valid single-branch
+        # hits (including videos that ranked well in SigLIP but not Jina).
+        union_limit = max(
+            pool_size,
+            sum(len(rows) for rows in branches.values()),
+        )
         merged = _union_variant_branches(
             branches,
-            top_k=pool_size,
+            top_k=union_limit,
             max_hits_per_video=video_cap,
         )
         reranker = getattr(self.retriever, "reranker", None)
@@ -805,13 +821,24 @@ class GroundedVqaPipeline:
                 except Exception as exc:
                     reranker_error = f"{type(exc).__name__}: {exc}"[:300]
                     LOGGER.warning("Grounded VQA reranker degraded: %s", exc)
+        debug_trace = _env_bool("VQA_DEBUG_TRACE", False)
+        trace_limit = min(pool_size, 250) if debug_trace else 20
         trace = {
             "effective_queries": variants,
             "branch_counts": {name: len(rows) for name, rows in branches.items()},
-            "top_videos": _top_video_trace(merged, limit=20),
+            "per_branch_pool_size": pool_size,
+            "union_limit": union_limit,
+            "merged_result_count": len(merged),
+            "merged_video_count": len({row.video_id for row in merged}),
+            "top_videos": _top_video_trace(merged, limit=trace_limit),
             "reranker_applied": reranker_applied,
             "reranker_error": reranker_error,
         }
+        if debug_trace:
+            trace["branch_top_videos"] = {
+                name: _top_video_trace(rows, limit=min(pool_size, 250))
+                for name, rows in branches.items()
+            }
         return merged, trace
 
     def _ensure_frame_index(self) -> None:
@@ -2285,7 +2312,19 @@ def _heuristic_english_event(text: str, *, answer_type: str) -> str:
     """Produce a conservative English fallback without naming the target."""
     normalized = _normalize_text(text)
     has_target = "[TARGET]" in text
-    count_match = re.search(r"\b(1|2|3|4|5|mot|hai|ba|bon|nam)\b", normalized)
+    # Prefer the count syntactically attached to the hidden target.  In a
+    # phrase such as ``1 dĩa trắng 4 con [TARGET]`` the first number describes
+    # the plate, not X; using a generic first-number match generated the wrong
+    # retrieval query ``woman placing one ...``.
+    count_match = re.search(
+        r"\b(1|2|3|4|5|mot|hai|ba|bon|nam)\s+(?:con\s+)?target\b",
+        normalized,
+    )
+    if count_match is None:
+        count_match = re.search(
+            r"\b(1|2|3|4|5|mot|hai|ba|bon|nam)\b",
+            normalized,
+        )
     number_words = {
         "1": "one",
         "2": "two",
@@ -2694,11 +2733,26 @@ def _union_variant_branches(
     top_k: int,
     max_hits_per_video: int,
 ) -> list[SearchResult]:
-    """Union branches while rewarding, but never requiring, consensus."""
+    """Union branches while rewarding, but never requiring, consensus.
+
+    Consensus is measured within a local video moment. Different embedders
+    commonly retrieve neighbouring keyframes from the same event; requiring
+    the exact same ``frame_id`` incorrectly treated that agreement as two
+    unrelated single-model hits. Conversely, hits several minutes apart in a
+    long video must not support each other.
+    """
     aggregated: dict[str, dict[str, object]] = {}
+    video_branch_hits: dict[
+        str,
+        dict[str, list[tuple[SearchResult, float]]],
+    ] = defaultdict(lambda: defaultdict(list))
     for branch_name, results in branches.items():
         branch_pool = max(1, len(results))
         for rank, result in enumerate(results, start=1):
+            rank_score = _rank_score(rank, branch_pool)
+            video_branch_hits[result.video_id][branch_name].append(
+                (result, rank_score)
+            )
             record = aggregated.setdefault(
                 result.frame_id,
                 {
@@ -2707,7 +2761,6 @@ def _union_variant_branches(
                     "branches": set(),
                 },
             )
-            rank_score = _rank_score(rank, branch_pool)
             record["best_rank_score"] = max(
                 float(record["best_rank_score"]), rank_score
             )
@@ -2724,25 +2777,109 @@ def _union_variant_branches(
     branch_count = max(1, len(branches))
     for record in aggregated.values():
         base = record["result"]
-        support = record["branches"]
         assert isinstance(base, SearchResult)
-        assert isinstance(support, set)
-        consensus = min(1.0, len(support) / branch_count)
+        branch_scores = [
+            max(
+                (
+                    rank_score
+                    for neighbor, rank_score in rows
+                    if _results_share_local_moment(base, neighbor)
+                ),
+                default=0.0,
+            )
+            for rows in video_branch_hits.get(base.video_id, {}).values()
+        ]
+        consensus = min(1.0, sum(branch_scores) / branch_count)
         score = 0.80 * float(record["best_rank_score"]) + 0.20 * consensus
         # Preserve the retrieval-ranking score shown by existing clients while
         # carrying consensus separately for candidate scoring.
         scored.append((score, _with_branch_consensus(base, score, consensus)))
     scored.sort(key=lambda item: item[0], reverse=True)
 
-    per_video: dict[str, int] = defaultdict(int)
-    for _, result in scored:
-        if per_video[result.video_id] >= max_hits_per_video:
-            continue
+    # Keep distinct shots/time buckets before filling the remaining per-video
+    # quota. Without this pass, eight adjacent keyframes from one shot could
+    # evict the later action needed to form an ordered target-event chain.
+    diverse_scored = _select_diverse_video_hits(
+        scored,
+        max_hits_per_video=max_hits_per_video,
+    )
+    for _, result in diverse_scored:
         ranked.append(result)
-        per_video[result.video_id] += 1
         if len(ranked) >= top_k:
             break
     return ranked
+
+
+def _select_diverse_video_hits(
+    scored: list[tuple[float, SearchResult]],
+    *,
+    max_hits_per_video: int,
+) -> list[tuple[float, SearchResult]]:
+    """Apply a per-video cap while reserving room for distinct moments."""
+    by_video: dict[str, list[tuple[float, SearchResult]]] = defaultdict(list)
+    for item in scored:
+        by_video[item[1].video_id].append(item)
+
+    selected: list[tuple[float, SearchResult]] = []
+    for rows in by_video.values():
+        chosen: list[tuple[float, SearchResult]] = []
+        chosen_ids: set[str] = set()
+        seen_moments: set[tuple[str, object]] = set()
+
+        for item in rows:
+            result = item[1]
+            if result.timestamp_sec is not None:
+                time_bucket = int(float(result.timestamp_sec) // 2.0)
+                moment_key: tuple[str, object] = (
+                    "shot-time",
+                    f"{result.shot_id or '<unknown>'}:{time_bucket}",
+                )
+            elif result.shot_id:
+                moment_key = ("shot", result.shot_id)
+            else:
+                moment_key = ("frame", result.frame_id)
+            if moment_key in seen_moments:
+                continue
+            chosen.append(item)
+            chosen_ids.add(result.frame_id)
+            seen_moments.add(moment_key)
+            if len(chosen) >= max_hits_per_video:
+                break
+
+        if len(chosen) < max_hits_per_video:
+            for item in rows:
+                result = item[1]
+                if result.frame_id in chosen_ids:
+                    continue
+                chosen.append(item)
+                chosen_ids.add(result.frame_id)
+                if len(chosen) >= max_hits_per_video:
+                    break
+        selected.extend(chosen)
+
+    selected.sort(key=lambda item: item[0], reverse=True)
+    return selected
+
+
+def _results_share_local_moment(left: SearchResult, right: SearchResult) -> bool:
+    """Return whether two same-video hits are close enough to show one event."""
+    if left.video_id != right.video_id:
+        return False
+    if left.timestamp_sec is not None and right.timestamp_sec is not None:
+        return (
+            abs(float(left.timestamp_sec) - float(right.timestamp_sec))
+            <= DEFAULT_BRANCH_CONSENSUS_WINDOW_SEC
+        )
+    if left.shot_id and right.shot_id:
+        return left.shot_id == right.shot_id
+    # Metadata-free custom retrievers cannot provide local grounding. Fall
+    # back to video agreement only when neither side has moment metadata.
+    return (
+        left.timestamp_sec is None
+        and right.timestamp_sec is None
+        and not left.shot_id
+        and not right.shot_id
+    )
 
 
 def _merge_auxiliary_results(
@@ -2762,8 +2899,6 @@ def _merge_auxiliary_results(
             previous_score, previous = scored.get(result.frame_id, (0.0, result))
             scored[result.frame_id] = (previous_score + bonus, previous)
     ranked = sorted(scored.values(), key=lambda item: item[0], reverse=True)
-    output: list[SearchResult] = []
-    per_video: dict[str, int] = defaultdict(int)
     max_hits_per_video = _env_int(
         "VQA_VIDEO_HITS_PER_EVENT",
         DEFAULT_VIDEO_HITS_PER_EVENT,
@@ -2771,20 +2906,27 @@ def _merge_auxiliary_results(
         maximum=100,
     )
     visual_ids = {result.frame_id for result in visual_results}
+    rescored: list[tuple[float, SearchResult]] = []
     for retrieval_score, result in ranked:
-        if per_video[result.video_id] >= max_hits_per_video:
-            continue
         # Auxiliary OCR/ASR affects list order, but it is not visual
         # model/query consensus. Text-only frames therefore carry zero here.
-        output.append(
-            result
-            if result.frame_id in visual_ids
-            else _with_branch_consensus(result, min(1.0, retrieval_score), 0.0)
+        rescored.append(
+            (
+                retrieval_score,
+                result
+                if result.frame_id in visual_ids
+                else _with_branch_consensus(
+                    result,
+                    min(1.0, retrieval_score),
+                    0.0,
+                ),
+            )
         )
-        per_video[result.video_id] += 1
-        if len(output) >= top_k:
-            break
-    return output
+    diverse = _select_diverse_video_hits(
+        rescored,
+        max_hits_per_video=max_hits_per_video,
+    )
+    return [result for _, result in diverse[:top_k]]
 
 
 def _top_video_trace(results: list[SearchResult], *, limit: int) -> list[dict[str, object]]:

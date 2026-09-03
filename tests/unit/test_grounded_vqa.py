@@ -173,6 +173,22 @@ def test_heuristic_plan_preserves_unknown_target_and_constraints() -> None:
     assert all("nghêu" not in event.text_vi.lower() for event in plan.events)
 
 
+def test_target_count_is_not_confused_with_plate_count() -> None:
+    plan = _heuristic_plan(
+        query=(
+            "Cô gái đặt lên 1 dĩa trắng 4 con X, X là nguyên liệu món ăn. "
+            "Sau đó cô ấy cầm lên 2 con X."
+        ),
+        question="Hỏi X là con gì?",
+        context="",
+    )
+
+    target_events = [event.text_en for event in plan.events if event.answer_bearing]
+
+    assert any("placing four [TARGET]" in text for text in target_events)
+    assert all("placing one [TARGET]" not in text for text in target_events)
+
+
 def test_evidence_prompt_keeps_asr_ocr_and_caption_sections() -> None:
     prompt = _evidence_prompt(
         {
@@ -421,6 +437,86 @@ def test_variant_union_retains_a_hit_strong_in_only_one_model() -> None:
     target_result = next(result for result in merged if result.frame_id == "target")
     assert target_result.model_query_consensus == 0.5
     assert target_result.score == 0.9
+
+
+def test_variant_search_does_not_truncate_the_union_to_one_branch_pool() -> None:
+    class BranchRetriever:
+        reranker = None
+
+        def search_variant_branches(self, query_variants, **kwargs):
+            assert kwargs["top_k"] == 2
+            return {
+                "jina:en:0": [
+                    _result("j1", "jina-1", 1.0),
+                    _result("j2", "jina-2", 2.0),
+                ],
+                "siglip:en:0": [
+                    _result("s1", "siglip-1", 3.0),
+                    _result("target", "L26_V254", 4.0),
+                ],
+            }
+
+    pipeline = GroundedVqaPipeline(object(), BranchRetriever())
+    results, trace = pipeline._search_visual_variants(
+        {"en": ["target-safe event"]},
+        pool_size=2,
+        enabled_models=["jina", "siglip"],
+        use_reranker=False,
+    )
+
+    assert len(results) == 4
+    assert any(result.frame_id == "target" for result in results)
+    assert trace["per_branch_pool_size"] == 2
+    assert trace["union_limit"] == 4
+
+
+def test_variant_consensus_is_shared_by_neighboring_frames_in_one_video() -> None:
+    merged = _union_variant_branches(
+        {
+            "jina:en:0": [_result("jina-frame", "L26_V254", 10.0)],
+            "siglip:en:0": [_result("siglip-frame", "L26_V254", 11.0)],
+        },
+        top_k=10,
+        max_hits_per_video=8,
+    )
+
+    assert len(merged) == 2
+    assert all(result.model_query_consensus == 1.0 for result in merged)
+
+
+def test_variant_consensus_does_not_cross_distant_video_moments() -> None:
+    merged = _union_variant_branches(
+        {
+            "jina:en:0": [
+                _result("early", "same-video", 10.0, shot_id="shot-a")
+            ],
+            "siglip:en:0": [
+                _result("late", "same-video", 200.0, shot_id="shot-b")
+            ],
+        },
+        top_k=10,
+        max_hits_per_video=8,
+    )
+
+    assert len(merged) == 2
+    assert all(result.model_query_consensus == 0.5 for result in merged)
+
+
+def test_video_hit_cap_reserves_a_slot_for_a_later_long_shot_moment() -> None:
+    same_shot = [
+        _result(f"near-{index}", "video", float(index), shot_id="shot-a")
+        for index in range(8)
+    ]
+    later_shot = _result("later", "video", 30.0, shot_id="shot-a")
+
+    merged = _union_variant_branches(
+        {"siglip:en:0": [*same_shot, later_shot]},
+        top_k=8,
+        max_hits_per_video=8,
+    )
+
+    assert len(merged) == 8
+    assert any(result.frame_id == "later" for result in merged)
 
 
 def test_variant_retrieval_honors_enabled_reranker() -> None:
