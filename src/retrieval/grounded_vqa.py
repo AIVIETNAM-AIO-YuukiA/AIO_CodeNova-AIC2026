@@ -427,6 +427,31 @@ class GroundedVqaPipeline:
                 candidate.to_dict(include_evidence=False)
                 for candidate in candidates
             ]
+            # The five candidates sent to the VLM are not enough to diagnose
+            # retrieval misses. Preserve the diverse pre-verification pool in
+            # debug mode so operators can distinguish "no valid chain" from
+            # "valid chain ranked below the verification budget".
+            diagnostic_pool_size = _env_int(
+                "VQA_MOMENT_POOL", DEFAULT_MOMENT_POOL, minimum=5, maximum=20
+            )
+            diagnostic_candidates = build_candidate_moments(
+                plan,
+                full_results,
+                event_results,
+                candidate_count=diagnostic_pool_size,
+                moment_pool=diagnostic_pool_size,
+                beam_width=_env_int(
+                    "VQA_BEAM_WIDTH", DEFAULT_BEAM_WIDTH, minimum=1, maximum=100
+                ),
+                event_gap_sec=_env_float("VQA_EVENT_GAP_SEC", DEFAULT_EVENT_GAP_SEC),
+                max_moment_span_sec=_env_float(
+                    "VQA_MOMENT_SPAN_SEC", DEFAULT_MOMENT_SPAN_SEC
+                ),
+            )
+            retrieval_trace["candidate_pool"] = [
+                candidate.to_dict(include_evidence=False)
+                for candidate in diagnostic_candidates
+            ]
             pipeline["retrieval_trace"] = retrieval_trace
 
         if not candidates:
@@ -839,6 +864,17 @@ class GroundedVqaPipeline:
                 name: _top_video_trace(rows, limit=min(pool_size, 250))
                 for name, rows in branches.items()
             }
+            debug_video_id = os.environ.get("VQA_DEBUG_VIDEO_ID", "").strip()
+            if debug_video_id:
+                trace["debug_video_id"] = debug_video_id
+                trace["branch_video_hits"] = {
+                    name: _video_hit_trace(rows, video_id=debug_video_id)
+                    for name, rows in branches.items()
+                }
+                trace["merged_video_hits"] = _video_hit_trace(
+                    merged,
+                    video_id=debug_video_id,
+                )
         return merged, trace
 
     def _ensure_frame_index(self) -> None:
@@ -2942,6 +2978,41 @@ def _top_video_trace(results: list[SearchResult], *, limit: int) -> list[dict[st
                 "video_name": _portable_basename(result.video_name or result.video_id),
                 "first_frame_rank": frame_rank,
                 "score": round(result.score, 6),
+                "model_query_consensus": round(
+                    _result_branch_consensus(result), 6
+                ),
+            }
+        )
+        if len(output) >= limit:
+            break
+    return output
+
+
+def _video_hit_trace(
+    results: list[SearchResult],
+    *,
+    video_id: str,
+    limit: int = 20,
+) -> list[dict[str, object]]:
+    """Return ranked frame-level hits for one video in debug traces."""
+    output: list[dict[str, object]] = []
+    video_rank = 0
+    seen_videos: set[str] = set()
+    for frame_rank, result in enumerate(results, start=1):
+        if result.video_id not in seen_videos:
+            seen_videos.add(result.video_id)
+            if result.video_id == video_id:
+                video_rank = len(seen_videos)
+        if result.video_id != video_id:
+            continue
+        output.append(
+            {
+                "frame_rank": frame_rank,
+                "video_rank": video_rank or len(seen_videos),
+                "frame_id": result.frame_id,
+                "shot_id": result.shot_id,
+                "timestamp_sec": result.timestamp_sec,
+                "score": round(float(result.score), 6),
                 "model_query_consensus": round(
                     _result_branch_consensus(result), 6
                 ),
