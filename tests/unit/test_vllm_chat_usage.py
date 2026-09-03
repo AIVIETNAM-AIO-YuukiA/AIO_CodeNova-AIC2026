@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 import httpx
+import pytest
 
 from modules._vllm_chat import VllmChatClient
 
@@ -30,6 +31,41 @@ def test_text_completion_exposes_backend_usage(monkeypatch) -> None:
 def test_query_router_can_disable_shared_internal_retries() -> None:
     client = VllmChatClient(max_retries=0)
     assert client.max_retries == 0
+
+
+def test_client_strips_invisible_whitespace_from_openrouter_key() -> None:
+    client = VllmChatClient(
+        openrouter_api_key="  sk-or-v1-test\r\n",
+        openrouter_base_url=" https://openrouter.ai/api/v1/\r",
+        openrouter_model=" vision-model\r",
+        openrouter_provider=" provider-name\r",
+    )
+    assert client.openrouter_api_key == "sk-or-v1-test"
+    assert client.openrouter_base_url == "https://openrouter.ai/api/v1"
+    assert client.openrouter_model == "vision-model"
+    assert client.openrouter_provider == "provider-name"
+
+
+def test_openrouter_401_is_not_retried_and_has_actionable_error(monkeypatch) -> None:
+    client = VllmChatClient(
+        openrouter_api_key="test-key",
+        openrouter_model="vision-model",
+        max_retries=1,
+    )
+    request = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    transport = MagicMock()
+    transport.post.return_value = httpx.Response(
+        401,
+        request=request,
+        json={"error": {"message": "Unauthorized"}},
+    )
+    monkeypatch.setattr(client, "_load_openrouter_client", lambda: transport)
+
+    with pytest.raises(RuntimeError, match="restart serve-ui"):
+        client.complete_text("system", "user")
+
+    assert transport.post.call_count == 1
+    assert client.last_usage["request_count"] == 1
 
 
 def test_usage_is_isolated_between_concurrent_request_threads(monkeypatch) -> None:

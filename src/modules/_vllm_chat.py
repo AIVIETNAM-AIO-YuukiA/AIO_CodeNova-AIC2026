@@ -74,21 +74,28 @@ class VllmChatClient:
         self._usage_local = threading.local()
         self.last_usage: dict[str, object] = {}
 
-        self.openrouter_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+        raw_api_key = openrouter_api_key or os.environ.get("OPENROUTER_API_KEY")
+        # ``source .env`` on a CRLF file can leave a trailing carriage return
+        # in the exported value. It is invisible in shell output but makes an
+        # otherwise valid bearer token fail with HTTP 401.
+        self.openrouter_api_key = raw_api_key.strip() if raw_api_key else raw_api_key
         openrouter_base_url = openrouter_base_url or os.environ.get(
             "OPENROUTER_BASE_URL", _DEFAULT_OPENROUTER_BASE_URL
         )
-        self.openrouter_base_url = openrouter_base_url.rstrip("/")
+        self.openrouter_base_url = openrouter_base_url.strip().rstrip("/")
         # No default: silently falling back to some other model would change
         # what answers, so an unset OPENROUTER_MODEL must fail loudly instead.
-        self.openrouter_model = openrouter_model or os.environ.get("OPENROUTER_MODEL")
+        raw_model = openrouter_model or os.environ.get("OPENROUTER_MODEL")
+        self.openrouter_model = raw_model.strip() if raw_model else raw_model
         # Pin the upstream provider (e.g. "relace") instead of letting
         # OpenRouter auto-route across whichever providers host the model.
         # No env fallback here on purpose: callers pass this explicitly per
         # use case (e.g. query_processor.py's OPENROUTER_PROVIDER_FOR_CHAT)
         # rather than one setting silently pinning every model on this client
         # (OCR/captioning included) to a provider that may not host them.
-        self.openrouter_provider = openrouter_provider
+        self.openrouter_provider = (
+            openrouter_provider.strip() if openrouter_provider else openrouter_provider
+        )
 
         self._openrouter_client = None
         self._openrouter_client_lock = threading.Lock()
@@ -281,6 +288,11 @@ class VllmChatClient:
                 else:
                     if response.status_code >= 400:
                         LOGGER.error("OpenRouter HTTP %s: %s", response.status_code, response.text)
+                    if response.status_code == 401:
+                        raise RuntimeError(
+                            "OpenRouter rejected OPENROUTER_API_KEY (HTTP 401). "
+                            "Verify the key and restart serve-ui after changing .env."
+                        )
                     response.raise_for_status()
                     return response
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
