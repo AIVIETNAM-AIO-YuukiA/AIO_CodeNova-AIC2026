@@ -83,6 +83,9 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
   target identity consistently across them. Thus a frame sequence showing
   tomatoes in one event and mushrooms in another must abstain rather than
   return either ingredient.
+  Indexed captions are also used as an answer-neutral auxiliary branch for
+  target events (`VQA_CAPTION_RETRIEVAL=1`); run `import-text --include-captions`
+  once when the experiment has a `captions.jsonl` manifest.
 - **Legacy VQA** remains available with `pipeline_mode=legacy` for manual
   rollback. It is not used as an automatic fallback because a text-only guess
   would hide missing visual evidence.

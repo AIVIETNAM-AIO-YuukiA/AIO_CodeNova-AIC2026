@@ -62,6 +62,7 @@ DEFAULT_VQA_OPENROUTER_MAX_CONCURRENCY = 1
 DEFAULT_VQA_OPENROUTER_429_COOLDOWN_SEC = 8.0
 DEFAULT_CONTEXT_RESCUE_CANDIDATES = 2
 DEFAULT_REQUIRED_CHAIN_RESCUE_CANDIDATES = 1
+DEFAULT_CAPTION_RETRIEVAL = True
 
 _TEXT_EVIDENCE_CACHE: dict[
     str,
@@ -314,6 +315,8 @@ class VqaCandidateMoment:
     context_quality: float = 0.0
     context_anchor_score: float = 0.0
     temporal_coherence: float = 0.0
+    required_temporal_coherence: float = 0.0
+    required_shot_coherence: float = 0.0
     model_query_consensus: float = 0.0
     branch_chain_score: float = 0.0
     candidate_source: str = "ordered_event_union"
@@ -338,6 +341,10 @@ class VqaCandidateMoment:
             "context_quality": round(self.context_quality, 6),
             "context_anchor_score": round(self.context_anchor_score, 6),
             "temporal_coherence": round(self.temporal_coherence, 6),
+            "required_temporal_coherence": round(
+                self.required_temporal_coherence, 6
+            ),
+            "required_shot_coherence": round(self.required_shot_coherence, 6),
             "model_query_consensus": round(self.model_query_consensus, 6),
             "branch_chain_score": round(self.branch_chain_score, 6),
             "candidate_source": self.candidate_source,
@@ -898,6 +905,7 @@ class GroundedVqaPipeline:
             use_reranker=use_reranker,
         )
         auxiliary: list[list[SearchResult]] = []
+        auxiliary_sources: set[str] = set()
         for source, keywords in (
             ("ocr", event.ocr_keywords),
             ("asr", event.asr_keywords),
@@ -918,7 +926,39 @@ class GroundedVqaPipeline:
             hits = [result for result in converted if result is not None]
             if hits:
                 auxiliary.append(hits)
-                trace.setdefault("text_sources", []).append(source)
+                auxiliary_sources.add(source)
+        if event.answer_bearing and _env_bool(
+            "VQA_CAPTION_RETRIEVAL", DEFAULT_CAPTION_RETRIEVAL
+        ):
+            # Captions can contain a concrete noun while the visual query must
+            # remain target-safe. Search only the concise bilingual action
+            # variants, never the original question or an inferred answer.
+            caption_queries = _caption_retrieval_queries(variants)
+            trace["caption_retrieval_enabled"] = True
+            trace["caption_retrieval_queries"] = caption_queries
+            for caption_query in caption_queries:
+                try:
+                    response = text_search(
+                        self.experiment,
+                        query=caption_query,
+                        source="caption",
+                        top_k=pool_size,
+                    )
+                except Exception as exc:
+                    LOGGER.warning("VQA caption event search degraded: %s", exc)
+                    continue
+                converted = [
+                    _search_result_from_mapping(row)
+                    for row in response.get("results", [])
+                ]
+                hits = [result for result in converted if result is not None]
+                if hits:
+                    auxiliary.append(hits)
+                    auxiliary_sources.add("caption")
+        elif event.answer_bearing:
+            trace["caption_retrieval_enabled"] = False
+        if auxiliary_sources:
+            trace["text_sources"] = sorted(auxiliary_sources)
         if auxiliary:
             # ``pool_size`` limits every visual/text branch independently.
             # Do not collapse their union back to the same size: a frame that
@@ -2114,7 +2154,8 @@ def build_candidate_moments(
     """
     event_count = max(1, len(plan.events))
     required_indices = sorted(_required_event_indices(plan))
-    context_indices = sorted(set(range(event_count)) - set(required_indices))
+    event_indices = {event.index for event in plan.events}
+    context_indices = sorted(event_indices - set(required_indices))
     full_by_video: dict[str, list[tuple[int, SearchResult, float]]] = defaultdict(list)
     full_video_ranks: dict[str, int] = {}
     for result in full_results:
@@ -2291,6 +2332,14 @@ def build_candidate_moments(
                 end_sec - start_sec,
                 max_moment_span_sec=max_moment_span_sec,
             )
+            required_times = [
+                float(hit.result.timestamp_sec or 0.0) for hit in required_hits
+            ]
+            required_temporal_coherence = _temporal_coherence(
+                max(required_times) - min(required_times),
+                max_moment_span_sec=max_moment_span_sec,
+            )
+            required_shot_coherence = _required_shot_coherence(required_hits)
             retrieval_score = (
                 0.42 * ordered_quality
                 + 0.23 * context_component
@@ -2316,6 +2365,8 @@ def build_candidate_moments(
                     context_quality=context_quality,
                     context_anchor_score=context_anchor_score,
                     temporal_coherence=temporal_coherence,
+                    required_temporal_coherence=required_temporal_coherence,
+                    required_shot_coherence=required_shot_coherence,
                     model_query_consensus=consensus,
                     branch_chain_score=branch_chain_score,
                     global_hit=global_hit,
@@ -2449,22 +2500,12 @@ def build_candidate_moments(
                 break
 
     if required_chain_rescue_slots and len(selected) < candidate_count:
-        # This reserve exists specifically for a valid chain that the normal
-        # ``moment_pool`` truncation did *not* retain. If we score every raw
-        # candidate together, a generic high-global candidate that is already
-        # available in ``ranked_pool`` can consume the reserve and recreate
-        # the original recall failure.
-        ranked_pool_ids = {id(candidate) for candidate in ranked_pool}
-        outside_moment_pool = [
-            candidate
-            for candidate in all_complete_candidates
-            if candidate.required_event_coverage >= 1.0
-            and id(candidate) not in ranked_pool_ids
-            and candidate not in selected
-        ]
+        # Consider every complete chain here. A valid target sequence may be
+        # inside ``moment_pool`` but still lose the standard slots to generic
+        # high-score videos; restricting this reserve to candidates outside
+        # the pool would silently recreate that recall failure.
         required_chain_pool = sorted(
-            outside_moment_pool
-            or [
+            [
                 candidate
                 for candidate in all_complete_candidates
                 if candidate.required_event_coverage >= 1.0
@@ -3521,6 +3562,16 @@ def _event_retrieval_variants(
     return {language: _unique_strings(values) for language, values in variants.items()}
 
 
+def _caption_retrieval_queries(variants: dict[str, list[str]]) -> list[str]:
+    """Choose short, target-safe bilingual queries for caption search."""
+    queries: list[str] = []
+    for language in ("en", "vi"):
+        values = variants.get(language, [])
+        if values:
+            queries.append(values[-1])
+    return _unique_strings(queries)
+
+
 def _target_focused_phrase(text: str, *, language: str) -> str:
     """Extract the observable target action from an answer-neutral event."""
     cleaned = " ".join(str(text).split()).strip(" ,.;:")
@@ -4034,6 +4085,22 @@ def _context_hit_quality(hit: EventHit) -> float:
     return 0.75 * hit.rank_score + 0.25 * _result_branch_consensus(hit.result)
 
 
+def _required_shot_coherence(required_hits: list[EventHit]) -> float:
+    """Score whether required actions are observed in one local shot.
+
+    A shot match is useful recall evidence for ordered actions, but it is only
+    a ranking signal: valid actions can cross a cut and the VLM remains the
+    authority for grounding.
+    """
+    if len(required_hits) <= 1:
+        return 1.0
+    shot_ids = [hit.result.shot_id for hit in required_hits]
+    known = [shot_id for shot_id in shot_ids if shot_id]
+    if len(known) != len(shot_ids):
+        return 0.5
+    return 1.0 if len(set(known)) == 1 else 0.0
+
+
 def _temporal_coherence(span_sec: float, *, max_moment_span_sec: float) -> float:
     """Softly prefer compact evidence without rejecting long valid moments."""
     denominator = max(1.0, float(max_moment_span_sec))
@@ -4063,7 +4130,7 @@ def _context_rescue_sort_key(candidate: VqaCandidateMoment) -> tuple[float, floa
 
 def _required_chain_rescue_sort_key(
     candidate: VqaCandidateMoment,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float]:
     """Rank the bounded recall reserve by branch evidence and compactness.
 
     ``branch_chain_score`` is deliberately separate from the global score:
@@ -4082,13 +4149,17 @@ def _required_chain_rescue_sort_key(
         candidate.branch_chain_score - candidate.chain_score,
     )
     reserve_score = (
-        0.50 * branch_recall_gap
-        + 0.25 * candidate.branch_chain_score
-        + 0.15 * candidate.context_anchor_score
-        + 0.10 * candidate.temporal_coherence
+        0.35 * candidate.required_shot_coherence
+        + 0.25 * candidate.required_temporal_coherence
+        + 0.20 * branch_recall_gap
+        + 0.10 * candidate.branch_chain_score
+        + 0.05 * candidate.context_anchor_score
+        + 0.05 * candidate.temporal_coherence
     )
     return (
         reserve_score,
+        candidate.required_shot_coherence,
+        candidate.required_temporal_coherence,
         branch_recall_gap,
         candidate.branch_chain_score,
         candidate.context_anchor_score,

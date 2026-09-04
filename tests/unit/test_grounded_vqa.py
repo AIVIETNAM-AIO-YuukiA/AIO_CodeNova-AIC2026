@@ -27,6 +27,7 @@ from retrieval.grounded_vqa import (
     _union_variant_branches,
     _vqa_verification_worker_count,
     _verification_from_payload,
+    _with_branch_consensus,
     build_candidate_moments,
 )
 
@@ -552,6 +553,117 @@ def test_required_chain_rescue_prefers_chain_outside_moment_pool(monkeypatch) ->
     rescued = next(candidate for candidate in candidates if candidate.video_id == "target")
     assert rescued.candidate_source == "required_chain_rescue"
     assert "preserved_from_branch_evidence" in rescued.selection_reason
+
+
+def test_required_chain_rescue_prefers_compact_same_shot_chain(monkeypatch) -> None:
+    """A local ordered chain survives stronger but fragmented distractors."""
+    monkeypatch.setenv("VQA_CONTEXT_RESCUE_CANDIDATES", "0")
+    monkeypatch.setenv("VQA_REQUIRED_CHAIN_RESCUE_CANDIDATES", "1")
+    plan = _plan()
+
+    def branch_result(
+        frame_id: str,
+        video_id: str,
+        timestamp: float,
+        *,
+        branch_score: float,
+        shot_id: str,
+    ) -> SearchResult:
+        return _with_branch_consensus(
+            _result(frame_id, video_id, timestamp, shot_id=shot_id),
+            score=0.5,
+            consensus=0.0,
+            best_branch_rank_score=branch_score,
+            branch_names=("jina:en:0",),
+        )
+
+    event_results = [
+        [
+            branch_result(
+                "generic-0", "generic", 10.0, branch_score=0.99, shot_id="g0"
+            ),
+            branch_result(
+                "fragmented-0", "fragmented", 30.0, branch_score=0.99, shot_id="f0"
+            ),
+            branch_result(
+                "compact-0", "compact", 90.0, branch_score=0.40, shot_id="target"
+            ),
+        ],
+        [
+            branch_result(
+                "generic-1", "generic", 50.0, branch_score=0.99, shot_id="g1"
+            ),
+            branch_result(
+                "fragmented-1", "fragmented", 70.0, branch_score=0.99, shot_id="f1"
+            ),
+            branch_result(
+                "compact-1", "compact", 92.0, branch_score=0.40, shot_id="target"
+            ),
+        ],
+        [],
+    ]
+
+    candidates = build_candidate_moments(
+        plan,
+        [
+            _result("generic-full", "generic", 10.0),
+            _result("fragmented-full", "fragmented", 30.0),
+            _result("compact-full", "compact", 90.0),
+        ],
+        event_results,
+        candidate_count=2,
+        moment_pool=1,
+    )
+
+    assert [candidate.video_id for candidate in candidates] == [
+        "generic",
+        "compact",
+    ]
+    rescued = candidates[1]
+    assert rescued.candidate_source == "required_chain_rescue"
+    assert rescued.required_shot_coherence == 1.0
+    assert rescued.required_temporal_coherence > 0.98
+
+
+def test_target_event_caption_retrieval_keeps_target_masked(monkeypatch) -> None:
+    monkeypatch.setenv("VQA_CAPTION_RETRIEVAL", "1")
+    calls: list[tuple[str, str]] = []
+
+    class BranchRetriever:
+        reranker = None
+
+        def search_variant_branches(self, query_variants, **kwargs):
+            return {}
+
+    def fake_text_search(experiment, *, query, source, top_k):
+        calls.append((query, source))
+        return {"results": []}
+
+    monkeypatch.setattr("retrieval.grounded_vqa.text_search", fake_text_search)
+    pipeline = GroundedVqaPipeline(object(), BranchRetriever())
+    event = VqaEvent(
+        0,
+        "woman placing four [TARGET] on a white plate",
+        "dat bon [TARGET] len dia trang",
+        answer_bearing=True,
+    )
+
+    _, trace = pipeline._search_event(
+        event,
+        plan=_plan(),
+        pool_size=20,
+        enabled_models=None,
+        use_reranker=False,
+    )
+
+    assert calls
+    assert all(source == "caption" for _, source in calls)
+    assert all("[TARGET]" not in query.upper() for query, _ in calls)
+    assert all(
+        "clam" not in query.lower() and "nghêu" not in query.lower()
+        for query, _ in calls
+    )
+    assert trace["caption_retrieval_enabled"] is True
 
 
 def test_optional_context_can_follow_required_actions_within_moment_window() -> None:

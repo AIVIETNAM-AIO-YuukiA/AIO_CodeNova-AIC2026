@@ -271,7 +271,7 @@ class AsrTemporalMapper:
 
 
 def text_search(experiment: Experiment, query: str, source: str, top_k: int = 20) -> dict:
-    """Search ASR (``source="asr"``) or OCR (``source="ocr"``) text directly.
+    """Search ASR, OCR, or caption text directly.
 
     Returns matches ranked by BM25 score, hydrated with frame metadata so the
     UI can render an image + timestamp per hit like the other tracks.
