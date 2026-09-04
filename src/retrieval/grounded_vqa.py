@@ -21,15 +21,16 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import json
 import logging
 import math
 import os
 import re
-from threading import Lock
-from time import perf_counter
-from typing import Any
+from threading import Condition, Lock
+from time import monotonic, perf_counter
+from typing import Any, Iterator
 import unicodedata
 
 from config.settings import Experiment
@@ -44,7 +45,8 @@ from retrieval.text_search import infer_asr_intervals, text_search
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_RETRIEVAL_POOL = 500
-DEFAULT_VIDEO_HITS_PER_EVENT = 8
+DEFAULT_CANDIDATE_VIDEO_HITS_PER_EVENT = 24
+DEFAULT_VIDEO_HITS_PER_BRANCH = 1
 DEFAULT_MOMENT_POOL = 20
 DEFAULT_CANDIDATE_COUNT = 5
 DEFAULT_BEAM_WIDTH = 20
@@ -54,6 +56,10 @@ DEFAULT_MOMENT_SPAN_SEC = 180.0
 DEFAULT_EVIDENCE_PADDING_SEC = 2.0
 DEFAULT_MIN_CONFIDENCE = 0.65
 DEFAULT_BRANCH_CONSENSUS_WINDOW_SEC = 3.0
+DEFAULT_VQA_VERIFICATION_CONCURRENCY = 1
+DEFAULT_VQA_OPENROUTER_MAX_CONCURRENCY = 1
+DEFAULT_VQA_OPENROUTER_429_COOLDOWN_SEC = 8.0
+DEFAULT_CONTEXT_RESCUE_CANDIDATES = 2
 
 _TEXT_EVIDENCE_CACHE: dict[
     str,
@@ -65,6 +71,147 @@ _FRAME_INDEX_CACHE: dict[
     tuple[dict[str, FrameRecord], dict[str, list[FrameRecord]]],
 ] = {}
 _FRAME_INDEX_LOCK = Lock()
+
+# VQA's planner, candidate verifiers, and final judge all share the same
+# provider pool.  Keeping this gate local to Grounded VQA avoids a burst of
+# multi-image requests (or a second browser request) exhausting a shared
+# OpenRouter provider, while leaving caption/OCR/Agent traffic untouched.
+_VQA_OPENROUTER_GATE = Condition(Lock())
+_VQA_OPENROUTER_INFLIGHT = 0
+_VQA_OPENROUTER_DEFER_UNTIL = 0.0
+
+
+def _vqa_verification_worker_count(candidate_count: int) -> int:
+    """Return the bounded per-request verifier parallelism.
+
+    The global gate below is the final protection across requests.  This
+    setting still matters because it bounds queued image encoding work and
+    makes the normal default visibly sequential rather than silently using a
+    hard-coded three worker burst.
+    """
+    return min(
+        max(0, candidate_count),
+        _env_int(
+            "VQA_VERIFICATION_CONCURRENCY",
+            DEFAULT_VQA_VERIFICATION_CONCURRENCY,
+            minimum=1,
+            maximum=5,
+        ),
+    )
+
+
+def _vqa_openrouter_gate_settings() -> tuple[int, float]:
+    return (
+        _env_int(
+            "VQA_OPENROUTER_MAX_CONCURRENCY",
+            DEFAULT_VQA_OPENROUTER_MAX_CONCURRENCY,
+            minimum=1,
+            maximum=5,
+        ),
+        _env_float(
+            "VQA_OPENROUTER_429_COOLDOWN_SEC",
+            DEFAULT_VQA_OPENROUTER_429_COOLDOWN_SEC,
+        ),
+    )
+
+
+def _vqa_openrouter_gate_snapshot() -> dict[str, object]:
+    """Expose gate state without exposing credentials or request payloads."""
+    max_concurrency, cooldown_sec = _vqa_openrouter_gate_settings()
+    with _VQA_OPENROUTER_GATE:
+        remaining = max(0.0, _VQA_OPENROUTER_DEFER_UNTIL - monotonic())
+        return {
+            "max_concurrency": max_concurrency,
+            "verification_concurrency": _env_int(
+                "VQA_VERIFICATION_CONCURRENCY",
+                DEFAULT_VQA_VERIFICATION_CONCURRENCY,
+                minimum=1,
+                maximum=5,
+            ),
+            "inflight": _VQA_OPENROUTER_INFLIGHT,
+            "cooldown_sec": cooldown_sec,
+            "cooldown_remaining_ms": round(remaining * 1000.0, 3),
+            "cooldown_active": remaining > 0.0,
+        }
+
+
+def _is_openrouter_rate_limited(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code == 429:
+        return True
+    return "429" in str(exc)
+
+
+def _openrouter_retry_after_seconds(exc: Exception) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        return None
+    return value if math.isfinite(value) and value >= 0.0 else None
+
+
+@contextmanager
+def _vqa_openrouter_slot() -> Iterator[dict[str, object]]:
+    """Serialize/throttle VQA OpenRouter work, including client retries.
+
+    ``VllmChatClient`` already retries transient provider failures.  The slot
+    intentionally wraps the whole client call, so no second VQA task starts a
+    new request while the first one is sleeping before its retry.
+    """
+    global _VQA_OPENROUTER_INFLIGHT, _VQA_OPENROUTER_DEFER_UNTIL
+
+    started = monotonic()
+    max_concurrency, configured_cooldown = _vqa_openrouter_gate_settings()
+    with _VQA_OPENROUTER_GATE:
+        while True:
+            now = monotonic()
+            cooldown_remaining = _VQA_OPENROUTER_DEFER_UNTIL - now
+            if _VQA_OPENROUTER_INFLIGHT < max_concurrency and cooldown_remaining <= 0.0:
+                _VQA_OPENROUTER_INFLIGHT += 1
+                break
+            wait_for = cooldown_remaining if cooldown_remaining > 0.0 else None
+            _VQA_OPENROUTER_GATE.wait(timeout=wait_for)
+
+    telemetry: dict[str, object] = {
+        "vqa_gate_wait_ms": round((monotonic() - started) * 1000.0, 3),
+        "vqa_gate_max_concurrency": max_concurrency,
+        "vqa_gate_rate_limited": False,
+    }
+    try:
+        yield telemetry
+    except Exception as exc:
+        if _is_openrouter_rate_limited(exc):
+            retry_after = _openrouter_retry_after_seconds(exc)
+            cooldown = max(configured_cooldown, retry_after or 0.0)
+            with _VQA_OPENROUTER_GATE:
+                _VQA_OPENROUTER_DEFER_UNTIL = max(
+                    _VQA_OPENROUTER_DEFER_UNTIL,
+                    monotonic() + cooldown,
+                )
+                _VQA_OPENROUTER_GATE.notify_all()
+            telemetry["vqa_gate_rate_limited"] = True
+            telemetry["vqa_gate_cooldown_sec"] = round(cooldown, 3)
+        raise
+    finally:
+        with _VQA_OPENROUTER_GATE:
+            _VQA_OPENROUTER_INFLIGHT = max(0, _VQA_OPENROUTER_INFLIGHT - 1)
+            _VQA_OPENROUTER_GATE.notify_all()
+
+
+def _gate_usage(usage: dict[str, object], telemetry: dict[str, object] | None) -> dict[str, object]:
+    """Add per-operation gate telemetry to a Vllm client usage snapshot."""
+    output = dict(usage)
+    if telemetry:
+        output.update(telemetry)
+    return output
 
 
 @dataclass(frozen=True)
@@ -160,7 +307,11 @@ class VqaCandidateMoment:
     retrieval_score: float
     required_event_coverage: float = 0.0
     optional_context_coverage: float = 0.0
+    context_quality: float = 0.0
+    context_anchor_score: float = 0.0
     model_query_consensus: float = 0.0
+    candidate_source: str = "ordered_event_union"
+    selection_reason: str = "standard_rank"
     global_hit: SearchResult | None = None
     evidence_frames: list[dict[str, object]] = field(default_factory=list)
     text_evidence: dict[str, list[dict[str, object]]] = field(default_factory=dict)
@@ -178,7 +329,11 @@ class VqaCandidateMoment:
             "retrieval_score": round(self.retrieval_score, 6),
             "required_event_coverage": round(self.required_event_coverage, 6),
             "optional_context_coverage": round(self.optional_context_coverage, 6),
+            "context_quality": round(self.context_quality, 6),
+            "context_anchor_score": round(self.context_anchor_score, 6),
             "model_query_consensus": round(self.model_query_consensus, 6),
+            "candidate_source": self.candidate_source,
+            "selection_reason": self.selection_reason,
             "event_hits": [hit.to_dict() for hit in self.event_hits],
         }
         if include_evidence:
@@ -281,15 +436,17 @@ Schema:
         )
         usage: dict[str, object] = {}
         client: VllmChatClient | None = None
+        gate_telemetry: dict[str, object] | None = None
         try:
             client = self._load_client()
             client.last_usage = {}
-            raw = client.complete_text(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                generation_params={"temperature": 0.0, "max_tokens": 900},
-            )
-            usage = _client_usage(client)
+            with _vqa_openrouter_slot() as gate_telemetry:
+                raw = client.complete_text(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    generation_params={"temperature": 0.0, "max_tokens": 900},
+                )
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             payload = _extract_json_object(raw)
             if payload.get("answer_guess") not in (None, "", "null"):
                 raise ValueError("planner attempted to guess the answer")
@@ -301,7 +458,7 @@ Schema:
                 usage=usage,
             )
         except Exception as exc:  # Planner must fail open to the deterministic plan.
-            usage = _client_usage(client)
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             LOGGER.warning("Grounded VQA planning failed; using heuristic plan: %s", exc)
             return VqaQueryPlan(
                 **{
@@ -409,15 +566,18 @@ class GroundedVqaPipeline:
                 "VQA_MOMENT_SPAN_SEC", DEFAULT_MOMENT_SPAN_SEC
             ),
         )
+        candidate_hit_limit = _candidate_video_hit_limit()
         pipeline["event_retrieval"] = {
             "fixed_pool_size": pool_size,
             "display_top_k": top_k,
             "full_results_count": len(full_results),
             "event_result_counts": [len(results) for results in event_results],
+            "candidate_video_hits_per_event": candidate_hit_limit,
             "candidate_count": len(candidates),
             "candidates_count": len(candidates),
             "elapsed_ms": _elapsed_ms(tick),
         }
+        pipeline["openrouter"] = _vqa_openrouter_gate_snapshot()
         if _env_bool("VQA_DEBUG_TRACE", False):
             retrieval_trace = dict(getattr(self, "_retrieval_trace", {}))
             retrieval_trace["required_event_indices"] = sorted(
@@ -519,10 +679,18 @@ class GroundedVqaPipeline:
         supported_count = sum(
             verification.verdict == "supported" for verification in verifications
         )
+        verification_workers = _vqa_verification_worker_count(len(candidates))
         pipeline["candidate_verification"] = {
             "requested": len(candidates),
             "completed": len(verifications),
             "candidate_count": len(candidates),
+            "configured_concurrency": _env_int(
+                "VQA_VERIFICATION_CONCURRENCY",
+                DEFAULT_VQA_VERIFICATION_CONCURRENCY,
+                minimum=1,
+                maximum=5,
+            ),
+            "effective_workers": verification_workers,
             "supported_count": supported_count,
             "verdicts": {
                 verification.candidate_id: verification.verdict
@@ -552,6 +720,7 @@ class GroundedVqaPipeline:
             "error": final_error,
             "elapsed_ms": _elapsed_ms(tick),
         }
+        pipeline["openrouter"] = _vqa_openrouter_gate_snapshot()
 
         selected = next(
             (
@@ -689,22 +858,7 @@ class GroundedVqaPipeline:
         enabled_models: list[str] | None,
         use_reranker: bool | None,
     ) -> tuple[list[SearchResult], dict[str, object]]:
-        variants = {
-            "en": [
-                _target_safe_search_text(
-                    event.text_en,
-                    language="en",
-                    answer_type=plan.answer_type,
-                )
-            ],
-            "vi": [
-                _target_safe_search_text(
-                    event.text_vi,
-                    language="vi",
-                    answer_type=plan.answer_type,
-                )
-            ],
-        }
+        variants = _event_retrieval_variants(event, plan=plan)
         visual_results, trace = self._search_visual_variants(
             variants,
             pool_size=pool_size,
@@ -757,12 +911,7 @@ class GroundedVqaPipeline:
         enabled_models: list[str] | None,
         use_reranker: bool | None,
     ) -> tuple[list[SearchResult], dict[str, object]]:
-        video_cap = _env_int(
-            "VQA_VIDEO_HITS_PER_EVENT",
-            DEFAULT_VIDEO_HITS_PER_EVENT,
-            minimum=1,
-            maximum=100,
-        )
+        video_cap = _candidate_video_hit_limit()
         search_branches = getattr(self.retriever, "search_variant_branches", None)
         if callable(search_branches):
             branches = search_branches(
@@ -796,10 +945,17 @@ class GroundedVqaPipeline:
             pool_size,
             sum(len(rows) for rows in branches.values()),
         )
+        branch_reserve = _env_int(
+            "VQA_VIDEO_HITS_PER_BRANCH",
+            DEFAULT_VIDEO_HITS_PER_BRANCH,
+            minimum=0,
+            maximum=4,
+        )
         merged = _union_variant_branches(
             branches,
             top_k=union_limit,
             max_hits_per_video=video_cap,
+            reserve_per_branch=branch_reserve,
         )
         reranker = getattr(self.retriever, "reranker", None)
         reranker_applied = False
@@ -853,6 +1009,8 @@ class GroundedVqaPipeline:
             "branch_counts": {name: len(rows) for name, rows in branches.items()},
             "per_branch_pool_size": pool_size,
             "union_limit": union_limit,
+            "candidate_video_hit_limit": video_cap,
+            "per_video_branch_reserve": branch_reserve,
             "merged_result_count": len(merged),
             "merged_video_count": len({row.video_id for row in merged}),
             "top_videos": _top_video_trace(merged, limit=trace_limit),
@@ -1217,7 +1375,7 @@ class GroundedVqaPipeline:
         context: str,
         candidates: list[VqaCandidateMoment],
     ) -> list[VqaVerification]:
-        workers = min(3, len(candidates))
+        workers = _vqa_verification_worker_count(len(candidates))
         if workers <= 0:
             return []
         output: dict[str, VqaVerification] = {}
@@ -1353,18 +1511,20 @@ not a substitute for contradictory images. Cite only supplied frame labels.
 Return JSON only, with a short answer and no hidden chain-of-thought."""
         usage: dict[str, object] = {}
         client: VllmChatClient | None = None
+        gate_telemetry: dict[str, object] | None = None
         try:
             client = self._load_vlm_client()
             client.last_usage = {}
-            raw = client.complete_with_images(
-                system_prompt=system,
-                user_prompt=prompt,
-                image_paths=[str(frame["frame_path"]) for frame in frames],
-                image_labels=list(frame_map),
-                detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
-                generation_params={"temperature": 0.0, "max_tokens": 700},
-            )
-            usage = _client_usage(client)
+            with _vqa_openrouter_slot() as gate_telemetry:
+                raw = client.complete_with_images(
+                    system_prompt=system,
+                    user_prompt=prompt,
+                    image_paths=[str(frame["frame_path"]) for frame in frames],
+                    image_labels=list(frame_map),
+                    detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
+                    generation_params={"temperature": 0.0, "max_tokens": 700},
+                )
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             payload = _extract_json_object(raw)
             return _verification_from_payload(
                 candidate=candidate,
@@ -1376,7 +1536,7 @@ Return JSON only, with a short answer and no hidden chain-of-thought."""
                 frame_times=frame_times,
             )
         except Exception as exc:
-            usage = _client_usage(client)
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             LOGGER.warning("VQA candidate %s verification failed: %s", candidate.candidate_id, exc)
             return _error_verification(
                 candidate.candidate_id,
@@ -1542,22 +1702,24 @@ Return strict JSON:
 "supporting_frames":["F1"],"evidence_summary":"brief observable evidence"}}"""
         usage: dict[str, object] = {}
         client: VllmChatClient | None = None
+        gate_telemetry: dict[str, object] | None = None
         try:
             client = self._load_vlm_client()
             client.last_usage = {}
-            raw = client.complete_with_images(
-                system_prompt=(
-                    "You are the final grounded VQA judge. Select only a proposed answer "
-                    "that satisfies the user constraints and supplied images. Otherwise return "
-                    "insufficient_evidence. Return JSON only."
-                ),
-                user_prompt=prompt,
-                image_paths=[str(frame["frame_path"]) for frame in final_frames],
-                image_labels=labels,
-                detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
-                generation_params={"temperature": 0.0, "max_tokens": 500},
-            )
-            usage = _client_usage(client)
+            with _vqa_openrouter_slot() as gate_telemetry:
+                raw = client.complete_with_images(
+                    system_prompt=(
+                        "You are the final grounded VQA judge. Select only a proposed answer "
+                        "that satisfies the user constraints and supplied images. Otherwise return "
+                        "insufficient_evidence. Return JSON only."
+                    ),
+                    user_prompt=prompt,
+                    image_paths=[str(frame["frame_path"]) for frame in final_frames],
+                    image_labels=labels,
+                    detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
+                    generation_params={"temperature": 0.0, "max_tokens": 500},
+                )
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             usage["_logical_calls"] = 1
             payload = _extract_json_object(raw)
             selected_id = str(payload.get("selected_candidate_id") or "")
@@ -1613,7 +1775,7 @@ Return strict JSON:
                 None,
             )
         except Exception as exc:
-            usage = _client_usage(client)
+            usage = _gate_usage(_client_usage(client), gate_telemetry)
             LOGGER.warning("Final VQA verification failed: %s", exc)
             usage["_logical_calls"] = 1
             return (
@@ -1695,9 +1857,15 @@ Return strict JSON:
                         "optional_context_coverage": round(
                             candidate.optional_context_coverage, 6
                         ),
+                        "context_quality": round(candidate.context_quality, 6),
+                        "context_anchor_score": round(
+                            candidate.context_anchor_score, 6
+                        ),
                         "model_query_consensus": round(
                             candidate.model_query_consensus, 6
                         ),
+                        "candidate_source": candidate.candidate_source,
+                        "selection_reason": candidate.selection_reason,
                         "evidence_frames": candidate.evidence_frames,
                     }
                 )
@@ -1814,12 +1982,7 @@ def build_candidate_moments(
     hits_by_video: dict[str, dict[int, list[EventHit]]] = defaultdict(
         lambda: defaultdict(list)
     )
-    video_hit_limit = _env_int(
-        "VQA_VIDEO_HITS_PER_EVENT",
-        DEFAULT_VIDEO_HITS_PER_EVENT,
-        minimum=1,
-        maximum=100,
-    )
+    video_hit_limit = _candidate_video_hit_limit()
     for event_index, results in enumerate(event_results):
         video_ranks: dict[str, int] = {}
         for result in results:
@@ -1846,7 +2009,7 @@ def build_candidate_moments(
             continue
 
         beams: list[tuple[EventHit, ...]] = [()]
-        for event_index in required_indices:
+        for required_position, event_index in enumerate(required_indices):
             expanded: list[tuple[EventHit, ...]] = []
             for chain in beams:
                 for hit in hits_per_event[event_index]:
@@ -1870,17 +2033,24 @@ def build_candidate_moments(
             for chain in expanded:
                 key = tuple(hit.result.frame_id for hit in chain)
                 unique[key] = chain
-            beams = sorted(
+            # Do not prune the first required event before it has had a chance
+            # to pair with the second.  The only correct first action can be
+            # lower-ranked than generic shots from the same video.  After a
+            # valid pair exists, beam pruning remains bounded as before.
+            ranked_beams = sorted(
                 unique.values(),
-                key=lambda chain: (
-                    sum(hit.rank_score for hit in chain) / len(chain),
-                    -(
-                        float(chain[-1].result.timestamp_sec or 0.0)
-                        - float(chain[0].result.timestamp_sec or 0.0)
-                    ),
+                key=lambda chain: _beam_chain_sort_key(
+                    chain,
+                    hits_per_event=hits_per_event,
+                    context_indices=context_indices,
+                    max_moment_span_sec=max_moment_span_sec,
                 ),
                 reverse=True,
-            )[:beam_width]
+            )
+            if required_position == 0 and len(required_indices) > 1:
+                beams = ranked_beams
+            else:
+                beams = ranked_beams[:beam_width]
 
         for required_chain in beams:
             chain = list(required_chain)
@@ -1893,7 +2063,6 @@ def build_candidate_moments(
                     and _context_hit_fits_chain(
                         hit,
                         chain,
-                        event_gap_sec=event_gap_sec,
                         max_moment_span_sec=max_moment_span_sec,
                     )
                 ]
@@ -1924,9 +2093,41 @@ def build_candidate_moments(
             consensus = sum(
                 _result_branch_consensus(hit.result) for hit in required_hits
             ) / len(required_hits)
+            context_hits = [hit for hit in chain if hit.event_index in context_indices]
+            if context_indices:
+                context_values = [
+                    (hit.event_index, _context_hit_quality(hit))
+                    for hit in context_hits
+                ]
+                context_quality = (
+                    sum(value for _, value in context_values) / len(context_values)
+                    if context_values
+                    else 0.0
+                )
+                # The scene established before the hidden target is usually
+                # more discriminative than a generic after-action dialogue.
+                # Prefer that anchor for the rescue route while retaining all
+                # optional context in the normal fusion score above.
+                pre_target_values = [
+                    value
+                    for event_index, value in context_values
+                    if event_index < required_indices[0]
+                ]
+                context_anchor_score = max(
+                    pre_target_values or [value for _, value in context_values],
+                    default=0.0,
+                )
+                context_component = context_coverage * context_quality
+            else:
+                # A plan made solely of required events should not lose the
+                # formerly-neutral context component merely because it has no
+                # optional context event to attach.
+                context_quality = 1.0
+                context_anchor_score = 1.0
+                context_component = 1.0
             retrieval_score = (
                 0.45 * ordered_quality
-                + 0.25 * context_coverage
+                + 0.25 * context_component
                 + 0.20 * consensus
                 + 0.10 * global_score
             )
@@ -1945,6 +2146,8 @@ def build_candidate_moments(
                     retrieval_score=retrieval_score,
                     required_event_coverage=required_coverage,
                     optional_context_coverage=context_coverage,
+                    context_quality=context_quality,
+                    context_anchor_score=context_anchor_score,
                     model_query_consensus=consensus,
                     global_hit=global_hit,
                 )
@@ -1958,6 +2161,7 @@ def build_candidate_moments(
         ),
         reverse=True,
     )
+    all_complete_candidates = list(raw)
     # Build the moment pool with one best moment per video first. Otherwise a
     # single high-density video can occupy all 20 beam outputs before the
     # candidate-level diversity pass ever sees another video.
@@ -1980,14 +2184,19 @@ def build_candidate_moments(
             pooled_ids.add(id(candidate))
             if len(diverse_pool) >= moment_pool:
                 break
-    raw = diverse_pool
+    ranked_pool = diverse_pool
     selected: list[VqaCandidateMoment] = []
 
-    def add_candidates(max_per_video: int) -> None:
+    def add_candidates(
+        source: list[VqaCandidateMoment],
+        *,
+        max_per_video: int,
+        limit: int,
+    ) -> None:
         per_video = defaultdict(int)
         for existing in selected:
             per_video[existing.video_id] += 1
-        for candidate in raw:
+        for candidate in source:
             if candidate in selected or per_video[candidate.video_id] >= max_per_video:
                 continue
             if any(
@@ -1999,12 +2208,63 @@ def build_candidate_moments(
             candidate.candidate_id = f"c{len(selected) + 1}"
             selected.append(candidate)
             per_video[candidate.video_id] += 1
-            if len(selected) >= candidate_count:
+            if len(selected) >= limit:
                 return
 
-    add_candidates(1)
+    # Keep one VLM slot for a distinctive context anchor when possible. This
+    # candidate still has a complete, strictly ordered required-event chain;
+    # it only gets a different *selection* route so generic high-score videos
+    # cannot crowd every candidate slot before visual verification.
+    rescue_slots = (
+        min(
+            _env_int(
+                "VQA_CONTEXT_RESCUE_CANDIDATES",
+                DEFAULT_CONTEXT_RESCUE_CANDIDATES,
+                minimum=0,
+                maximum=2,
+            ),
+            max(0, candidate_count - 1),
+        )
+        if plan.target_reference and len(required_indices) >= 2 and context_indices
+        else 0
+    )
+    standard_limit = candidate_count - rescue_slots
+    add_candidates(ranked_pool, max_per_video=1, limit=standard_limit)
+    if len(selected) < standard_limit:
+        add_candidates(ranked_pool, max_per_video=2, limit=standard_limit)
+
+    if rescue_slots:
+        rescue_pool = sorted(
+            (
+                candidate
+                for candidate in all_complete_candidates
+                if candidate.required_event_coverage >= 1.0
+                and candidate.optional_context_coverage > 0.0
+                and candidate not in selected
+            ),
+            key=lambda candidate: (
+                candidate.context_anchor_score,
+                candidate.context_quality,
+                candidate.global_rank_score,
+                candidate.chain_score,
+            ),
+            reverse=True,
+        )
+        rescue_limit = min(candidate_count, len(selected) + rescue_slots)
+        for candidate in rescue_pool:
+            if any(existing.video_id == candidate.video_id for existing in selected):
+                continue
+            candidate.candidate_source = "context_anchor_rescue"
+            candidate.selection_reason = (
+                "complete_required_chain_with_distinct_context_anchor"
+            )
+            candidate.candidate_id = f"c{len(selected) + 1}"
+            selected.append(candidate)
+            if len(selected) >= rescue_limit:
+                break
+
     if len(selected) < candidate_count:
-        add_candidates(2)
+        add_candidates(ranked_pool, max_per_video=2, limit=candidate_count)
     return selected
 
 
@@ -2718,6 +2978,90 @@ def _target_safe_search_text(
     return re.sub(r"\[TARGET\]", replacement, safe, flags=re.IGNORECASE)
 
 
+def _event_retrieval_variants(
+    event: VqaEvent,
+    *,
+    plan: VqaQueryPlan,
+) -> dict[str, list[str]]:
+    """Return bilingual event queries plus a short target-safe action phrase.
+
+    A long cooking-show description often retrieves the presenter and kitchen
+    well but dilutes a count/action such as "four ingredients on a plate".
+    The focused variant removes only surrounding context; it never names an
+    unknown target or asks an LLM to guess one.
+    """
+    en = _target_safe_search_text(
+        event.text_en,
+        language="en",
+        answer_type=plan.answer_type,
+    )
+    vi = _target_safe_search_text(
+        event.text_vi,
+        language="vi",
+        answer_type=plan.answer_type,
+    )
+    variants = {"en": [en], "vi": [vi]}
+    if not event.answer_bearing:
+        return variants
+
+    focused_en = _target_focused_phrase(en, language="en")
+    focused_vi = _target_focused_phrase(vi, language="vi")
+    if focused_en and focused_en != en:
+        variants["en"].append(focused_en)
+    if focused_vi and focused_vi != vi:
+        variants["vi"].append(focused_vi)
+    return {language: _unique_strings(values) for language, values in variants.items()}
+
+
+def _target_focused_phrase(text: str, *, language: str) -> str:
+    """Extract the observable target action from an answer-neutral event."""
+    cleaned = " ".join(str(text).split()).strip(" ,.;:")
+    if not cleaned:
+        return ""
+    if language == "en":
+        match = re.search(
+            r"\b(?:placing|putting|places|puts|holding|holds|hold|lifting|picking\s+up)\s+(.+)$",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return ""
+        focus = match.group(1).strip(" ,.;:")
+        if re.search(r"\b(?:holding|holds|hold|lifting|picking\s+up)\b", cleaned, re.IGNORECASE):
+            if not re.search(r"\bhand(?:s)?\b", focus, re.IGNORECASE):
+                focus = f"{focus} in hands"
+        return focus
+
+    normalized = _normalize_text(cleaned)
+    if "dat" in normalized and "dia" in normalized:
+        # The count immediately following "dĩa/plate" is attached to the
+        # target, unlike the preceding "một đĩa" in common descriptions.
+        match = re.search(
+            r"\bdia\b.*?\b(1|2|3|4|5|mot|hai|ba|bon|nam)\b\s+(.+)$",
+            normalized,
+        )
+        if match:
+            return f"{match.group(1)} {match.group(2)} tren dia trang"
+    if "cam" in normalized:
+        match = re.search(
+            r"\b(?:cam|giu)\b.*?\b(1|2|3|4|5|mot|hai|ba|bon|nam)\b\s+(.+)$",
+            normalized,
+        )
+        if match:
+            return f"{match.group(1)} {match.group(2)} tren tay"
+    return ""
+
+
+def _candidate_video_hit_limit() -> int:
+    """Use a recall-oriented cap separately from visual card display limits."""
+    return _env_int(
+        "VQA_CANDIDATE_VIDEO_HITS_PER_EVENT",
+        DEFAULT_CANDIDATE_VIDEO_HITS_PER_EVENT,
+        minimum=1,
+        maximum=100,
+    )
+
+
 def _required_event_indices(plan: VqaQueryPlan) -> set[int]:
     required = {event.index for event in plan.events if event.answer_bearing}
     return required or {event.index for event in plan.events}
@@ -2768,6 +3112,7 @@ def _union_variant_branches(
     *,
     top_k: int,
     max_hits_per_video: int,
+    reserve_per_branch: int | None = None,
 ) -> list[SearchResult]:
     """Union branches while rewarding, but never requiring, consensus.
 
@@ -2808,7 +3153,6 @@ def _union_variant_branches(
             if result.score > current.score:
                 record["result"] = result
 
-    ranked: list[SearchResult] = []
     scored: list[tuple[float, SearchResult]] = []
     branch_count = max(1, len(branches))
     for record in aggregated.values():
@@ -2832,24 +3176,54 @@ def _union_variant_branches(
         scored.append((score, _with_branch_consensus(base, score, consensus)))
     scored.sort(key=lambda item: item[0], reverse=True)
 
+    # A low-ranked frame can be the *only* useful observation of one event in
+    # one model/query variant.  Preserve a small temporally-diverse reserve
+    # for every (video, branch) before filling the wider per-video quota.
+    # This is especially important for target-safe action queries where Jina
+    # or SigLIP may succeed alone while another branch returns many generic
+    # kitchen frames from the same video.
+    if reserve_per_branch is None:
+        reserve_per_branch = _env_int(
+            "VQA_VIDEO_HITS_PER_BRANCH",
+            DEFAULT_VIDEO_HITS_PER_BRANCH,
+            minimum=0,
+            maximum=4,
+        )
+    score_by_frame = {result.frame_id: (score, result) for score, result in scored}
+    reserved_frame_ids: set[str] = set()
+    if reserve_per_branch > 0:
+        for branch_hits in video_branch_hits.values():
+            for rows in branch_hits.values():
+                selected = 0
+                seen_moments: set[tuple[str, object]] = set()
+                for result, _ in sorted(rows, key=lambda item: item[1], reverse=True):
+                    moment_key = _result_moment_key(result)
+                    if result.frame_id in reserved_frame_ids or moment_key in seen_moments:
+                        continue
+                    if result.frame_id not in score_by_frame:
+                        continue
+                    reserved_frame_ids.add(result.frame_id)
+                    seen_moments.add(moment_key)
+                    selected += 1
+                    if selected >= reserve_per_branch:
+                        break
+
     # Keep distinct shots/time buckets before filling the remaining per-video
     # quota. Without this pass, eight adjacent keyframes from one shot could
     # evict the later action needed to form an ordered target-event chain.
     diverse_scored = _select_diverse_video_hits(
         scored,
         max_hits_per_video=max_hits_per_video,
+        reserved_frame_ids=reserved_frame_ids,
     )
-    for _, result in diverse_scored:
-        ranked.append(result)
-        if len(ranked) >= top_k:
-            break
-    return ranked
+    return [result for _, result in diverse_scored[:top_k]]
 
 
 def _select_diverse_video_hits(
     scored: list[tuple[float, SearchResult]],
     *,
     max_hits_per_video: int,
+    reserved_frame_ids: set[str] | None = None,
 ) -> list[tuple[float, SearchResult]]:
     """Apply a per-video cap while reserving room for distinct moments."""
     by_video: dict[str, list[tuple[float, SearchResult]]] = defaultdict(list)
@@ -2857,23 +3231,32 @@ def _select_diverse_video_hits(
         by_video[item[1].video_id].append(item)
 
     selected: list[tuple[float, SearchResult]] = []
+    reserved_frame_ids = reserved_frame_ids or set()
     for rows in by_video.values():
         chosen: list[tuple[float, SearchResult]] = []
         chosen_ids: set[str] = set()
         seen_moments: set[tuple[str, object]] = set()
 
+        # Reserves are intentionally kept even when their global score is
+        # weak: each is the top temporally-distinct witness from one branch.
+        # The outer candidate cap is deliberately larger than this reserve.
         for item in rows:
             result = item[1]
-            if result.timestamp_sec is not None:
-                time_bucket = int(float(result.timestamp_sec) // 2.0)
-                moment_key: tuple[str, object] = (
-                    "shot-time",
-                    f"{result.shot_id or '<unknown>'}:{time_bucket}",
-                )
-            elif result.shot_id:
-                moment_key = ("shot", result.shot_id)
-            else:
-                moment_key = ("frame", result.frame_id)
+            if result.frame_id not in reserved_frame_ids:
+                continue
+            if result.frame_id in chosen_ids:
+                continue
+            chosen.append(item)
+            chosen_ids.add(result.frame_id)
+            seen_moments.add(_result_moment_key(result))
+            if len(chosen) >= max_hits_per_video:
+                break
+
+        for item in rows:
+            result = item[1]
+            moment_key = _result_moment_key(result)
+            if result.frame_id in chosen_ids:
+                continue
             if moment_key in seen_moments:
                 continue
             chosen.append(item)
@@ -2895,6 +3278,15 @@ def _select_diverse_video_hits(
 
     selected.sort(key=lambda item: item[0], reverse=True)
     return selected
+
+
+def _result_moment_key(result: SearchResult) -> tuple[str, object]:
+    if result.timestamp_sec is not None:
+        time_bucket = int(float(result.timestamp_sec) // 2.0)
+        return ("shot-time", f"{result.shot_id or '<unknown>'}:{time_bucket}")
+    if result.shot_id:
+        return ("shot", result.shot_id)
+    return ("frame", result.frame_id)
 
 
 def _results_share_local_moment(left: SearchResult, right: SearchResult) -> bool:
@@ -2935,12 +3327,7 @@ def _merge_auxiliary_results(
             previous_score, previous = scored.get(result.frame_id, (0.0, result))
             scored[result.frame_id] = (previous_score + bonus, previous)
     ranked = sorted(scored.values(), key=lambda item: item[0], reverse=True)
-    max_hits_per_video = _env_int(
-        "VQA_VIDEO_HITS_PER_EVENT",
-        DEFAULT_VIDEO_HITS_PER_EVENT,
-        minimum=1,
-        maximum=100,
-    )
+    max_hits_per_video = _candidate_video_hit_limit()
     visual_ids = {result.frame_id for result in visual_results}
     rescored: list[tuple[float, SearchResult]] = []
     for retrieval_score, result in ranked:
@@ -3035,13 +3422,50 @@ def _search_result_payload(result: SearchResult) -> dict[str, object]:
     return payload
 
 
+def _context_hit_quality(hit: EventHit) -> float:
+    """Quality for an optional context observation, independent of coverage."""
+    return 0.75 * hit.rank_score + 0.25 * _result_branch_consensus(hit.result)
+
+
+def _beam_chain_sort_key(
+    chain: tuple[EventHit, ...],
+    *,
+    hits_per_event: dict[int, list[EventHit]],
+    context_indices: list[int],
+    max_moment_span_sec: float,
+) -> tuple[float, float, float]:
+    """Score a partial required chain without letting context replace it."""
+    required_quality = sum(hit.rank_score for hit in chain) / len(chain)
+    contextual = [
+        _context_hit_quality(hit)
+        for event_index in context_indices
+        for hit in hits_per_event.get(event_index, [])
+        if _context_hit_fits_chain(
+            hit,
+            list(chain),
+            max_moment_span_sec=max_moment_span_sec,
+        )
+    ]
+    context_anchor = max(contextual, default=0.0)
+    span = float(chain[-1].result.timestamp_sec or 0.0) - float(
+        chain[0].result.timestamp_sec or 0.0
+    )
+    # Context breaks ties/helps a distinctive scene survive the beam, but a
+    # higher-quality required action chain remains the main criterion.
+    return (0.80 * required_quality + 0.20 * context_anchor, required_quality, -span)
+
+
 def _context_hit_fits_chain(
     hit: EventHit,
     chain: list[EventHit],
     *,
-    event_gap_sec: float,
     max_moment_span_sec: float,
+    event_gap_sec: float | None = None,
 ) -> bool:
+    # ``event_gap_sec`` is retained as a keyword-only compatibility argument.
+    # Strict 60-second adjacency applies only between required events; optional
+    # context is allowed anywhere inside the broader candidate moment span.
+    del event_gap_sec
     if hit.result.timestamp_sec is None:
         return False
     timestamp = float(hit.result.timestamp_sec)
@@ -3053,11 +3477,11 @@ def _context_hit_fits_chain(
     ]
     if earlier:
         previous = max(float(item.result.timestamp_sec or 0.0) for item in earlier)
-        if not previous < timestamp <= previous + event_gap_sec:
+        if not previous < timestamp:
             return False
     if later:
         following = min(float(item.result.timestamp_sec or 0.0) for item in later)
-        if not following - event_gap_sec <= timestamp < following:
+        if not timestamp < following:
             return False
     all_times = [float(item.result.timestamp_sec or 0.0) for item in chain]
     return max([timestamp, *all_times]) - min([timestamp, *all_times]) <= max_moment_span_sec
@@ -3109,12 +3533,14 @@ def _build_display_results(
                 "video_name": _portable_basename(candidate.video_name),
                 "score": round(candidate.retrieval_score, 6),
                 "candidate_id": candidate.candidate_id,
-                "candidate_source": "ordered_event_union",
+                "candidate_source": candidate.candidate_source,
+                "candidate_selection_reason": candidate.selection_reason,
                 "candidate_event_indices": sorted(
                     {hit.event_index for hit in candidate.event_hits}
                 ),
                 "required_event_coverage": round(candidate.required_event_coverage, 6),
                 "optional_context_coverage": round(candidate.optional_context_coverage, 6),
+                "context_quality": round(candidate.context_quality, 6),
             }
         )
         seen_frames.add(frame_id)
@@ -3349,6 +3775,8 @@ def _empty_usage() -> dict[str, object]:
         "openrouter_calls": 0,
         "openrouter_http_requests": 0,
         "openrouter_operations": 0,
+        "openrouter_gate_wait_ms": 0.0,
+        "openrouter_rate_limited_operations": 0,
         "prompt_tokens": 0,
         "completion_tokens": 0,
         "total_tokens": 0,
@@ -3373,6 +3801,18 @@ def _merge_usage(
     # requests. ``openrouter_operations`` exposes the higher-level planner /
     # verifier count separately.
     aggregate["openrouter_calls"] = aggregate["openrouter_http_requests"]
+    try:
+        aggregate["openrouter_gate_wait_ms"] = round(
+            float(aggregate.get("openrouter_gate_wait_ms", 0.0))
+            + float(usage.get("vqa_gate_wait_ms", 0.0)),
+            3,
+        )
+    except (TypeError, ValueError):
+        pass
+    if bool(usage.get("vqa_gate_rate_limited", False)):
+        aggregate["openrouter_rate_limited_operations"] = int(
+            aggregate.get("openrouter_rate_limited_operations", 0)
+        ) + 1
     for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
         try:
             aggregate[key] = int(aggregate.get(key, 0)) + int(usage.get(key, 0))

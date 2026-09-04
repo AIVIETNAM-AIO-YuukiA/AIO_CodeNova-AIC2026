@@ -409,12 +409,15 @@ APP_JS = r"""
               const candidateFrames = Array.isArray(c.evidence_frames) ? c.evidence_frames : [];
               const requiredCoverage = Number(c.required_event_coverage || 0);
               const contextCoverage = Number(c.optional_context_coverage || 0);
+              const contextQuality = Number(c.context_quality || 0);
+              const source = c.candidate_source || "ordered_event_union";
               return `<div style="padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px;line-height:1.45;">
                 <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
                   <strong>#${i + 1} ${escapeHtml(name)}</strong>
                   <span class="pill">${escapeHtml(c.verdict || "unknown")} &middot; ${scoreText}</span>
                 </div>
-                <div style="color:var(--muted);margin-top:4px;">Required events ${(requiredCoverage * 100).toFixed(0)}% &middot; optional context ${(contextCoverage * 100).toFixed(0)}%</div>
+                <div style="color:var(--muted);margin-top:4px;">${escapeHtml(source)} &middot; Required events ${(requiredCoverage * 100).toFixed(0)}% &middot; optional context ${(contextCoverage * 100).toFixed(0)}% &middot; context quality ${(contextQuality * 100).toFixed(0)}%</div>
+                ${c.selection_reason && c.selection_reason !== "standard_rank" ? `<div style="color:var(--muted);margin-top:2px;">${escapeHtml(c.selection_reason)}</div>` : ""}
                 <div style="margin-top:5px;"><strong>${escapeHtml(c.answer || "No answer")}</strong></div>
                 ${c.evidence_summary ? `<div style="color:var(--muted);margin-top:3px;">${escapeHtml(c.evidence_summary)}</div>` : ""}
                 ${c.error ? `<div style="color:var(--warn);margin-top:3px;">Verifier error: ${escapeHtml(c.error)}</div>` : ""}
@@ -437,16 +440,24 @@ APP_JS = r"""
         const selection = pipeline.evidence_selection || {};
         const verification = pipeline.candidate_verification || {};
         const finalVerification = pipeline.final_verification || {};
+        const provider = pipeline.openrouter || {};
+        const usage = data.usage || {};
         const eventCount = plan.event_count ?? plan.events?.length ?? data.query_plan?.events?.length ?? 0;
         const candidateCount = retrieval.candidate_count ?? verification.candidate_count ?? data.candidate_answers?.length ?? 0;
         const evidenceCount = selection.frame_count ?? selection.evidence_frame_count ?? data.evidence_frames?.length ?? 0;
         const supportedCount = verification.supported_count ?? (data.candidate_answers || []).filter(c => c.verdict === "supported").length;
+        const workerCount = verification.effective_workers ?? provider.verification_concurrency ?? 0;
+        const requestCount = usage.openrouter_http_requests ?? usage.openrouter_calls ?? 0;
+        const gateMax = provider.max_concurrency ?? "?";
+        const gateWait = Number(usage.openrouter_gate_wait_ms || 0);
+        const cooldown = Number(provider.cooldown_remaining_ms || 0);
         const groundedStages = [
           { label: "Query Planning", desc: `${eventCount} ordered event(s) &middot; ${escapeHtml(plan.mode || plan.routing_mode || (plan.llm_used ? "LLM" : "heuristic"))}` },
           { label: "Ordered-event Retrieval", desc: `${candidateCount} candidate moment(s) retrieved` },
           { label: "Evidence Selection", desc: `${evidenceCount} evidence frame(s) selected` },
-          { label: "Candidate Verification", desc: `${supportedCount} supported candidate(s)` },
+          { label: "Candidate Verification", desc: `${supportedCount} supported candidate(s) &middot; ${workerCount} worker(s)` },
           { label: "Final Verification", desc: `${escapeHtml(finalVerification.status || data.answer_status || "completed")} &middot; confidence ${Number(data.answer_confidence || 0).toFixed(2)}` },
+          { label: "OpenRouter", desc: `${requestCount} HTTP request(s) &middot; VQA gate ${gateMax} concurrent &middot; queued ${gateWait.toFixed(0)}ms${cooldown > 0 ? ` &middot; cooldown ${(cooldown / 1000).toFixed(1)}s` : ""}` },
         ];
         const finalError = finalVerification.error
           ? `<div style="margin-top:8px;color:var(--warn);"><strong>Final verifier error:</strong> ${escapeHtml(finalVerification.error)}</div>`
@@ -581,7 +592,7 @@ APP_JS = r"""
         const frameNum = result.frame_index != null ? `f${result.frame_index}` : "f0";
         const timeStr = formatTime(result.timestamp_sec || 0);
         const candidateBadge = result.candidate_id
-          ? `<span class="pill">${escapeHtml(result.candidate_id)} &middot; ${escapeHtml(result.candidate_source || "ordered events")} &middot; required ${(Number(result.required_event_coverage || 0) * 100).toFixed(0)}% &middot; context ${(Number(result.optional_context_coverage || 0) * 100).toFixed(0)}%</span>`
+          ? `<span class="pill">${escapeHtml(result.candidate_id)} &middot; ${escapeHtml(result.candidate_source || "ordered events")} &middot; required ${(Number(result.required_event_coverage || 0) * 100).toFixed(0)}% &middot; context ${(Number(result.optional_context_coverage || 0) * 100).toFixed(0)}% &middot; quality ${(Number(result.context_quality || 0) * 100).toFixed(0)}%</span>`
           : "";
 
         return `

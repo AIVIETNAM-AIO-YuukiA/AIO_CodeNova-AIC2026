@@ -20,9 +20,11 @@ from retrieval.grounded_vqa import (
     VqaQueryPlan,
     VqaVerification,
     _evidence_prompt,
+    _event_retrieval_variants,
     _heuristic_plan,
     _normalize_text,
     _union_variant_branches,
+    _vqa_verification_worker_count,
     _verification_from_payload,
     build_candidate_moments,
 )
@@ -403,6 +405,99 @@ def test_beam_search_keeps_a_lower_early_hit_that_forms_a_complete_chain() -> No
     assert candidates[0].required_event_coverage == 1.0
 
 
+def test_beam_pairs_before_pruning_a_low_rank_first_required_event(monkeypatch) -> None:
+    """A valid early action must survive more than ``beam_width`` dead ends."""
+    monkeypatch.setenv("VQA_CANDIDATE_VIDEO_HITS_PER_EVENT", "32")
+    plan = _plan()
+    dead_ends = [
+        _result(f"dead-{index}", "right", 100.0 + index)
+        for index in range(25)
+    ]
+    event_results = [
+        [*dead_ends, _result("chain-start", "right", 10.0)],
+        [_result("chain-end", "right", 20.0)],
+        [],
+    ]
+
+    candidates = build_candidate_moments(
+        plan,
+        [],
+        event_results,
+        beam_width=5,
+    )
+
+    assert candidates
+    required_ids = [
+        hit.result.frame_id
+        for hit in candidates[0].event_hits
+        if hit.event_index in {0, 1}
+    ]
+    assert required_ids == ["chain-start", "chain-end"]
+
+
+def test_context_quality_breaks_tie_between_complete_chains() -> None:
+    plan = _plan()
+    weak_context_distractors = [
+        _result(f"noise-{index}", f"noise-{index}", 30.0)
+        for index in range(8)
+    ]
+    candidates = build_candidate_moments(
+        plan,
+        [],
+        [
+            [
+                _result("strong-r0", "strong", 10.0),
+                _result("weak-r0", "weak", 10.0),
+            ],
+            [
+                _result("weak-r1", "weak", 20.0),
+                _result("strong-r1", "strong", 20.0),
+            ],
+            [
+                _result("strong-context", "strong", 30.0),
+                *weak_context_distractors,
+                _result("weak-context", "weak", 30.0),
+            ],
+        ],
+        candidate_count=2,
+    )
+
+    assert [candidate.video_id for candidate in candidates] == ["strong", "weak"]
+    assert candidates[0].context_quality > candidates[1].context_quality
+
+
+def test_context_anchor_rescue_keeps_a_complete_low_rank_candidate() -> None:
+    plan = _plan()
+    candidates = build_candidate_moments(
+        plan,
+        [
+            _result("generic-full", "generic", 15.0),
+            _result("target-full", "target", 15.0),
+        ],
+        [
+            [
+                _result("generic-r0", "generic", 10.0),
+                _result("target-r0", "target", 10.0),
+            ],
+            [
+                _result("generic-r1", "generic", 20.0),
+                _result("target-r1", "target", 20.0),
+            ],
+            [
+                _result("target-context", "target", 30.0),
+                _result("generic-context", "generic", 30.0),
+            ],
+        ],
+        candidate_count=2,
+    )
+
+    assert {candidate.video_id for candidate in candidates} == {"generic", "target"}
+    rescued = next(candidate for candidate in candidates if candidate.video_id == "target")
+    assert rescued.required_event_coverage == 1.0
+    assert rescued.candidate_source == "context_anchor_rescue"
+    assert "complete_required_chain" in rescued.selection_reason
+
+
 def test_full_query_video_rank_counts_without_adding_a_far_frame_to_evidence() -> None:
     plan = _plan()
     candidates = build_candidate_moments(
@@ -437,6 +532,58 @@ def test_variant_union_retains_a_hit_strong_in_only_one_model() -> None:
     target_result = next(result for result in merged if result.frame_id == "target")
     assert target_result.model_query_consensus == 0.5
     assert target_result.score == 0.9
+
+
+def test_variant_union_reserves_single_branch_witness_before_video_cap() -> None:
+    generic = [
+        _result(f"generic-{index}", "same-video", float(index))
+        for index in range(8)
+    ]
+    target = _result("target-action", "same-video", 90.0)
+    other_branch = [
+        _result(f"other-{index}", f"other-video-{index}", 10.0)
+        for index in range(12)
+    ]
+
+    merged = _union_variant_branches(
+        {
+            "siglip:en:0": generic,
+            "jina:focused:1": [*other_branch, target],
+        },
+        top_k=100,
+        max_hits_per_video=2,
+        reserve_per_branch=1,
+    )
+
+    assert {result.frame_id for result in merged if result.video_id == "same-video"} >= {
+        "generic-0",
+        "target-action",
+    }
+
+
+def test_target_safe_event_adds_short_action_variant_without_entity_guess() -> None:
+    plan = _heuristic_plan(
+        query="Cô gái đặt 4 con X lên đĩa trắng, sau đó cầm 2 con X.",
+        question="X là con gì?",
+        context="",
+    )
+    event = next(event for event in plan.events if event.answer_bearing)
+
+    variants = _event_retrieval_variants(event, plan=plan)
+
+    assert len(variants["en"]) >= 2
+    assert any("four food ingredients" in value for value in variants["en"])
+    serialized = json.dumps(variants, ensure_ascii=False).lower()
+    assert "nghêu" not in serialized
+    assert "clam" not in serialized
+
+
+def test_vqa_verification_concurrency_is_configurable(monkeypatch) -> None:
+    monkeypatch.delenv("VQA_VERIFICATION_CONCURRENCY", raising=False)
+    assert _vqa_verification_worker_count(5) == 1
+    monkeypatch.setenv("VQA_VERIFICATION_CONCURRENCY", "3")
+    assert _vqa_verification_worker_count(5) == 3
+    assert _vqa_verification_worker_count(2) == 2
 
 
 def test_variant_search_does_not_truncate_the_union_to_one_branch_pool() -> None:
