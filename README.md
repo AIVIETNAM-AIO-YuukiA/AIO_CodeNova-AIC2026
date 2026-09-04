@@ -66,8 +66,9 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
 
 - **Grounded VQA** (`retrieval/grounded_vqa.py`): translates and labels an
   answer-neutral ordered event plan, searches English/Vietnamese variants per
-  embedding model, keeps up to five complete candidate moments, selects 4-6
-  timestamped frames for each, and asks
+  embedding model, preserves a per-branch witness and a wider per-video
+  candidate-recall pool before forming chains, then keeps up to five complete
+  candidate moments. It selects 4-6 timestamped frames for each, and asks
   an OpenRouter vision model to return an answer with cited evidence. It
   abstains when confidence or visual grounding is insufficient. Configure the
   model with `VQA_OPENROUTER_MODEL` (empty means `OPENROUTER_MODEL`). Explicit
@@ -81,6 +82,17 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
   query planning. Multi-image verification still requires the configured
   OpenRouter vision model; disabling the planner does not turn VQA into a
   non-LLM answerer.
+- VQA verification is deliberately rate-controlled separately from captioning
+  and OCR. Defaults `VQA_VERIFICATION_CONCURRENCY=1` and
+  `VQA_OPENROUTER_MAX_CONCURRENCY=1` prevent five image-verification calls or
+  two browser searches from bursting a shared provider pool. Set either value
+  higher only after the provider has been stable; a `429` triggers the
+  configurable `VQA_OPENROUTER_429_COOLDOWN_SEC` before the next VQA call.
+- For difficult recall debugging, set `VQA_DEBUG_TRACE=1` and
+  `VQA_DEBUG_VIDEO_ID=<video_id>`. The response then includes every retained
+  branch/merged hit for that video and the pre-verification candidate pool,
+  which distinguishes a retrieval miss from a candidate-ranking miss. Do not
+  leave this enabled in normal UI use because the response is much larger.
 - **Interactive search chat** (`agent/interactive.py`, `POST /api/agent/chat`
   + chat panel in the UI): the AIC_2025-style narrowing loop — tools
   `search_kis`, `search_asr`, `search_ocr`, `subagent_summarize`, `ask_user`;
