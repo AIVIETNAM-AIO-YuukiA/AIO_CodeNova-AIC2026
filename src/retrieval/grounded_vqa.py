@@ -47,6 +47,7 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_RETRIEVAL_POOL = 500
 DEFAULT_CANDIDATE_VIDEO_HITS_PER_EVENT = 24
 DEFAULT_VIDEO_HITS_PER_BRANCH = 1
+DEFAULT_VISUAL_WITNESSES_PER_VIDEO = 4
 DEFAULT_MOMENT_POOL = 20
 DEFAULT_CANDIDATE_COUNT = 5
 DEFAULT_BEAM_WIDTH = 20
@@ -60,6 +61,7 @@ DEFAULT_VQA_VERIFICATION_CONCURRENCY = 1
 DEFAULT_VQA_OPENROUTER_MAX_CONCURRENCY = 1
 DEFAULT_VQA_OPENROUTER_429_COOLDOWN_SEC = 8.0
 DEFAULT_CONTEXT_RESCUE_CANDIDATES = 2
+DEFAULT_REQUIRED_CHAIN_RESCUE_CANDIDATES = 1
 
 _TEXT_EVIDENCE_CACHE: dict[
     str,
@@ -234,6 +236,8 @@ class VqaBranchSearchResult(SearchResult):
     """Search result with VQA-only branch consensus kept separate from score."""
 
     model_query_consensus: float = 0.0
+    best_branch_rank_score: float = 0.0
+    branch_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -309,7 +313,9 @@ class VqaCandidateMoment:
     optional_context_coverage: float = 0.0
     context_quality: float = 0.0
     context_anchor_score: float = 0.0
+    temporal_coherence: float = 0.0
     model_query_consensus: float = 0.0
+    branch_chain_score: float = 0.0
     candidate_source: str = "ordered_event_union"
     selection_reason: str = "standard_rank"
     global_hit: SearchResult | None = None
@@ -331,7 +337,9 @@ class VqaCandidateMoment:
             "optional_context_coverage": round(self.optional_context_coverage, 6),
             "context_quality": round(self.context_quality, 6),
             "context_anchor_score": round(self.context_anchor_score, 6),
+            "temporal_coherence": round(self.temporal_coherence, 6),
             "model_query_consensus": round(self.model_query_consensus, 6),
+            "branch_chain_score": round(self.branch_chain_score, 6),
             "candidate_source": self.candidate_source,
             "selection_reason": self.selection_reason,
             "event_hits": [hit.to_dict() for hit in self.event_hits],
@@ -362,6 +370,12 @@ class VqaVerification:
     required_event_coverage: float = 0.0
     valid_citation_coverage: float = 0.0
     effective_confidence: float | None = None
+    # Observable target facts are kept per required event so the backend can
+    # verify that a hidden reference (for example ``X``) did not silently
+    # change identity between actions.
+    event_observations: dict[int, dict[str, object]] = field(default_factory=dict)
+    canonical_target_label: str | None = None
+    identity_consistent: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -573,6 +587,24 @@ class GroundedVqaPipeline:
             "full_results_count": len(full_results),
             "event_result_counts": [len(results) for results in event_results],
             "candidate_video_hits_per_event": candidate_hit_limit,
+            "visual_witnesses_per_video": _env_int(
+                "VQA_VISUAL_WITNESSES_PER_VIDEO",
+                DEFAULT_VISUAL_WITNESSES_PER_VIDEO,
+                minimum=1,
+                maximum=12,
+            ),
+            "context_rescue_candidates": _env_int(
+                "VQA_CONTEXT_RESCUE_CANDIDATES",
+                DEFAULT_CONTEXT_RESCUE_CANDIDATES,
+                minimum=0,
+                maximum=2,
+            ),
+            "required_chain_rescue_candidates": _env_int(
+                "VQA_REQUIRED_CHAIN_RESCUE_CANDIDATES",
+                DEFAULT_REQUIRED_CHAIN_RESCUE_CANDIDATES,
+                minimum=0,
+                maximum=2,
+            ),
             "candidate_count": len(candidates),
             "candidates_count": len(candidates),
             "elapsed_ms": _elapsed_ms(tick),
@@ -901,6 +933,14 @@ class GroundedVqaPipeline:
                 auxiliary,
                 top_k=auxiliary_union_limit,
             )
+        if _env_bool("VQA_DEBUG_TRACE", False):
+            trace["post_text_merge_result_count"] = len(visual_results)
+            debug_video_id = os.environ.get("VQA_DEBUG_VIDEO_ID", "").strip()
+            if debug_video_id:
+                trace["post_text_merge_video_hits"] = _video_hit_trace(
+                    visual_results,
+                    video_id=debug_video_id,
+                )
         return visual_results, trace
 
     def _search_visual_variants(
@@ -961,8 +1001,17 @@ class GroundedVqaPipeline:
         reranker_applied = False
         reranker_error: str | None = None
         if reranker is not None and use_reranker is not False and merged:
-            consensus_by_frame = {
-                result.frame_id: _result_branch_consensus(result)
+            # Rerankers may reconstruct SearchResult objects and thereby drop
+            # VQA-only provenance. Keep the strongest original branch score
+            # as well as the names of the branches that produced a frame;
+            # candidate rescue uses this provenance independently from the
+            # post-union/global rank.
+            branch_provenance_by_frame = {
+                result.frame_id: (
+                    _result_branch_consensus(result),
+                    _result_best_branch_score(result),
+                    _result_branch_names(result),
+                )
                 for result in merged
             }
             preferred_groups = [
@@ -994,7 +1043,18 @@ class GroundedVqaPipeline:
                         _with_branch_consensus(
                             result,
                             float(result.score),
-                            consensus_by_frame.get(result.frame_id, 0.0),
+                            branch_provenance_by_frame.get(
+                                result.frame_id,
+                                (0.0, 0.0, ()),
+                            )[0],
+                            best_branch_rank_score=branch_provenance_by_frame.get(
+                                result.frame_id,
+                                (0.0, 0.0, ()),
+                            )[1],
+                            branch_names=branch_provenance_by_frame.get(
+                                result.frame_id,
+                                (0.0, 0.0, ()),
+                            )[2],
                         )
                         for result in reranked
                     ]
@@ -1488,8 +1548,17 @@ Inspect every image in timestamp order. Resolve the target only from this candid
 Use verdict=supported only when every required event is grounded in its
 eligible frame(s) and the event order is consistent. ``event_support`` must map
 each required event index to supplied frame labels that list that event in
-``eligible_events``. Return only IDs from Structured constraints in
-``supported_constraint_ids`` when visibly grounded.
+``eligible_events``. For every required event, ``event_observations`` must
+name the *observable target entity* in that event, cite only labels already
+listed for that event in ``event_support``, and report visible count/on-plate/
+held facts when observable. A hidden target reference must name the same
+entity across all required events and match ``canonical_target_label`` and the
+answer. Use one concise, specific target noun phrase in the same language as
+the answer; do not use generic labels such as "food ingredient". If the
+events show different entities (for example tomato then
+mushroom), return ``not_supported`` rather than choosing either one.
+Return only IDs from Structured constraints in ``supported_constraint_ids``
+when visibly grounded.
 Return strict JSON:
 {{
   "verdict": "supported|partial|not_supported",
@@ -1499,6 +1568,10 @@ Return strict JSON:
   "supporting_frames": ["F1"],
   "matched_event_indices": [0],
   "event_support": {{"0": ["F1"]}},
+  "event_observations": {{
+    "0": {{"frame_labels": ["F1"], "target_label": "specific visible entity or null", "visible_count": 4, "on_plate": true, "held": false}}
+  }},
+  "canonical_target_label": "same specific entity across required events or null",
   "supported_constraint_ids": ["E0_COUNT_4"],
   "contradictions": [],
   "evidence_summary": "brief observable evidence"
@@ -1522,7 +1595,7 @@ Return JSON only, with a short answer and no hidden chain-of-thought."""
                     image_paths=[str(frame["frame_path"]) for frame in frames],
                     image_labels=list(frame_map),
                     detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
-                    generation_params={"temperature": 0.0, "max_tokens": 700},
+                    generation_params={"temperature": 0.0, "max_tokens": 900},
                 )
             usage = _gate_usage(_client_usage(client), gate_telemetry)
             payload = _extract_json_object(raw)
@@ -1635,12 +1708,25 @@ Return JSON only, with a short answer and no hidden chain-of-thought."""
                 str(frame["frame_id"]): frame for frame in candidate.evidence_frames
             }
             ordered_ids: list[str] = []
+            additional_event_ids: list[str] = []
             for event_index in sorted(_required_event_indices(plan)):
+                event_ids: list[str] = []
                 for frame_id in verification.event_support.get(event_index, ()):
-                    if frame_id in evidence_by_id and frame_id not in ordered_ids:
-                        ordered_ids.append(frame_id)
                     if frame_id in evidence_by_id:
                         final_frame_events[frame_id].add(event_index)
+                        if frame_id not in event_ids:
+                            event_ids.append(frame_id)
+                # One cited frame per required event is non-negotiable. Put
+                # these first so a verbose citation for event 0 cannot crowd
+                # event 1 out of the final multi-image judge's small budget.
+                if event_ids and event_ids[0] not in ordered_ids:
+                    ordered_ids.append(event_ids[0])
+                for frame_id in event_ids[1:]:
+                    if frame_id not in additional_event_ids:
+                        additional_event_ids.append(frame_id)
+            for frame_id in additional_event_ids:
+                if frame_id not in ordered_ids:
+                    ordered_ids.append(frame_id)
             for frame in candidate.evidence_frames:
                 frame_id = str(frame["frame_id"])
                 if frame_id in supported and frame_id not in ordered_ids:
@@ -1668,6 +1754,10 @@ Return JSON only, with a short answer and no hidden chain-of-thought."""
                 "answer": verification.answer,
                 "confidence": _effective_verification_confidence(verification),
                 "supporting_frame_ids": verification.supporting_frame_ids,
+                "event_support": verification.event_support,
+                "event_observations": verification.event_observations,
+                "canonical_target_label": verification.canonical_target_label,
+                "identity_consistent": verification.identity_consistent,
                 "evidence_summary": verification.evidence_summary,
             }
             for _, candidate, verification in scored[:2]
@@ -1692,14 +1782,25 @@ Return JSON only, with a short answer and no hidden chain-of-thought."""
 Scene description: {query}
 Question: {question}
 Constraints: {json.dumps(plan.constraints, ensure_ascii=False)}
+Structured constraints: {json.dumps([spec.to_dict() for spec in plan.constraint_specs], ensure_ascii=False)}
+Ordered events: {json.dumps([event.to_dict() for event in plan.events], ensure_ascii=False)}
+Required event indices: {json.dumps(sorted(_required_event_indices(plan)))}
 Candidate proposals: {json.dumps(proposals, ensure_ascii=False)}
 Frame grounding: {json.dumps(frame_grounding, ensure_ascii=False)}
 
 Verify these proposals and their cited images. Do not create a new answer.
+For a hidden target reference, confirm that every required event shows the
+same specific observable entity; a sequence such as tomatoes then mushrooms
+is not evidence for one answer. Cite the supplied final frame labels for each
+required event in ``event_observations``. Candidate observations are prior
+claims, not proof: reject them if the images show a different target.
 Return strict JSON:
 {{"status":"answered|insufficient_evidence","selected_candidate_id":"... or null",
 "answer":"one proposed answer or null","confidence":0.0,
-"supporting_frames":["F1"],"evidence_summary":"brief observable evidence"}}"""
+"supporting_frames":["F1"],
+"event_observations":{{"0":{{"frame_labels":["F1"],"target_label":"specific entity"}}}},
+"canonical_target_label":"same entity across required events or null",
+"evidence_summary":"brief observable evidence"}}"""
         usage: dict[str, object] = {}
         client: VllmChatClient | None = None
         gate_telemetry: dict[str, object] | None = None
@@ -1717,7 +1818,7 @@ Return strict JSON:
                     image_paths=[str(frame["frame_path"]) for frame in final_frames],
                     image_labels=labels,
                     detail=os.environ.get("VQA_IMAGE_DETAIL", "high"),
-                    generation_params={"temperature": 0.0, "max_tokens": 500},
+                    generation_params={"temperature": 0.0, "max_tokens": 700},
                 )
             usage = _gate_usage(_client_usage(client), gate_telemetry)
             usage["_logical_calls"] = 1
@@ -1740,6 +1841,25 @@ Return strict JSON:
                 for frame_id in cited
                 for event_index in final_frame_events.get(frame_id, set())
             }
+            final_identity_valid = _final_identity_observations_are_valid(
+                payload,
+                plan=plan,
+                selected_candidate_id=selected_id,
+                answer=answer,
+                cited_frame_ids=cited,
+                label_map=label_map,
+                frame_owners=final_frame_owner,
+                frame_events=final_frame_events,
+                verifier_observations=(
+                    chosen.event_observations if chosen is not None else {}
+                ),
+                verifier_canonical_target_label=(
+                    chosen.canonical_target_label if chosen is not None else None
+                ),
+                verifier_identity_consistent=(
+                    chosen.identity_consistent if chosen is not None else False
+                ),
+            )
             if (
                 payload.get("status") != "answered"
                 or chosen is None
@@ -1749,12 +1869,13 @@ Return strict JSON:
                 or not cited
                 or cited_owners != {selected_id}
                 or not _required_event_indices(plan).issubset(cited_events)
+                or not final_identity_valid
             ):
                 return (
                     {
                         "status": "insufficient_evidence",
                         "answer": None,
-                        "confidence": confidence,
+                        "confidence": 0.0,
                         "candidate_id": None,
                         "supporting_frame_ids": (),
                         "evidence_summary": str(payload.get("evidence_summary") or "")[:1000],
@@ -1822,6 +1943,15 @@ Return strict JSON:
         )
         if selected_payload is not None and selected_verification is not None:
             selected_payload["event_support"] = selected_verification.event_support
+            selected_payload["event_observations"] = (
+                selected_verification.event_observations
+            )
+            selected_payload["canonical_target_label"] = (
+                selected_verification.canonical_target_label
+            )
+            selected_payload["identity_consistent"] = (
+                selected_verification.identity_consistent
+            )
             selected_payload["effective_confidence"] = round(
                 _effective_verification_confidence(selected_verification), 6
             )
@@ -1861,8 +1991,14 @@ Return strict JSON:
                         "context_anchor_score": round(
                             candidate.context_anchor_score, 6
                         ),
+                        "temporal_coherence": round(
+                            candidate.temporal_coherence, 6
+                        ),
                         "model_query_consensus": round(
                             candidate.model_query_consensus, 6
+                        ),
+                        "branch_chain_score": round(
+                            candidate.branch_chain_score, 6
                         ),
                         "candidate_source": candidate.candidate_source,
                         "selection_reason": candidate.selection_reason,
@@ -1889,6 +2025,21 @@ Return strict JSON:
                 selected_verification.event_support
                 if selected_verification is not None
                 else {}
+            ),
+            "event_observations": (
+                selected_verification.event_observations
+                if selected_verification is not None
+                else {}
+            ),
+            "identity_consistent": (
+                selected_verification.identity_consistent
+                if selected_verification is not None
+                else False
+            ),
+            "canonical_target_label": (
+                selected_verification.canonical_target_label
+                if selected_verification is not None
+                else None
             ),
             "evidence_frames": evidence_frames,
             "supporting_frame_ids": supporting_ids,
@@ -1983,7 +2134,10 @@ def build_candidate_moments(
         lambda: defaultdict(list)
     )
     video_hit_limit = _candidate_video_hit_limit()
-    for event_index, results in enumerate(event_results):
+    # ``event_results`` follows ``plan.events`` order, while event IDs are
+    # part of the plan contract and are not required to be contiguous.
+    for event, results in zip(plan.events, event_results, strict=False):
+        event_index = event.index
         video_ranks: dict[str, int] = {}
         for result in results:
             video_ranks.setdefault(result.video_id, len(video_ranks) + 1)
@@ -2093,6 +2247,14 @@ def build_candidate_moments(
             consensus = sum(
                 _result_branch_consensus(hit.result) for hit in required_hits
             ) / len(required_hits)
+            # Keep a second ranking signal that is independent of the global
+            # union rank. A target action can be strong in one query/model
+            # branch yet rank poorly after all multilingual branches are
+            # merged. This value is used only for a bounded recall reserve;
+            # it never replaces the normal fusion score for every candidate.
+            branch_chain_score = sum(
+                _result_best_branch_score(hit.result) for hit in required_hits
+            ) / len(required_hits)
             context_hits = [hit for hit in chain if hit.event_index in context_indices]
             if context_indices:
                 context_values = [
@@ -2125,11 +2287,16 @@ def build_candidate_moments(
                 context_quality = 1.0
                 context_anchor_score = 1.0
                 context_component = 1.0
+            temporal_coherence = _temporal_coherence(
+                end_sec - start_sec,
+                max_moment_span_sec=max_moment_span_sec,
+            )
             retrieval_score = (
-                0.45 * ordered_quality
-                + 0.25 * context_component
-                + 0.20 * consensus
-                + 0.10 * global_score
+                0.42 * ordered_quality
+                + 0.23 * context_component
+                + 0.18 * consensus
+                + 0.07 * global_score
+                + 0.10 * temporal_coherence
             )
             base = required_chain[0].result
             raw.append(
@@ -2148,7 +2315,9 @@ def build_candidate_moments(
                     optional_context_coverage=context_coverage,
                     context_quality=context_quality,
                     context_anchor_score=context_anchor_score,
+                    temporal_coherence=temporal_coherence,
                     model_query_consensus=consensus,
+                    branch_chain_score=branch_chain_score,
                     global_hit=global_hit,
                 )
             )
@@ -2215,7 +2384,7 @@ def build_candidate_moments(
     # candidate still has a complete, strictly ordered required-event chain;
     # it only gets a different *selection* route so generic high-score videos
     # cannot crowd every candidate slot before visual verification.
-    rescue_slots = (
+    context_rescue_slots = (
         min(
             _env_int(
                 "VQA_CONTEXT_RESCUE_CANDIDATES",
@@ -2228,12 +2397,30 @@ def build_candidate_moments(
         if plan.target_reference and len(required_indices) >= 2 and context_indices
         else 0
     )
-    standard_limit = candidate_count - rescue_slots
+    # Preserve one complete required-action chain that is strong in a single
+    # visual branch even when its global union video rank is weak. This is
+    # deliberately bounded: normal high-quality candidates still receive the
+    # majority of verification slots, while a low-ranked but coherent target
+    # sequence is not discarded by ``VQA_MOMENT_POOL`` before VLM inspection.
+    required_chain_rescue_slots = (
+        min(
+            _env_int(
+                "VQA_REQUIRED_CHAIN_RESCUE_CANDIDATES",
+                DEFAULT_REQUIRED_CHAIN_RESCUE_CANDIDATES,
+                minimum=0,
+                maximum=2,
+            ),
+            max(0, candidate_count - context_rescue_slots - 1),
+        )
+        if plan.target_reference and len(required_indices) >= 2
+        else 0
+    )
+    standard_limit = candidate_count - context_rescue_slots - required_chain_rescue_slots
     add_candidates(ranked_pool, max_per_video=1, limit=standard_limit)
     if len(selected) < standard_limit:
         add_candidates(ranked_pool, max_per_video=2, limit=standard_limit)
 
-    if rescue_slots:
+    if context_rescue_slots:
         rescue_pool = sorted(
             (
                 candidate
@@ -2242,15 +2429,13 @@ def build_candidate_moments(
                 and candidate.optional_context_coverage > 0.0
                 and candidate not in selected
             ),
-            key=lambda candidate: (
-                candidate.context_anchor_score,
-                candidate.context_quality,
-                candidate.global_rank_score,
-                candidate.chain_score,
-            ),
+            key=_context_rescue_sort_key,
             reverse=True,
         )
-        rescue_limit = min(candidate_count, len(selected) + rescue_slots)
+        rescue_limit = min(
+            candidate_count - required_chain_rescue_slots,
+            len(selected) + context_rescue_slots,
+        )
         for candidate in rescue_pool:
             if any(existing.video_id == candidate.video_id for existing in selected):
                 continue
@@ -2261,6 +2446,47 @@ def build_candidate_moments(
             candidate.candidate_id = f"c{len(selected) + 1}"
             selected.append(candidate)
             if len(selected) >= rescue_limit:
+                break
+
+    if required_chain_rescue_slots and len(selected) < candidate_count:
+        # This reserve exists specifically for a valid chain that the normal
+        # ``moment_pool`` truncation did *not* retain. If we score every raw
+        # candidate together, a generic high-global candidate that is already
+        # available in ``ranked_pool`` can consume the reserve and recreate
+        # the original recall failure.
+        ranked_pool_ids = {id(candidate) for candidate in ranked_pool}
+        outside_moment_pool = [
+            candidate
+            for candidate in all_complete_candidates
+            if candidate.required_event_coverage >= 1.0
+            and id(candidate) not in ranked_pool_ids
+            and candidate not in selected
+        ]
+        required_chain_pool = sorted(
+            outside_moment_pool
+            or [
+                candidate
+                for candidate in all_complete_candidates
+                if candidate.required_event_coverage >= 1.0
+                and candidate not in selected
+            ],
+            key=_required_chain_rescue_sort_key,
+            reverse=True,
+        )
+        required_rescue_limit = min(
+            candidate_count,
+            len(selected) + required_chain_rescue_slots,
+        )
+        for candidate in required_chain_pool:
+            if any(existing.video_id == candidate.video_id for existing in selected):
+                continue
+            candidate.candidate_source = "required_chain_rescue"
+            candidate.selection_reason = (
+                "complete_required_chain_preserved_from_branch_evidence"
+            )
+            candidate.candidate_id = f"c{len(selected) + 1}"
+            selected.append(candidate)
+            if len(selected) >= required_rescue_limit:
                 break
 
     if len(selected) < candidate_count:
@@ -2591,6 +2817,16 @@ def _infer_constraint_specs(
         sequence = "_".join(str(event.index) for event in required_events)
         specs.append(
             VqaConstraint(
+                constraint_id=f"TARGET_SAME_IDENTITY_{sequence}",
+                kind="same_identity",
+                value=sequence,
+                description=(
+                    "Every required event visibly shows the same target entity."
+                ),
+            )
+        )
+        specs.append(
+            VqaConstraint(
                 constraint_id=f"ORDER_{sequence}",
                 kind="order",
                 value=sequence,
@@ -2672,6 +2908,203 @@ def _looks_like_untranslated_vietnamese(text: str) -> bool:
         "thoai",
     }
     return len(normalized & markers) >= 3
+
+
+def _coerce_observed_count(value: object) -> int | None:
+    """Parse an observable count without accepting booleans or fractions."""
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed < 0 or not parsed.is_integer():
+        return None
+    return int(parsed)
+
+
+def _optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0"}:
+            return False
+    return None
+
+
+def _target_label_core_tokens(value: object) -> set[str]:
+    """Return identity-bearing tokens from a VLM's target observation."""
+    generic = {
+        "a",
+        "an",
+        "the",
+        "target",
+        "food",
+        "ingredient",
+        "ingredients",
+        "object",
+        "objects",
+        "item",
+        "items",
+        "thing",
+        "things",
+        "piece",
+        "pieces",
+        "slice",
+        "slices",
+        "wedge",
+        "wedges",
+        "fresh",
+        "raw",
+        "red",
+        "white",
+        "nguyen",
+        "lieu",
+        "mon",
+        "an",
+        "vat",
+        "the",
+        "do",
+        "con",
+        "cai",
+    }
+    output: set[str] = set()
+    for token in _normalize_answer(str(value or "")).split():
+        if token in generic:
+            continue
+        # Keep a small deterministic English singularisation so ``clam`` and
+        # ``clams`` do not become different hidden identities. We deliberately
+        # do not apply semantic aliases across languages: the prompt requires
+        # the canonical label to use the answer's language, and abstention is
+        # safer than accepting an under-specified translation.
+        if len(token) > 3 and token.endswith("s") and not token.endswith("ss"):
+            token = token[:-1]
+        output.add(token)
+    return output
+
+
+def _target_labels_agree(left: object, right: object) -> bool:
+    """Require the same concrete identity, not merely "food" twice."""
+    left_tokens = _target_label_core_tokens(left)
+    right_tokens = _target_label_core_tokens(right)
+    if not left_tokens or not right_tokens:
+        return False
+    return left_tokens == right_tokens
+
+
+def _validated_event_observations(
+    raw_value: object,
+    *,
+    frame_map: dict[str, str],
+    label_events: dict[str, set[int]],
+    event_support_labels: dict[int, list[str]],
+    valid_event_indices: set[int],
+) -> dict[int, dict[str, object]]:
+    """Validate VLM observations against candidate-local event citations."""
+    if not isinstance(raw_value, dict):
+        return {}
+    output: dict[int, dict[str, object]] = {}
+    for raw_index, raw_observation in raw_value.items():
+        if not str(raw_index).lstrip("-").isdigit() or not isinstance(
+            raw_observation, dict
+        ):
+            continue
+        event_index = int(raw_index)
+        if event_index not in valid_event_indices:
+            continue
+        cited_labels = set(event_support_labels.get(event_index, ()))
+        observation_labels: list[str] = []
+        for raw_label in _as_list(raw_observation.get("frame_labels")):
+            label = str(raw_label).strip()
+            if (
+                label in frame_map
+                and label in cited_labels
+                and event_index in label_events.get(label, set())
+                and label not in observation_labels
+            ):
+                observation_labels.append(label)
+        target_label = str(raw_observation.get("target_label") or "").strip()
+        if not observation_labels or not _target_label_core_tokens(target_label):
+            continue
+        output[event_index] = {
+            "frame_labels": tuple(observation_labels),
+            "target_label": target_label,
+            "visible_count": _coerce_observed_count(
+                raw_observation.get("visible_count")
+            ),
+            "on_plate": _optional_bool(raw_observation.get("on_plate")),
+            "held": _optional_bool(raw_observation.get("held")),
+        }
+    return output
+
+
+def _final_identity_observations_are_valid(
+    payload: dict[str, object],
+    *,
+    plan: VqaQueryPlan,
+    selected_candidate_id: str,
+    answer: str,
+    cited_frame_ids: tuple[str, ...],
+    label_map: dict[str, str],
+    frame_owners: dict[str, str],
+    frame_events: dict[str, set[int]],
+    verifier_observations: dict[int, dict[str, object]],
+    verifier_canonical_target_label: str | None,
+    verifier_identity_consistent: bool,
+) -> bool:
+    """Check the final judge's own same-target observations in the backend."""
+    if not any(spec.kind == "same_identity" for spec in plan.constraint_specs):
+        return True
+    if not verifier_identity_consistent:
+        return False
+    raw_observations = payload.get("event_observations")
+    if not isinstance(raw_observations, dict):
+        return False
+    canonical = str(payload.get("canonical_target_label") or answer).strip()
+    required_events = sorted(_required_event_indices(plan))
+    labels: list[str] = []
+    cited_set = set(cited_frame_ids)
+    for event_index in required_events:
+        observation = raw_observations.get(str(event_index), raw_observations.get(event_index))
+        if not isinstance(observation, dict):
+            return False
+        target_label = str(observation.get("target_label") or "").strip()
+        frame_labels = [
+            str(value).strip()
+            for value in _as_list(observation.get("frame_labels"))
+            if str(value).strip()
+        ]
+        if not _target_label_core_tokens(target_label) or not frame_labels:
+            return False
+        verifier_observation = verifier_observations.get(event_index)
+        verifier_target_label = (
+            str(verifier_observation.get("target_label") or "").strip()
+            if verifier_observation is not None
+            else ""
+        )
+        if not _target_labels_agree(target_label, verifier_target_label):
+            return False
+        for label in frame_labels:
+            frame_id = label_map.get(label)
+            if (
+                not frame_id
+                or frame_id not in cited_set
+                or frame_owners.get(frame_id) != selected_candidate_id
+                or event_index not in frame_events.get(frame_id, set())
+            ):
+                return False
+        labels.append(target_label)
+    expected_canonical = verifier_canonical_target_label or answer
+    return bool(labels) and _target_labels_agree(
+        canonical, expected_canonical
+    ) and all(
+        _target_labels_agree(canonical, label) for label in labels
+    ) and all(
+        _target_labels_agree(labels[0], label) for label in labels[1:]
+    ) and _target_labels_agree(canonical, answer)
 
 
 def _verification_from_payload(
@@ -2773,6 +3206,46 @@ def _verification_from_payload(
             for frame_id in validated_event_support[event_index]
         )
     )
+    event_observations = _validated_event_observations(
+        payload.get("event_observations"),
+        frame_map=frame_map,
+        label_events=label_events,
+        event_support_labels=event_support_labels,
+        valid_event_indices=valid_event_indices,
+    )
+    observation_coverage = (
+        len(required_events & set(event_observations)) / len(required_events)
+        if required_events
+        else 1.0
+    )
+    raw_canonical_target = str(payload.get("canonical_target_label") or "").strip()
+    canonical_target_label = raw_canonical_target or answer
+    required_observation_labels = [
+        str(event_observations[event_index].get("target_label") or "")
+        for event_index in sorted(required_events)
+        if event_index in event_observations
+    ]
+    identity_specs_present = any(
+        spec.kind == "same_identity" for spec in plan.constraint_specs
+    )
+    identity_consistent = (
+        not identity_specs_present
+        or (
+            observation_coverage >= 1.0
+            and bool(canonical_target_label)
+            and all(
+                _target_labels_agree(canonical_target_label, target_label)
+                for target_label in required_observation_labels
+            )
+            and all(
+                _target_labels_agree(
+                    required_observation_labels[0], target_label
+                )
+                for target_label in required_observation_labels[1:]
+            )
+            and _target_labels_agree(canonical_target_label, answer or "")
+        )
+    )
     disallowed = {_normalize_text(value) for value in plan.disallowed_entity_types}
     person_terms = {
         "person",
@@ -2815,13 +3288,40 @@ def _verification_from_payload(
         if spec is None:
             continue
         if spec.kind == "entity_type":
-            if not type_conflict:
+            expected_type = _normalize_text(str(spec.value or ""))
+            type_matches = entity_type == expected_type or (
+                expected_type == "object" and entity_type == "food"
+            )
+            if not type_conflict and type_matches:
                 validated_constraint_ids.append(constraint_id)
         elif spec.kind == "order":
             if ordered and citation_coverage >= 1.0:
                 validated_constraint_ids.append(constraint_id)
-        elif spec.event_index in validated_event_support:
-            validated_constraint_ids.append(constraint_id)
+        elif spec.kind == "same_identity":
+            if identity_consistent:
+                validated_constraint_ids.append(constraint_id)
+        else:
+            observation = (
+                event_observations.get(spec.event_index)
+                if spec.event_index is not None
+                else None
+            )
+            if spec.kind == "count":
+                if (
+                    observation is not None
+                    and observation.get("visible_count") == spec.value
+                ):
+                    validated_constraint_ids.append(constraint_id)
+            elif spec.kind == "relation":
+                if observation is not None and observation.get("on_plate") is True:
+                    validated_constraint_ids.append(constraint_id)
+            elif spec.kind == "action":
+                if observation is not None and observation.get("held") is True:
+                    validated_constraint_ids.append(constraint_id)
+            elif spec.event_index in validated_event_support:
+                # Keep the fallback for future constraint kinds, while count,
+                # relation and action all require a concrete observation above.
+                validated_constraint_ids.append(constraint_id)
 
     visual_specs = [spec for spec in plan.constraint_specs if spec.kind != "entity_type"]
     if visual_specs:
@@ -2868,6 +3368,11 @@ def _verification_from_payload(
     if not ordered:
         verdict = "partial" if verdict == "supported" else verdict
         contradictions.append("Required event citations are not in chronological order.")
+    if identity_specs_present and not identity_consistent:
+        verdict = "partial" if verdict == "supported" else verdict
+        contradictions.append(
+            "Required events do not establish one consistent target identity."
+        )
     if constraint_coverage < 1.0:
         verdict = "partial" if verdict == "supported" else verdict
         contradictions.append("Not every structured target constraint was grounded.")
@@ -2891,6 +3396,9 @@ def _verification_from_payload(
         required_event_coverage=candidate_required_coverage,
         valid_citation_coverage=citation_coverage,
         effective_confidence=effective_confidence,
+        event_observations=event_observations,
+        canonical_target_label=canonical_target_label,
+        identity_consistent=identity_consistent,
     )
 
 
@@ -3088,15 +3596,40 @@ def _with_branch_consensus(
     result: SearchResult,
     score: float,
     consensus: float,
+    *,
+    best_branch_rank_score: float | None = None,
+    branch_names: tuple[str, ...] | list[str] | None = None,
 ) -> VqaBranchSearchResult:
     payload = {
         name: getattr(result, name)
         for name in SearchResult.__dataclass_fields__
     }
     payload["score"] = score
+    inherited_best_score = getattr(result, "best_branch_rank_score", score)
+    inherited_branch_names = getattr(result, "branch_names", ())
+    resolved_branch_names = (
+        branch_names if branch_names is not None else inherited_branch_names
+    )
     return VqaBranchSearchResult(
         **payload,
         model_query_consensus=_clamp_float(consensus, default=0.0),
+        best_branch_rank_score=_clamp_float(
+            (
+                best_branch_rank_score
+                if best_branch_rank_score is not None
+                else inherited_best_score
+            ),
+            default=0.0,
+        ),
+        branch_names=tuple(
+            sorted(
+                {
+                    str(name).strip()
+                    for name in _as_list(resolved_branch_names)
+                    if str(name).strip()
+                }
+            )
+        ),
     )
 
 
@@ -3104,6 +3637,27 @@ def _result_branch_consensus(result: SearchResult) -> float:
     return _clamp_float(
         getattr(result, "model_query_consensus", result.score),
         default=0.0,
+    )
+
+
+def _result_best_branch_score(result: SearchResult) -> float:
+    """Return the strongest pre-union branch rank carried by a result."""
+    return _clamp_float(
+        getattr(result, "best_branch_rank_score", result.score),
+        default=0.0,
+    )
+
+
+def _result_branch_names(result: SearchResult) -> tuple[str, ...]:
+    raw = getattr(result, "branch_names", ())
+    return tuple(
+        sorted(
+            {
+                str(name).strip()
+                for name in _as_list(raw)
+                if str(name).strip()
+            }
+        )
     )
 
 
@@ -3173,7 +3727,22 @@ def _union_variant_branches(
         score = 0.80 * float(record["best_rank_score"]) + 0.20 * consensus
         # Preserve the retrieval-ranking score shown by existing clients while
         # carrying consensus separately for candidate scoring.
-        scored.append((score, _with_branch_consensus(base, score, consensus)))
+        record_branches = record["branches"]
+        assert isinstance(record_branches, set)
+        scored.append(
+            (
+                score,
+                _with_branch_consensus(
+                    base,
+                    score,
+                    consensus,
+                    best_branch_rank_score=float(record["best_rank_score"]),
+                    branch_names=tuple(
+                        sorted(str(name) for name in record_branches)
+                    ),
+                ),
+            )
+        )
     scored.sort(key=lambda item: item[0], reverse=True)
 
     # A low-ranked frame can be the *only* useful observation of one event in
@@ -3345,11 +3914,41 @@ def _merge_auxiliary_results(
                 ),
             )
         )
+    # OCR/ASR are useful corroboration, but they must not evict every visual
+    # witness from one video. Keep a few diverse visual frames first so a weak
+    # single-model target action remains available to the temporal chain after
+    # text fusion (especially when a broad ASR segment yields many frames).
+    visual_reserve = _visual_witness_frame_ids(visual_results)
     diverse = _select_diverse_video_hits(
         rescored,
         max_hits_per_video=max_hits_per_video,
+        reserved_frame_ids=visual_reserve,
     )
     return [result for _, result in diverse[:top_k]]
+
+
+def _visual_witness_frame_ids(results: list[SearchResult]) -> set[str]:
+    """Keep several temporally distinct visual observations per video."""
+    per_video_limit = _env_int(
+        "VQA_VISUAL_WITNESSES_PER_VIDEO",
+        DEFAULT_VISUAL_WITNESSES_PER_VIDEO,
+        minimum=1,
+        maximum=12,
+    )
+    selected: set[str] = set()
+    selected_moments: dict[str, set[tuple[str, object]]] = defaultdict(set)
+    selected_count: dict[str, int] = defaultdict(int)
+    for result in results:
+        video_id = result.video_id
+        if selected_count[video_id] >= per_video_limit:
+            continue
+        moment = _result_moment_key(result)
+        if moment in selected_moments[video_id]:
+            continue
+        selected.add(result.frame_id)
+        selected_moments[video_id].add(moment)
+        selected_count[video_id] += 1
+    return selected
 
 
 def _top_video_trace(results: list[SearchResult], *, limit: int) -> list[dict[str, object]]:
@@ -3368,6 +3967,10 @@ def _top_video_trace(results: list[SearchResult], *, limit: int) -> list[dict[st
                 "model_query_consensus": round(
                     _result_branch_consensus(result), 6
                 ),
+                "best_branch_rank_score": round(
+                    _result_best_branch_score(result), 6
+                ),
+                "branch_names": list(_result_branch_names(result)),
             }
         )
         if len(output) >= limit:
@@ -3403,6 +4006,10 @@ def _video_hit_trace(
                 "model_query_consensus": round(
                     _result_branch_consensus(result), 6
                 ),
+                "best_branch_rank_score": round(
+                    _result_best_branch_score(result), 6
+                ),
+                "branch_names": list(_result_branch_names(result)),
             }
         )
         if len(output) >= limit:
@@ -3425,6 +4032,68 @@ def _search_result_payload(result: SearchResult) -> dict[str, object]:
 def _context_hit_quality(hit: EventHit) -> float:
     """Quality for an optional context observation, independent of coverage."""
     return 0.75 * hit.rank_score + 0.25 * _result_branch_consensus(hit.result)
+
+
+def _temporal_coherence(span_sec: float, *, max_moment_span_sec: float) -> float:
+    """Softly prefer compact evidence without rejecting long valid moments."""
+    denominator = max(1.0, float(max_moment_span_sec))
+    return _clamp_float(1.0 - max(0.0, float(span_sec)) / denominator, default=0.0)
+
+
+def _context_rescue_sort_key(candidate: VqaCandidateMoment) -> tuple[float, float, float, float]:
+    """Choose a distinctive, compact complete chain for the rescue slots.
+
+    A vague cooking-show context can rank highly in many videos.  Combining
+    the context anchor with total-moment compactness promotes a scene where
+    the contextual cues and the target actions actually occur together,
+    rather than a video assembled from unrelated shots minutes apart.
+    """
+    rescue_score = (
+        0.55 * candidate.context_anchor_score
+        + 0.30 * candidate.temporal_coherence
+        + 0.15 * candidate.chain_score
+    )
+    return (
+        rescue_score,
+        candidate.context_anchor_score,
+        candidate.temporal_coherence,
+        candidate.chain_score,
+    )
+
+
+def _required_chain_rescue_sort_key(
+    candidate: VqaCandidateMoment,
+) -> tuple[float, float, float, float, float]:
+    """Rank the bounded recall reserve by branch evidence and compactness.
+
+    ``branch_chain_score`` is deliberately separate from the global score:
+    it records how strongly at least one concrete model/query branch retrieved
+    each required action before unioning all variants. Optional context helps
+    choose between otherwise similar chains, but can never substitute for the
+    complete required-event coverage checked by the caller.
+    """
+    # This reserve specifically protects evidence that was strong in one
+    # branch but de-ranked by the global union. A candidate already strong in
+    # the normal cross-branch video ranking has the standard slots; the gap
+    # lets a single-model SigLIP/Jina witness survive long enough to be
+    # visually verified.
+    branch_recall_gap = max(
+        0.0,
+        candidate.branch_chain_score - candidate.chain_score,
+    )
+    reserve_score = (
+        0.50 * branch_recall_gap
+        + 0.25 * candidate.branch_chain_score
+        + 0.15 * candidate.context_anchor_score
+        + 0.10 * candidate.temporal_coherence
+    )
+    return (
+        reserve_score,
+        branch_recall_gap,
+        candidate.branch_chain_score,
+        candidate.context_anchor_score,
+        candidate.temporal_coherence,
+    )
 
 
 def _beam_chain_sort_key(
@@ -3469,20 +4138,13 @@ def _context_hit_fits_chain(
     if hit.result.timestamp_sec is None:
         return False
     timestamp = float(hit.result.timestamp_sec)
-    earlier = [
-        item for item in chain if item.event_index < hit.event_index
-    ]
-    later = [
-        item for item in chain if item.event_index > hit.event_index
-    ]
-    if earlier:
-        previous = max(float(item.result.timestamp_sec or 0.0) for item in earlier)
-        if not previous < timestamp:
-            return False
-    if later:
-        following = min(float(item.result.timestamp_sec or 0.0) for item in later)
-        if not timestamp < following:
-            return False
+    # Context events improve retrieval discrimination but cannot establish the
+    # answer by themselves. Keep their temporal window broad and do not force
+    # their textual order onto the strict required-event chain: a retriever can
+    # find the distinctive apron/flower frame a few seconds after a target
+    # action even when the description mentioned it first. The verifier still
+    # receives the original chronological description and must ground every
+    # required target event in order.
     all_times = [float(item.result.timestamp_sec or 0.0) for item in chain]
     return max([timestamp, *all_times]) - min([timestamp, *all_times]) <= max_moment_span_sec
 
@@ -3541,6 +4203,8 @@ def _build_display_results(
                 "required_event_coverage": round(candidate.required_event_coverage, 6),
                 "optional_context_coverage": round(candidate.optional_context_coverage, 6),
                 "context_quality": round(candidate.context_quality, 6),
+                "temporal_coherence": round(candidate.temporal_coherence, 6),
+                "branch_chain_score": round(candidate.branch_chain_score, 6),
             }
         )
         seen_frames.add(frame_id)

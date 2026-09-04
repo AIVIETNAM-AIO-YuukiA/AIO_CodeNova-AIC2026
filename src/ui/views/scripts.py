@@ -23,6 +23,38 @@ APP_JS = r"""
       return parts[parts.length - 1];
     }
 
+    function hasFiniteMetric(record, key) {
+      if (!record || !Object.prototype.hasOwnProperty.call(record, key)) return false;
+      const value = record[key];
+      return value !== null && value !== "" && Number.isFinite(Number(value));
+    }
+    function formatCandidateTelemetry(record, { compact = false } = {}) {
+      const candidate = record || {};
+      const parts = [];
+      if (candidate.candidate_source) {
+        parts.push(`source ${escapeHtml(candidate.candidate_source)}`);
+      }
+      if (hasFiniteMetric(candidate, "required_event_coverage")) {
+        parts.push(`required ${(Number(candidate.required_event_coverage) * 100).toFixed(0)}%`);
+      }
+      if (hasFiniteMetric(candidate, "optional_context_coverage")) {
+        parts.push(`context ${(Number(candidate.optional_context_coverage) * 100).toFixed(0)}%`);
+      }
+      if (!compact && hasFiniteMetric(candidate, "context_quality")) {
+        parts.push(`context quality ${(Number(candidate.context_quality) * 100).toFixed(0)}%`);
+      }
+      if (hasFiniteMetric(candidate, "temporal_coherence")) {
+        parts.push(`temporal ${(Number(candidate.temporal_coherence) * 100).toFixed(0)}%`);
+      }
+      if (hasFiniteMetric(candidate, "branch_chain_score")) {
+        parts.push(`branch chain ${Number(candidate.branch_chain_score).toFixed(3)}`);
+      }
+      if (Array.isArray(candidate.candidate_event_indices) && candidate.candidate_event_indices.length) {
+        parts.push(`events ${candidate.candidate_event_indices.map(index => `E${Number(index) + 1}`).join(", ")}`);
+      }
+      return parts.join(" &middot; ");
+    }
+
     const form = document.getElementById("search-form");
     const statusEl = document.getElementById("status");
     const resultsEl = document.getElementById("results");
@@ -407,16 +439,16 @@ APP_JS = r"""
               const name = cleanVideoName(c.video_name || c.video_id || c.candidate_id || `Candidate ${i + 1}`);
               const contradictions = Array.isArray(c.contradictions) ? c.contradictions : [];
               const candidateFrames = Array.isArray(c.evidence_frames) ? c.evidence_frames : [];
-              const requiredCoverage = Number(c.required_event_coverage || 0);
-              const contextCoverage = Number(c.optional_context_coverage || 0);
-              const contextQuality = Number(c.context_quality || 0);
-              const source = c.candidate_source || "ordered_event_union";
+              const telemetry = formatCandidateTelemetry({
+                ...c,
+                candidate_source: c.candidate_source || "ordered_event_union",
+              });
               return `<div style="padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:12px;line-height:1.45;">
                 <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;">
-                  <strong>#${i + 1} ${escapeHtml(name)}</strong>
+                  <strong>Candidate #${i + 1} ${escapeHtml(name)}</strong>
                   <span class="pill">${escapeHtml(c.verdict || "unknown")} &middot; ${scoreText}</span>
                 </div>
-                <div style="color:var(--muted);margin-top:4px;">${escapeHtml(source)} &middot; Required events ${(requiredCoverage * 100).toFixed(0)}% &middot; optional context ${(contextCoverage * 100).toFixed(0)}% &middot; context quality ${(contextQuality * 100).toFixed(0)}%</div>
+                ${telemetry ? `<div style="color:var(--muted);margin-top:4px;">${telemetry}</div>` : ""}
                 ${c.selection_reason && c.selection_reason !== "standard_rank" ? `<div style="color:var(--muted);margin-top:2px;">${escapeHtml(c.selection_reason)}</div>` : ""}
                 <div style="margin-top:5px;"><strong>${escapeHtml(c.answer || "No answer")}</strong></div>
                 ${c.evidence_summary ? `<div style="color:var(--muted);margin-top:3px;">${escapeHtml(c.evidence_summary)}</div>` : ""}
@@ -591,8 +623,20 @@ APP_JS = r"""
         const scoreStr = result.score != null ? Number(result.score).toFixed(4) : "1.0000";
         const frameNum = result.frame_index != null ? `f${result.frame_index}` : "f0";
         const timeStr = formatTime(result.timestamp_sec || 0);
+        const candidateTelemetry = result.candidate_id
+          ? formatCandidateTelemetry({
+              ...result,
+              candidate_source: result.candidate_source || "ordered events",
+            }, { compact: true })
+          : "";
         const candidateBadge = result.candidate_id
-          ? `<span class="pill">${escapeHtml(result.candidate_id)} &middot; ${escapeHtml(result.candidate_source || "ordered events")} &middot; required ${(Number(result.required_event_coverage || 0) * 100).toFixed(0)}% &middot; context ${(Number(result.optional_context_coverage || 0) * 100).toFixed(0)}% &middot; quality ${(Number(result.context_quality || 0) * 100).toFixed(0)}%</span>`
+          ? `<div style="display:flex;gap:4px;align-items:flex-start;flex-wrap:wrap;margin:4px 0 6px;">
+              <span class="pill">Candidate moment ${escapeHtml(result.candidate_id)}</span>
+              ${candidateTelemetry ? `<span class="pill" style="font-size:10px;white-space:normal;line-height:1.35;">${candidateTelemetry}</span>` : ""}
+            </div>`
+          : "";
+        const candidateReason = result.candidate_selection_reason && result.candidate_selection_reason !== "standard_rank"
+          ? `<div style="font-size:10px;color:var(--muted);margin:-2px 0 5px;overflow-wrap:anywhere;">${escapeHtml(result.candidate_selection_reason)}</div>`
           : "";
 
         return `
@@ -606,6 +650,7 @@ APP_JS = r"""
             </div>
             ${candidateBadge}
             <div class="card-vname" title="${escapeHtml(videoName)}">📹 ${escapeHtml(videoName)}</div>
+            ${candidateReason}
             <div class="card-info-row">
               <span class="card-frame-badge">${frameNum}</span>
               <span>⏱️ ${timeStr} (${Number(result.timestamp_sec || 0).toFixed(1)}s)</span>

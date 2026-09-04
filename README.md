@@ -75,6 +75,14 @@ with `BEIT3_USE_TENSORRT=0` / `SIGLIP2_USE_TENSORRT=0` in `.env`.
   unknowns such as `X` are replaced with `[TARGET]` before planning. The LLM
   may translate and classify those source events, but cannot rename the target
   or change which target events are required.
+  A bounded recall reserve (`VQA_REQUIRED_CHAIN_RESCUE_CANDIDATES=1`) keeps a
+  complete chain that was strong in one visual model/query branch even if the
+  multilingual union ranks its video low; optional context is soft temporal
+  evidence, while target actions remain strictly ordered. Before an answer is
+  accepted, the verifier must cite each required event and name one concrete
+  target identity consistently across them. Thus a frame sequence showing
+  tomatoes in one event and mushrooms in another must abstain rather than
+  return either ingredient.
 - **Legacy VQA** remains available with `pipeline_mode=legacy` for manual
   rollback. It is not used as an automatic fallback because a text-only guess
   would hide missing visual evidence.

@@ -19,6 +19,7 @@ from retrieval.grounded_vqa import (
     VqaEvent,
     VqaQueryPlan,
     VqaVerification,
+    _context_hit_fits_chain,
     _evidence_prompt,
     _event_retrieval_variants,
     _heuristic_plan,
@@ -405,6 +406,29 @@ def test_beam_search_keeps_a_lower_early_hit_that_forms_a_complete_chain() -> No
     assert candidates[0].required_event_coverage == 1.0
 
 
+def test_candidate_builder_uses_explicit_event_ids_not_result_positions() -> None:
+    plan = replace(
+        _plan(),
+        events=(
+            replace(_plan().events[0], index=10),
+            replace(_plan().events[1], index=20),
+            replace(_plan().events[2], index=30),
+        ),
+    )
+    candidates = build_candidate_moments(
+        plan,
+        [],
+        [
+            [_result("first", "v1", 10.0)],
+            [_result("second", "v1", 20.0)],
+            [],
+        ],
+    )
+
+    assert candidates
+    assert [hit.event_index for hit in candidates[0].event_hits] == [10, 20]
+
+
 def test_beam_pairs_before_pruning_a_low_rank_first_required_event(monkeypatch) -> None:
     """A valid early action must survive more than ``beam_width`` dead ends."""
     monkeypatch.setenv("VQA_CANDIDATE_VIDEO_HITS_PER_EVENT", "32")
@@ -496,6 +520,64 @@ def test_context_anchor_rescue_keeps_a_complete_low_rank_candidate() -> None:
     assert rescued.required_event_coverage == 1.0
     assert rescued.candidate_source == "context_anchor_rescue"
     assert "complete_required_chain" in rescued.selection_reason
+
+
+def test_required_chain_rescue_prefers_chain_outside_moment_pool(monkeypatch) -> None:
+    """The branch reserve cannot be spent on a candidate already in the pool."""
+    monkeypatch.setenv("VQA_CONTEXT_RESCUE_CANDIDATES", "0")
+    monkeypatch.setenv("VQA_REQUIRED_CHAIN_RESCUE_CANDIDATES", "1")
+    plan = _plan()
+    candidates = build_candidate_moments(
+        plan,
+        [
+            _result("generic-full", "generic", 15.0),
+            _result("target-full", "target", 15.0),
+        ],
+        [
+            [
+                _result("generic-r0", "generic", 10.0),
+                _result("target-r0", "target", 10.0),
+            ],
+            [
+                _result("generic-r1", "generic", 20.0),
+                _result("target-r1", "target", 20.0),
+            ],
+            [],
+        ],
+        candidate_count=2,
+        moment_pool=1,
+    )
+
+    assert {candidate.video_id for candidate in candidates} == {"generic", "target"}
+    rescued = next(candidate for candidate in candidates if candidate.video_id == "target")
+    assert rescued.candidate_source == "required_chain_rescue"
+    assert "preserved_from_branch_evidence" in rescued.selection_reason
+
+
+def test_optional_context_can_follow_required_actions_within_moment_window() -> None:
+    """Context order is soft; only the two target actions are strictly ordered.
+
+    This mirrors L26_V254: the distinctive apron/flower frame was retrieved a
+    few seconds *after* the two required target actions, even though the
+    textual description mentions it first.  It must still be usable as
+    optional evidence for the otherwise valid required-event chain.
+    """
+    required_chain = [
+        EventHit(1, _result("placed-four", "L26_V254", 13.08), 1, 1.0),
+        EventHit(2, _result("held-two", "L26_V254", 15.60), 1, 1.0),
+    ]
+    later_context = EventHit(
+        0,
+        _result("apron-and-flowers", "L26_V254", 23.36),
+        1,
+        1.0,
+    )
+
+    assert _context_hit_fits_chain(
+        later_context,
+        required_chain,
+        max_moment_span_sec=60.0,
+    )
 
 
 def test_full_query_video_rank_counts_without_adding_a_far_frame_to_evidence() -> None:
@@ -917,6 +999,22 @@ def test_structured_event_support_and_constraints_are_backend_validated() -> Non
             "E1_COUNT_2",
             "ORDER_0_1",
         ],
+        "event_observations": {
+            "0": {
+                "frame_labels": ["F1"],
+                "target_label": "clam",
+                "visible_count": 4,
+                "on_plate": None,
+                "held": None,
+            },
+            "1": {
+                "frame_labels": ["F2"],
+                "target_label": "clam",
+                "visible_count": 2,
+                "on_plate": None,
+                "held": None,
+            },
+        },
     }
 
     valid = _verification_from_payload(
@@ -959,6 +1057,144 @@ def test_structured_event_support_and_constraints_are_backend_validated() -> Non
     assert wrong_event.valid_citation_coverage == 0.5
     assert missing_event_support.verdict == "partial"
     assert missing_event_support.valid_citation_coverage == 0.0
+
+
+def test_same_target_identity_is_checked_across_required_events() -> None:
+    """A verifier cannot turn tomatoes then mushrooms into one hidden X.
+
+    Both frames have valid citations, counts, actions and chronological order.
+    The only way to reject the false answer is to require one observable target
+    identity across the two answer-bearing events.
+    """
+    plan = replace(
+        _plan(),
+        constraint_specs=(
+            VqaConstraint("TARGET_ENTITY_TYPE", "entity_type", "food target", value="food"),
+            VqaConstraint("E0_COUNT_4", "count", "four targets", event_index=0, value=4),
+            VqaConstraint(
+                "E0_ON_PLATE",
+                "relation",
+                "targets on a plate",
+                event_index=0,
+                value="on_plate",
+            ),
+            VqaConstraint("E1_COUNT_2", "count", "two targets", event_index=1, value=2),
+            VqaConstraint(
+                "E1_HELD",
+                "action",
+                "targets are held",
+                event_index=1,
+                value="held",
+            ),
+            VqaConstraint("ORDER_0_1", "order", "event order", value="0_1"),
+            VqaConstraint(
+                "TARGET_SAME_IDENTITY_0_1",
+                "same_identity",
+                "the same target appears in every required event",
+                value="0_1",
+            ),
+        ),
+    )
+    first = _result("f1", "v1", 10.0)
+    second = _result("f2", "v1", 15.0)
+    candidate = VqaCandidateMoment(
+        candidate_id="c1",
+        video_id="v1",
+        video_name="L26_V254.mp4",
+        start_sec=10.0,
+        end_sec=15.0,
+        event_hits=(EventHit(0, first, 1, 1.0), EventHit(1, second, 1, 1.0)),
+        event_coverage=2 / 3,
+        chain_score=1.0,
+        global_rank_score=0.0,
+        retrieval_score=0.9,
+        required_event_coverage=1.0,
+    )
+    common = {
+        "verdict": "supported",
+        "entity_type": "food",
+        "confidence": 1.0,
+        "supporting_frames": ["F1", "F2"],
+        "matched_event_indices": [0, 1],
+        "event_support": {"0": ["F1"], "1": ["F2"]},
+        "supported_constraint_ids": [
+            "TARGET_ENTITY_TYPE",
+            "E0_COUNT_4",
+            "E0_ON_PLATE",
+            "E1_COUNT_2",
+            "E1_HELD",
+            "ORDER_0_1",
+            "TARGET_SAME_IDENTITY_0_1",
+        ],
+    }
+    valid = _verification_from_payload(
+        candidate=candidate,
+        plan=plan,
+        payload={
+            **common,
+            "answer": "clam",
+            "canonical_target_label": "clam",
+            "event_observations": {
+                "0": {
+                    "frame_labels": ["F1"],
+                    "target_label": "clam",
+                    "visible_count": 4,
+                    "on_plate": True,
+                    "held": False,
+                },
+                "1": {
+                    "frame_labels": ["F2"],
+                    "target_label": "clam",
+                    "visible_count": 2,
+                    "on_plate": False,
+                    "held": True,
+                },
+            },
+        },
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
+        usage={},
+    )
+    tomato_then_mushroom = _verification_from_payload(
+        candidate=candidate,
+        plan=plan,
+        payload={
+            **common,
+            "answer": "oyster mushroom",
+            "canonical_target_label": "oyster mushroom",
+            "event_observations": {
+                "0": {
+                    "frame_labels": ["F1"],
+                    "target_label": "tomato",
+                    "visible_count": 4,
+                    "on_plate": True,
+                    "held": False,
+                },
+                "1": {
+                    "frame_labels": ["F2"],
+                    "target_label": "oyster mushroom",
+                    "visible_count": 2,
+                    "on_plate": False,
+                    "held": True,
+                },
+            },
+        },
+        frame_map={"F1": "f1", "F2": "f2"},
+        frame_events={"F1": {0}, "F2": {1}},
+        frame_times={"F1": 10.0, "F2": 15.0},
+        usage={},
+    )
+
+    assert valid.verdict == "supported"
+    assert valid.identity_consistent is True
+    assert valid.event_observations[0]["target_label"] == "clam"
+    assert "TARGET_SAME_IDENTITY_0_1" in valid.validated_constraint_ids
+
+    assert tomato_then_mushroom.verdict != "supported"
+    assert tomato_then_mushroom.identity_consistent is False
+    assert "TARGET_SAME_IDENTITY_0_1" not in tomato_then_mushroom.validated_constraint_ids
+    assert tomato_then_mushroom.effective_confidence < tomato_then_mushroom.confidence
 
 
 def test_partial_required_candidate_is_rejected_before_openrouter() -> None:

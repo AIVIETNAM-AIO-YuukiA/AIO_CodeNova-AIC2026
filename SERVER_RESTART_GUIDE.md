@@ -73,7 +73,21 @@ service docker restart
 Sau đó chạy lại lệnh `docker run ... nvidia-smi` ở trên. Không cần GPU trong
 container để chạy Qdrant/Elasticsearch; nó chỉ cần khi chọn reranker vLLM.
 
-## 3. Clone source và cài Python dependency
+## 3. Cài `uv`, clone source và cài Python dependency
+
+Cài `uv` một lần trên mỗi server. Installer sẽ tự thêm `uv` vào shell profile;
+nạp lại PATH cho terminal hiện tại rồi kiểm tra version:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source "$HOME/.local/bin/env"
+uv --version
+```
+
+Nếu `source` báo không tìm thấy file, đóng SSH và kết nối lại, sau đó chạy
+`uv --version` lần nữa. Không dùng `pip install uv` cho bước này.
+
+Sau đó clone source và tạo môi trường Python của project:
 
 ```bash
 cd ~
