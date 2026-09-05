@@ -1,14 +1,57 @@
 """Elasticsearch-backed text index.
 
-Not yet wired into the pipeline — there is no OCR/ASR text to index yet. The
-implementation is kept minimal and the ``elasticsearch`` package is imported
-lazily so the project runs without it installed (install via the ``text`` extra).
+Indexes OCR (``modules/ocr/vllm.py``), ASR (``modules/asr/gipformer.py``), and
+caption documents under one mapping (same convention as the AIC 2025
+reference project's ``elasticsearch_service.py``: one index, ``source``
+distinguishes modalities rather than using separate indices).
 """
 
 from __future__ import annotations
 
 from core.errors import IndexBuildError
 from stores.text.base import TextDocument, TextIndex
+
+# Keep each HTTP bulk request comfortably below Elasticsearch's default
+# ``http.max_content_length`` (100 MB). ASR segments can be several KB each,
+# so sending a whole 100k+ document manifest in one request is not safe.
+BULK_INDEX_BATCH_SIZE = 500
+
+# Custom analyzer for Vietnamese/multilingual text: lowercases, strips
+# diacritics-as-separate-chars (asciifolding), and drops English stopwords —
+# same setup as the AIC 2025 reference project. ``text.exact`` is a
+# keyword-tokenized sub-field for substring/exact-phrase matching, which the
+# standard analyzer's tokenization can't do.
+_INDEX_MAPPING = {
+    "settings": {
+        "analysis": {
+            "analyzer": {
+                "multilingual_analyzer": {
+                    "type": "custom",
+                    "tokenizer": "standard",
+                    "filter": ["lowercase", "asciifolding", "stop"],
+                },
+                "exact_analyzer": {
+                    "type": "custom",
+                    "tokenizer": "keyword",
+                    "filter": ["lowercase"],
+                },
+            }
+        }
+    },
+    "mappings": {
+        "properties": {
+            "text": {
+                "type": "text",
+                "analyzer": "multilingual_analyzer",
+                "fields": {"exact": {"type": "text", "analyzer": "exact_analyzer"}},
+            },
+            "video_id": {"type": "keyword"},
+            "frame_id": {"type": "keyword"},
+            "source": {"type": "keyword"},
+            "timestamp_sec": {"type": "float"},
+        }
+    },
+}
 
 
 class ElasticTextIndex(TextIndex):
@@ -21,33 +64,116 @@ class ElasticTextIndex(TextIndex):
         self._client = None
 
     def index_documents(self, documents: list[TextDocument]) -> None:
-        """Bulk-index text documents into Elasticsearch."""
+        """Bulk-index text documents in bounded requests.
+
+        ``import-text`` may contain more than 100k OCR/ASR/caption records.
+        A single bulk payload can exceed Elasticsearch's HTTP request limit and
+        fail with HTTP 413, so each batch is sent independently. Refresh only
+        after the final batch to avoid one costly refresh per request.
+        """
         if not documents:
             return
         client = self._connect()
-        operations = []
-        for doc in documents:
-            operations.append({"index": {"_index": self.index_name, "_id": doc.doc_id}})
-            operations.append(
-                {
-                    "video_id": doc.video_id,
-                    "frame_id": doc.frame_id,
-                    "text": doc.text,
-                    "source": doc.source,
-                    "timestamp_sec": doc.timestamp_sec,
-                }
+        self._ensure_index(client)
+        for offset in range(0, len(documents), BULK_INDEX_BATCH_SIZE):
+            batch = documents[offset : offset + BULK_INDEX_BATCH_SIZE]
+            operations = []
+            for doc in batch:
+                operations.append({"index": {"_index": self.index_name, "_id": doc.doc_id}})
+                operations.append(
+                    {
+                        "video_id": doc.video_id,
+                        "frame_id": doc.frame_id,
+                        "text": doc.text,
+                        "source": doc.source,
+                        "timestamp_sec": doc.timestamp_sec,
+                    }
+                )
+            response = client.bulk(
+                operations=operations,
+                refresh=offset + BULK_INDEX_BATCH_SIZE >= len(documents),
             )
-        client.bulk(operations=operations, refresh=True)
+            if response.get("errors"):
+                raise IndexBuildError(
+                    "Elasticsearch rejected one or more text documents in bulk indexing."
+                )
 
     def search(self, query: str, top_k: int) -> list[tuple[str, float]]:
-        """Run a BM25 match query and return ``(doc_id, score)`` pairs."""
+        """Run a multi-strategy BM25 query and return ``(doc_id, score)`` pairs.
+
+        Combines exact-phrase (highest weight), all-words, most-words, and
+        fuzzy matching in one query so typos and partial matches still rank
+        below an exact hit rather than needing separate calls.
+        """
+        hits = self._query(query, top_k)
+        return [(hit["_id"], float(hit["_score"])) for hit in hits]
+
+    def search_documents(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
+        """Return full matching documents, optionally restricted by source."""
+        if source is not None and not isinstance(source, str) and not source:
+            return []
+        hits = self._query(query, top_k, source=source)
+        return [
+            {"doc_id": hit["_id"], "score": float(hit["_score"]), **hit["_source"]} for hit in hits
+        ]
+
+    def _query(
+        self,
+        query: str,
+        top_k: int,
+        source: str | tuple[str, ...] | list[str] | None = None,
+    ) -> list[dict]:
         client = self._connect()
-        response = client.search(
-            index=self.index_name,
-            query={"match": {"text": query}},
-            size=top_k,
-        )
-        return [(hit["_id"], float(hit["_score"])) for hit in response["hits"]["hits"]]
+        should = [
+            {"match_phrase": {"text": {"query": query, "boost": 8.0}}},
+            {"match": {"text": {"query": query, "operator": "and", "boost": 5.0}}},
+            {
+                "match": {
+                    "text": {
+                        "query": query,
+                        "operator": "or",
+                        "minimum_should_match": "60%",
+                        "boost": 3.0,
+                    }
+                }
+            },
+            {"match": {"text": {"query": query, "fuzziness": "AUTO", "boost": 2.0}}},
+        ]
+        bool_query: dict = {"should": should, "minimum_should_match": 1}
+        if isinstance(source, str):
+            bool_query["filter"] = [{"term": {"source": source}}]
+        elif source is not None:
+            bool_query["filter"] = [{"terms": {"source": list(source)}}]
+        response = client.search(index=self.index_name, query={"bool": bool_query}, size=top_k)
+        return response["hits"]["hits"]
+
+    def export_all(self):
+        """Yield every document in the index as a dict, for local backup/inspection.
+
+        Uses the scroll API since ``search`` is capped at ``top_k`` — indices
+        here can hold hundreds of thousands of OCR/ASR documents.
+        """
+        from elasticsearch.helpers import scan
+
+        client = self._connect()
+        for hit in scan(client, index=self.index_name, query={"query": {"match_all": {}}}):
+            yield {"doc_id": hit["_id"], **hit["_source"]}
+
+    def _ensure_index(self, client) -> None:
+        """Create the index with the custom analyzer mapping if it doesn't exist yet.
+
+        Without this, Elasticsearch's dynamic mapping would guess a plain
+        ``text`` field on first write and the ``multilingual_analyzer``/
+        ``text.exact`` sub-field would never apply.
+        """
+        if client.indices.exists(index=self.index_name):
+            return
+        client.indices.create(index=self.index_name, body=_INDEX_MAPPING)
 
     def _connect(self):
         if self._client is not None:

@@ -20,7 +20,7 @@ def test_build_vector_index_returns_qdrant_with_namespaced_collection(
     assert isinstance(index, QdrantVectorIndex)
     assert isinstance(index, VectorIndex)
     assert index.url == "http://example:6333"
-    assert index.collection == "frames__exp1"
+    assert index.collection == "frames_exp1"
 
 
 def test_build_vector_index_rejects_unknown_backend(tmp_path) -> None:
@@ -49,4 +49,4 @@ def test_build_text_index_reads_env_and_namespaces_index(monkeypatch, tmp_path) 
     assert isinstance(index, ElasticTextIndex)
     assert isinstance(index, TextIndex)
     assert index.url == "http://example:9200"
-    assert index.index_name == "text__exp1"
+    assert index.index_name == "text_exp1"

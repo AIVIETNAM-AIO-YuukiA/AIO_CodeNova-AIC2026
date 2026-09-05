@@ -6,18 +6,22 @@ Dựa trên thuật toán Adaptive Temporal Search trong tài liệu training:
   - Khi tolerance == threshold → kết thúc segment
 
 Pipeline:
-  CLIP search → top-K frames → Temporal search (mỗi frame) → Segments →
+  Embedding search → top-K frames → Temporal search (mỗi frame) → Segments →
   Gather shot → Shot validation → Agent (VQA) / Events (TRAKE)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 import json
 import logging
 
 import numpy as np
+
+from config.settings import Experiment
+from core.errors import RetrievalError
+from core.paths import require_experiment_frame_path
+from indexing.embedding_paths import frame_ids_path, vectors_path
 
 LOGGER = logging.getLogger(__name__)
 
@@ -33,7 +37,7 @@ class ShotInput:
     frame_count: int = 0
     start_timestamp: float | None = None
     end_timestamp: float | None = None
-    clip_score: float = 0.0
+    sim_score: float = 0.0
     temporal_score: float = 0.0
     validation_score: float = 0.0
     validated: bool = False
@@ -47,6 +51,7 @@ def _norm(emb: np.ndarray) -> np.ndarray:
 def temporal_search_forward(
     start_idx: int,
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
 ) -> int:
     """Dò tìm phía trước từ start_idx.
@@ -57,6 +62,7 @@ def temporal_search_forward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
+        frame_records: Metadata frame để chặn ranh giới video/shot (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -68,10 +74,21 @@ def temporal_search_forward(
 
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
+    start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
+    start_shot_id = frame_records[start_idx].get("shot_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx + 1, n):
+        # Không để một segment vô tình đi xuyên video hoặc shot khác.
+        if frame_records:
+            current_record = frame_records[idx]
+            if (
+                current_record.get("video_id") != start_video_id
+                or current_record.get("shot_id") != start_shot_id
+            ):
+                return idx - 1
+
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
             best = sim
@@ -79,13 +96,14 @@ def temporal_search_forward(
         else:
             tolerance += 1
             if tolerance >= tolerance_threshold:
-                return idx - tolerance_threshold
+                return max(start_idx, idx - tolerance_threshold)
     return n - 1
 
 
 def temporal_search_backward(
     start_idx: int,
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
 ) -> int:
     """Dò tìm phía trước từ start_idx (về phía đầu).
@@ -93,6 +111,7 @@ def temporal_search_backward(
     Args:
         start_idx: Vị trí frame bắt đầu.
         frame_embeddings: Ma trận [N, D] đã L2-normalize.
+        frame_records: Metadata frame để chặn ranh giới video/shot (optional).
         tolerance_threshold: Số frame liên tiếp thấp hơn best để dừng.
 
     Returns:
@@ -103,10 +122,21 @@ def temporal_search_backward(
 
     emb = _norm(frame_embeddings)
     current_kf = emb[start_idx]
+    start_video_id = frame_records[start_idx].get("video_id") if frame_records else None
+    start_shot_id = frame_records[start_idx].get("shot_id") if frame_records else None
     best = -1.0
     tolerance = 0
 
     for idx in range(start_idx - 1, -1, -1):
+        # Không để một segment vô tình đi xuyên video hoặc shot khác.
+        if frame_records:
+            current_record = frame_records[idx]
+            if (
+                current_record.get("video_id") != start_video_id
+                or current_record.get("shot_id") != start_shot_id
+            ):
+                return idx + 1
+
         sim = float(emb[idx] @ current_kf)
         if sim >= best:
             best = sim
@@ -114,13 +144,14 @@ def temporal_search_backward(
         else:
             tolerance += 1
             if tolerance >= tolerance_threshold:
-                return idx + tolerance_threshold
+                return min(start_idx, idx + tolerance_threshold)
     return 0
 
 
 def find_segments(
     start_indices: list[int],
     frame_embeddings: np.ndarray,
+    frame_records: list[dict] | None = None,
     tolerance_threshold: int = 3,
     min_gap: int = 2,
 ) -> list[dict]:
@@ -133,6 +164,7 @@ def find_segments(
     Args:
         start_indices: Danh sách vị trí frame từ CLIP search (sorted theo score).
         frame_embeddings: Ma trận [N, D] image embeddings.
+        frame_records: Danh sách metadata frame.
         tolerance_threshold: Ngưỡng tolerance cho temporal search.
         min_gap: Khoảng cách tối thiểu giữa 2 segment để không gộp.
 
@@ -143,8 +175,10 @@ def find_segments(
     raw_segments: list[tuple[int, int, int]] = []
 
     for idx in start_indices:
-        end_pos = temporal_search_forward(idx, frame_embeddings, tolerance_threshold)
-        start_pos = temporal_search_backward(idx, frame_embeddings, tolerance_threshold)
+        end_pos = temporal_search_forward(idx, frame_embeddings, frame_records, tolerance_threshold)
+        start_pos = temporal_search_backward(
+            idx, frame_embeddings, frame_records, tolerance_threshold
+        )
         raw_segments.append((start_pos, end_pos, idx))
 
     if not raw_segments:
@@ -157,7 +191,15 @@ def find_segments(
     merged: list[tuple[int, int, int]] = [raw_segments[0]]
     for start, end, center in raw_segments[1:]:
         prev_start, prev_end, prev_center = merged[-1]
-        if start <= prev_end + min_gap:
+        same_group = True
+        if frame_records:
+            previous_record = frame_records[prev_center]
+            current_record = frame_records[center]
+            same_group = (
+                previous_record.get("video_id") == current_record.get("video_id")
+                and previous_record.get("shot_id") == current_record.get("shot_id")
+            )
+        if same_group and start <= prev_end + min_gap:
             new_start = min(prev_start, start)
             new_end = max(prev_end, end)
             merged[-1] = (new_start, new_end, prev_center)
@@ -220,17 +262,20 @@ def gather_frame_s(
         frame_count=len(selected),
         start_timestamp=timestamps[0] if timestamps else None,
         end_timestamp=timestamps[-1] if timestamps else None,
-        clip_score=0.0,
+        sim_score=0.0,
     )
 
 
 def load_temporal_data(
-    run_dir: Path,
+    experiment: Experiment,
+    model_name: str | None = None,
 ) -> tuple[np.ndarray, list[dict]]:
     """Load embeddings và metadata frame cho temporal search.
 
     Args:
-        run_dir: Thư mục experiment (runs/<experiment-name>/).
+        experiment: Experiment đang chạy.
+        model_name: Model dùng làm nguồn embedding cho temporal search;
+            mặc định là model đầu tiên trong ``embedding_models``.
 
     Returns:
         (frame_embeddings, frame_metadata_list)
@@ -238,17 +283,32 @@ def load_temporal_data(
         - frame_metadata_list: list[dict] mỗi phần tử chứa frame_id, video_id,
           shot_id, frame_index, timestamp_sec, frame_path.
     """
-    embeddings_path = run_dir / "embeddings" / "frames.npz"
-    frame_ids_path = run_dir / "embeddings" / "frame_ids.json"
-    frames_manifest = run_dir / "manifests" / "frames.jsonl"
+    model_name = model_name or experiment.config.embedding_models[0]
+    embeddings_dir = experiment.run_dir / "embeddings"
+    embeddings_path = vectors_path(embeddings_dir, model_name)
+    frame_ids_json_path = frame_ids_path(embeddings_dir, model_name)
+    frames_manifest = experiment.run_dir / "manifests" / "frames.jsonl"
 
-    if not embeddings_path.exists() or not frame_ids_path.exists():
+    if not embeddings_path.exists() or not frame_ids_json_path.exists():
         raise FileNotFoundError(
-            f"Chưa có embeddings. Chạy 'embed-frames' trước. " f"Missing: {embeddings_path}"
+            f"Chưa có embeddings cho model '{model_name}'. Chạy 'embed-frames' trước. "
+            f"Missing: {embeddings_path}"
         )
 
     vectors = np.load(embeddings_path)["embeddings"].astype("float32")
-    id_list = json.loads(frame_ids_path.read_text(encoding="utf-8"))
+    id_list = json.loads(frame_ids_json_path.read_text(encoding="utf-8"))
+    if vectors.ndim != 2:
+        raise RetrievalError(
+            f"Embedding artifact for model {model_name!r} must be 2-D, got {vectors.shape}"
+        )
+    if not isinstance(id_list, list) or len(vectors) != len(id_list):
+        raise RetrievalError(
+            f"Embedding artifact mismatch for model {model_name!r}: "
+            f"vectors={len(vectors)} frame_ids={len(id_list) if isinstance(id_list, list) else 'invalid'}"
+        )
+    id_list = [str(value) for value in id_list]
+    if len(id_list) != len(set(id_list)):
+        raise RetrievalError(f"Duplicate frame IDs in embedding artifact for model {model_name!r}")
 
     frame_map: dict[str, dict] = {}
     if frames_manifest.exists():
@@ -261,9 +321,11 @@ def load_temporal_data(
 
     records = []
     for fid in id_list:
-        meta = frame_map.get(fid, {})
+        meta = dict(frame_map.get(fid, {}))
         if meta.get("frame_id") is None:
             meta["frame_id"] = fid
+        if meta.get("frame_path"):
+            meta["frame_path"] = str(require_experiment_frame_path(experiment, meta["frame_path"]))
         records.append(meta)
 
     sorted_indices = sorted(
@@ -271,6 +333,7 @@ def load_temporal_data(
         key=lambda i: (
             records[i].get("video_id", ""),
             records[i].get("frame_index", 0) or 0,
+            records[i].get("frame_id", ""),
         ),
     )
 
@@ -290,11 +353,11 @@ class ShotValidator:
     def __init__(
         self,
         min_frames: int = 2,
-        min_clip_score: float = 0.15,
+        min_sim_score: float = 0.15,
         temporal_weight: float = 0.3,
     ) -> None:
         self.min_frames = min_frames
-        self.min_clip_score = min_clip_score
+        self.min_sim_score = min_sim_score
         self.temporal_weight = temporal_weight
 
     def validate(
@@ -308,7 +371,7 @@ class ShotValidator:
 
         Args:
             shot: ShotInput cần validate.
-            query_embedding: CLIP text embedding của query.
+            query_embedding: text embedding của query (SigLIP hoặc BEiT-3).
             all_embeddings: Tất cả frame embeddings [N x D].
             all_records: Tất cả frame records (cùng thứ tự với embeddings).
 
@@ -335,11 +398,11 @@ class ShotValidator:
             shot.validated = False
             return shot
 
-        # 1. CLIP score trung bình của shot với query
+        # 1. Embedding score trung bình của shot với query
         shot_embs = all_embeddings[indices]
         shot_embs = shot_embs / (np.linalg.norm(shot_embs, axis=1, keepdims=True) + 1e-12)
-        clip_sims = shot_embs @ q
-        avg_clip = float(np.mean(clip_sims))
+        sim_scores = shot_embs @ q
+        avg_sim = float(np.mean(sim_scores))
 
         # 2. Temporal consistency
         timestamps = [
@@ -355,17 +418,17 @@ class ShotValidator:
         # 3. Composite score
         composite = (
             1 - self.temporal_weight
-        ) * avg_clip + self.temporal_weight * temporal_consistency
+        ) * avg_sim + self.temporal_weight * temporal_consistency
 
-        shot.clip_score = avg_clip
+        shot.sim_score = avg_sim
         shot.temporal_score = temporal_consistency
         shot.validation_score = composite
-        shot.validated = composite >= self.min_clip_score
+        shot.validated = composite >= self.min_sim_score
 
         LOGGER.info(
-            "Shot validation: frames=%d clip=%.4f temporal=%.4f composite=%.4f validated=%s",
+            "Shot validation: frames=%d sim=%.4f temporal=%.4f composite=%.4f validated=%s",
             shot.frame_count,
-            avg_clip,
+            avg_sim,
             temporal_consistency,
             composite,
             shot.validated,

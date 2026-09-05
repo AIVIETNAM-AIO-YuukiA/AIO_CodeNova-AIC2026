@@ -1,9 +1,9 @@
-"""TRAKE search — Bidirectional Pair Join (BPJ) algorithm.
+"""TRAKE search — Bidirectional Pair Join (BPJ) algorithm for Bản 1.
 
 Each adjacent pair (eᵢ, eᵢ₊₁) is processed independently:
-  - Forward: from candidate eᵢ → find eᵢ₊₁ inside +5min (in-memory cosine)
-  - Backward: from candidate eᵢ₊₁ → find eᵢ inside -5min (in-memory cosine)
-  - Merge → top-300 pairs
+  - Forward: candidate eᵢ from KIS Basic search → find eᵢ₊₁ inside +window (in-memory cosine)
+  - Backward: candidate eᵢ₊₁ from KIS Basic search → find eᵢ inside -window (in-memory cosine)
+  - Merge → top pairs
 
 Chains are formed by joining pairs on common frame_id.
 
@@ -16,19 +16,26 @@ from __future__ import annotations
 import logging
 from bisect import bisect_left, bisect_right
 from collections import Counter
+import re
 
 import numpy as np
 
 from config.settings import Experiment
-from retrieval import build_retriever
 from retrieval.hydrator import ResultHydrator
 from stores.vector.base import frame_result
 from retrieval.temporal_search import load_temporal_data
+from stores.text.factory import build_text_index
+from retrieval.text_search import NearestFrameIndex
 
 LOGGER = logging.getLogger(__name__)
 
 
-# ── helpers ────────────────────────────────────────────────────────────
+def _get_timestamp_sec(rec: dict) -> float:
+    """Get timestamp_sec from record metadata (provided by map-keyframes JSON)."""
+    ts = rec.get("timestamp_sec")
+    if ts is not None:
+        return float(ts)
+    return 0.0
 
 
 def _build_video_index(
@@ -41,8 +48,9 @@ def _build_video_index(
     raw: dict[str, list[tuple[float, int]]] = {}
     for i, rec in enumerate(frame_records):
         vid = rec.get("video_id")
-        ts = rec.get("timestamp_sec")
-        if vid is not None and ts is not None:
+        ts = _get_timestamp_sec(rec)
+        rec["timestamp_sec"] = ts
+        if vid is not None:
             raw.setdefault(vid, []).append((ts, i))
     index: dict[str, tuple[list[float], list[int]]] = {}
     for vid, pairs in raw.items():
@@ -51,120 +59,128 @@ def _build_video_index(
     return index
 
 
-def _search_event(
-    retriever,
+def _fetch_text_scores_to_ram(experiment: Experiment, processed) -> dict:
+    """Fetch global BM25 scores into RAM for fast window lookup."""
+    index = build_text_index(experiment)
+    nearest = NearestFrameIndex(experiment)
+
+    def _fetch(keywords, source):
+        if not keywords:
+            return {}, 0.0
+        best_score = {}
+        for kw in keywords:
+            for doc in index.search_documents(kw, top_k=5000, source=source):
+                fid = doc.get("frame_id")
+                if not fid and source == "asr":
+                    fid = nearest.nearest(doc.get("video_id", ""), doc.get("timestamp_sec") or 0.0)
+                if not fid:
+                    continue
+                s = float(doc.get("score", 0.0))
+                if s > best_score.get(fid, -1.0):
+                    best_score[fid] = s
+        m_score = max(best_score.values()) if best_score else 0.0
+        return best_score, m_score
+
+    ocr_d, max_ocr = _fetch(processed.ocr_keywords, "ocr")
+    asr_d, max_asr = _fetch(processed.asr_keywords, "asr")
+
+    weights = processed.weights
+    fusion_weights = {
+        "ocr": weights.get("ocr_bonus", 0.0),
+        "asr": weights.get("asr_bonus", 0.0),
+    }
+
+    return {
+        "ocr_dict": ocr_d,
+        "max_ocr": max_ocr,
+        "asr_dict": asr_d,
+        "max_asr": max_asr,
+        "fusion_weights": fusion_weights,
+    }
+
+
+def _search_event_intelligent(
+    experiment: Experiment,
     event_text: str,
     event_index: int,
-    top_k: int,
-    *,
-    frame_embeddings: np.ndarray | None = None,
-    frame_records: list[dict] | None = None,
-    sub_details: list[str] | None = None,
-    embedder: object | None = None,
-    hydrator: object | None = None,
+    top_k: int = 300,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> list[dict]:
-    """Search one event globally, return enriched frame dicts (distinct frame_id).
+    """Search one event globally using intelligent_search."""
+    # Imported lazily: retrieval/__init__ pulls in trake_search, and
+    # intelligent_search reaches back into retrieval.vqa -> agent ->
+    # retrieval.temporal_search, so importing it at module scope makes
+    # `import retrieval` a circular import.
+    from retrieval.intelligent_search import intelligent_search
 
-    When *sub_details* is provided (non-empty), uses in-memory sum fusion
-    (KIS Detail pipeline) instead of Qdrant. Falls back to Qdrant otherwise.
-    """
-    # ── NEW: sub-detail sum fusion ────────────────────────────────────
-    if (
-        sub_details
-        and frame_embeddings is not None
-        and frame_records is not None
-        and embedder is not None
-    ):
-        sub_vectors = np.stack(
-            [np.asarray(embedder.embed_text(sd), dtype="float32").flatten() for sd in sub_details]
-        )
-        for i in range(sub_vectors.shape[0]):
-            norm = np.linalg.norm(sub_vectors[i])
-            if norm > 1e-12:
-                sub_vectors[i] /= norm
-
-        scores = frame_embeddings @ sub_vectors.T  # [N, K]
-        final_scores = scores.sum(axis=1)  # [N]
-
-        n = min(top_k, len(final_scores))
-        if n == 0:
-            return []
-        top_indices = np.argpartition(final_scores, -n)[-n:]
-        top_indices = top_indices[np.argsort(final_scores[top_indices])[::-1]]
-
-        out: list[dict] = []
-        seen_fids: set[str] = set()
-        for rank, idx in enumerate(top_indices, start=1):
-            rec = frame_records[idx]
-            frame_id = rec.get("frame_id")
-            if not frame_id or frame_id in seen_fids:
-                continue
-            seen_fids.add(frame_id)
-
-            if hydrator is not None:
-                from stores.vector.base import frame_result
-
-                sr = hydrator.hydrate([frame_result(frame_id, float(final_scores[idx]))])[0]
-                out.append(
-                    {
-                        "event_index": event_index,
-                        "rank": rank,
-                        "score": round(float(final_scores[idx]), 4),
-                        "frame_id": sr.frame_id,
-                        "video_id": sr.video_id,
-                        "video_name": sr.video_name or sr.video_id,
-                        "frame_path": sr.frame_path,
-                        "timestamp_sec": sr.timestamp_sec,
-                        "shot_id": sr.shot_id,
-                        "frame_index": sr.frame_index,
-                    }
-                )
-            else:
-                out.append(
-                    {
-                        "event_index": event_index,
-                        "rank": rank,
-                        "score": round(float(final_scores[idx]), 4),
-                        "frame_id": rec.get("frame_id"),
-                        "video_id": rec.get("video_id"),
-                        "video_name": rec.get("video_id", ""),
-                        "frame_path": rec.get("frame_path"),
-                        "timestamp_sec": rec.get("timestamp_sec"),
-                        "shot_id": rec.get("shot_id"),
-                        "frame_index": rec.get("frame_index"),
-                    }
-                )
-        return out
-
-    # ── ORIGINAL: Qdrant search (hoàn toàn không sửa) ────────────────
-    results = retriever.search(query=event_text, top_k=top_k)
+    response = intelligent_search(
+        experiment=experiment,
+        query=event_text,
+        top_k=top_k,
+        enable_kis=True,
+        enable_ocr=True,
+        enable_asr=True,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
+    )
     out = []
     seen_fids = set()
-    for rank, r in enumerate(results, start=1):
-        if r.frame_id in seen_fids:
+    for rank, r in enumerate(response.get("results", []), start=1):
+        if r["frame_id"] in seen_fids:
             continue
-        seen_fids.add(r.frame_id)
+        seen_fids.add(r["frame_id"])
+        ts = r.get("timestamp_sec")
+        if ts is None or ts == 0.0:
+            ts = _get_timestamp_sec(
+                {
+                    "frame_id": r["frame_id"],
+                    "timestamp_sec": r.get("timestamp_sec"),
+                    "frame_index": r.get("frame_index"),
+                }
+            )
         out.append(
             {
                 "event_index": event_index,
                 "rank": rank,
-                "score": r.score,
-                "frame_id": r.frame_id,
-                "video_id": r.video_id,
-                "video_name": r.video_name or r.video_id,
-                "frame_path": r.frame_path,
-                "timestamp_sec": r.timestamp_sec,
-                "shot_id": r.shot_id,
-                "frame_index": r.frame_index,
+                "score": r["score"],
+                "frame_id": r["frame_id"],
+                "video_id": r["video_id"],
+                "video_name": r.get("video_name") or r["video_id"],
+                "frame_path": r["frame_path"],
+                "timestamp_sec": ts,
+                "shot_id": r.get("shot_id"),
+                "frame_index": r.get("frame_index"),
             }
         )
     return out
 
 
-def _embed_event(retriever, text: str) -> np.ndarray:
-    """Embed event text (processed), return L2-normalized vector."""
-    processed = retriever.query_processor.process(text)
-    raw = retriever.embedder.embed_text(processed.visual_prompt)
+def _embed_event(
+    retriever,
+    text: str,
+    enabled_models: list[str] | None = None,
+    use_llm: bool = True,
+) -> np.ndarray:
+    """Embed event text using the first active model from enabled_models.
+
+    Returns an L2-normalized vector for in-memory temporal window cosine search.
+    """
+    processed = retriever.query_processor.process(
+        text, enabled_models=enabled_models, use_llm=use_llm
+    )
+    active = retriever._select_embedders(enabled_models)
+    first_model = list(active.keys())[0]
+    embedder = active[first_model]
+
+    if "vietnamese" in first_model.lower() or "vism" in first_model.lower():
+        visual_query = processed.visual_prompt_vi
+    else:
+        visual_query = processed.visual_prompt
+
+    raw = embedder.embed_text(visual_query)
     vec = np.asarray(raw, dtype="float32").flatten()
     norm = np.linalg.norm(vec)
     if norm > 1e-12:
@@ -181,6 +197,7 @@ def _window_search_fwd(
     frame_embeddings: np.ndarray,
     frame_records: list[dict],
     hydrator: ResultHydrator,
+    text_context: dict | None = None,
 ) -> list[tuple[dict, float]]:
     """In-memory cosine search in (t_start, t_start + window].
 
@@ -196,22 +213,50 @@ def _window_search_fwd(
     idxs = idx_list[lo:hi]
     embs = frame_embeddings[idxs]
     sims = embs @ query_embed
-    top_n = min(30, len(sims))
+
+    final_scores = np.copy(sims)
+    if text_context:
+        w_ocr = text_context["fusion_weights"]["ocr"]
+        w_asr = text_context["fusion_weights"]["asr"]
+
+        m_ocr = max(text_context["max_ocr"], 15.0)
+        m_asr = max(text_context["max_asr"], 15.0)
+
+        for i, pos in enumerate(idxs):
+            rec = frame_records[pos]
+            fid = rec.get("frame_id")
+            if not fid:
+                continue
+
+            ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
+            asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
+
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s)
+            final_scores[i] += bonus
+
+        global_max_possible = 1.0 + w_ocr + w_asr
+        if global_max_possible > 0:
+            final_scores = final_scores / global_max_possible
+
+    top_n = min(30, len(final_scores))
     if top_n == 0:
         return []
-    top_pos = np.argpartition(sims, -top_n)[-top_n:]
-    top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
+    top_pos = np.argpartition(final_scores, -top_n)[-top_n:]
+    top_pos = top_pos[np.argsort(final_scores[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
     seen_fids: set[str] = set()
     for pos in top_pos:
-        score = float(sims[pos])
+        score = float(final_scores[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
             if frame_id in seen_fids:
                 continue
             seen_fids.add(frame_id)
-            sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
+            hydrated = hydrator.hydrate([frame_result(frame_id, score)])
+            if not hydrated:
+                continue
+            sr = hydrated[0]
             info = {
                 "frame_id": sr.frame_id,
                 "video_id": sr.video_id,
@@ -250,6 +295,7 @@ def _window_search_bwd(
     frame_embeddings: np.ndarray,
     frame_records: list[dict],
     hydrator: ResultHydrator,
+    text_context: dict | None = None,
 ) -> list[tuple[dict, float]]:
     """In-memory cosine search in [t_end - window, t_end).
 
@@ -265,22 +311,50 @@ def _window_search_bwd(
     idxs = idx_list[lo:hi]
     embs = frame_embeddings[idxs]
     sims = embs @ query_embed
-    top_n = min(30, len(sims))
+
+    final_scores = np.copy(sims)
+    if text_context:
+        w_ocr = text_context["fusion_weights"]["ocr"]
+        w_asr = text_context["fusion_weights"]["asr"]
+
+        m_ocr = max(text_context["max_ocr"], 15.0)
+        m_asr = max(text_context["max_asr"], 15.0)
+
+        for i, pos in enumerate(idxs):
+            rec = frame_records[pos]
+            fid = rec.get("frame_id")
+            if not fid:
+                continue
+
+            ocr_s = text_context["ocr_dict"].get(fid, 0.0) / m_ocr
+            asr_s = text_context["asr_dict"].get(fid, 0.0) / m_asr
+
+            bonus = (w_ocr * ocr_s) + (w_asr * asr_s)
+            final_scores[i] += bonus
+
+        global_max_possible = 1.0 + w_ocr + w_asr
+        if global_max_possible > 0:
+            final_scores = final_scores / global_max_possible
+
+    top_n = min(30, len(final_scores))
     if top_n == 0:
         return []
-    top_pos = np.argpartition(sims, -top_n)[-top_n:]
-    top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
+    top_pos = np.argpartition(final_scores, -top_n)[-top_n:]
+    top_pos = top_pos[np.argsort(final_scores[top_pos])[::-1]]
     results: list[tuple[dict, float]] = []
     seen_fids: set[str] = set()
     for pos in top_pos:
-        score = float(sims[pos])
+        score = float(final_scores[pos])
         rec = frame_records[idxs[pos]]
         frame_id = rec.get("frame_id")
         if frame_id:
             if frame_id in seen_fids:
                 continue
             seen_fids.add(frame_id)
-            sr = hydrator.hydrate([frame_result(frame_id, score)])[0]
+            hydrated = hydrator.hydrate([frame_result(frame_id, score)])
+            if not hydrated:
+                continue
+            sr = hydrated[0]
             info = {
                 "frame_id": sr.frame_id,
                 "video_id": sr.video_id,
@@ -314,6 +388,7 @@ def _window_search_bwd(
 
 
 def bidirectional_pair_search(
+    experiment: Experiment,
     retriever,
     event_text_i: str,
     event_text_j: str,
@@ -327,26 +402,73 @@ def bidirectional_pair_search(
     *,
     sub_details_i: list[str] | None = None,
     sub_details_j: list[str] | None = None,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> list[tuple[dict, dict, float, float, float]]:
     """Bidirectional search for one adjacent pair (eᵢ, eᵢ₊₁).
 
     Returns top-K pairs, each pair = (f_i_info, f_j_info, pair_score, sim_i, sim_j).
     """
-    embed_i = _embed_event(retriever, event_text_i)
-    embed_j = _embed_event(retriever, event_text_j)
+    processed_i = retriever.query_processor.process(
+        event_text_i, enabled_models=enabled_models, use_llm=use_llm
+    )
+    processed_j = retriever.query_processor.process(
+        event_text_j, enabled_models=enabled_models, use_llm=use_llm
+    )
 
-    # 1. Forward: candidate eᵢ → find eᵢ₊₁ in +window (top-30 distinct)
-    candidates_i = _search_event(
-        retriever,
+    text_context_i = _fetch_text_scores_to_ram(experiment, processed_i)
+    text_context_j = _fetch_text_scores_to_ram(experiment, processed_j)
+
+    embed_i = _embed_event(retriever, event_text_i, enabled_models=enabled_models, use_llm=use_llm)
+    embed_j = _embed_event(retriever, event_text_j, enabled_models=enabled_models, use_llm=use_llm)
+
+    # 1. Candidate search for eᵢ and eᵢ₊₁ via full Intelligent pipeline (top 300 pool)
+    candidate_pool = top_k
+    candidates_i = _search_event_intelligent(
+        experiment,
         event_text_i,
         event_index_i,
-        top_k,
-        frame_embeddings=frame_embeddings,
-        frame_records=frame_records,
-        sub_details=sub_details_i,
-        embedder=retriever.embedder,
-        hydrator=hydrator,
+        candidate_pool,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
     )
+    candidates_j = _search_event_intelligent(
+        experiment,
+        event_text_j,
+        event_index_i + 1,
+        candidate_pool,
+        enabled_models=enabled_models,
+        use_reranker=use_reranker,
+        use_llm=use_llm,
+    )
+
+    rank_map_i = {f["frame_id"]: f["rank"] for f in candidates_i if f.get("frame_id")}
+    rank_map_j = {f["frame_id"]: f["rank"] for f in candidates_j if f.get("frame_id")}
+
+    # 2. Direct KIS-to-KIS Pairs (both frames come directly from full KIS Basic pipeline)
+    vids_j: dict[str, list[dict]] = {}
+    for f_j in candidates_j:
+        vid = f_j.get("video_id")
+        if vid:
+            vids_j.setdefault(vid, []).append(f_j)
+
+    direct_pairs: list[tuple[dict, dict, float, float, float]] = []
+    for f_i in candidates_i:
+        vid = f_i.get("video_id")
+        ts_i = f_i.get("timestamp_sec")
+        if not vid or ts_i is None or vid not in vids_j:
+            continue
+        for f_j in vids_j[vid]:
+            ts_j = f_j.get("timestamp_sec")
+            if ts_j is not None and ts_j > ts_i and (ts_j - ts_i) <= window:
+                sim_i = f_i["score"]
+                sim_j = f_j["score"]
+                pair_score = sim_i + sim_j
+                direct_pairs.append((f_i, f_j, pair_score, sim_i, sim_j))
+
+    # 3. Forward: candidate eᵢ → find eᵢ₊₁ in +window (top-30 distinct)
     forward: list[tuple[dict, dict, float, float, float]] = []
     for f_i in candidates_i:
         ts = f_i.get("timestamp_sec")
@@ -362,23 +484,18 @@ def bidirectional_pair_search(
             frame_embeddings,
             frame_records,
             hydrator,
+            text_context_j,
         ):
+            fid_j = f_j_info.get("frame_id")
+            if fid_j and fid_j in rank_map_j:
+                f_j_info["rank"] = rank_map_j[fid_j]
+            else:
+                f_j_info["rank"] = f">{candidate_pool}"
             sim_i = f_i["score"]
             pair_score = sim_i + sim_j
             forward.append((f_i, f_j_info, pair_score, sim_i, sim_j))
 
-    # 2. Backward: candidate eᵢ₊₁ → find eᵢ in -window (top-30 distinct)
-    candidates_j = _search_event(
-        retriever,
-        event_text_j,
-        event_index_i + 1,
-        top_k,
-        frame_embeddings=frame_embeddings,
-        frame_records=frame_records,
-        sub_details=sub_details_j,
-        embedder=retriever.embedder,
-        hydrator=hydrator,
-    )
+    # 4. Backward: candidate eᵢ₊₁ → find eᵢ in -window (top-30 distinct)
     backward: list[tuple[dict, dict, float, float, float]] = []
     for f_j in candidates_j:
         ts = f_j.get("timestamp_sec")
@@ -394,14 +511,20 @@ def bidirectional_pair_search(
             frame_embeddings,
             frame_records,
             hydrator,
+            text_context_i,
         ):
+            fid_i = f_i_info.get("frame_id")
+            if fid_i and fid_i in rank_map_i:
+                f_i_info["rank"] = rank_map_i[fid_i]
+            else:
+                f_i_info["rank"] = f">{candidate_pool}"
             sim_j = f_j["score"]
             pair_score = sim_i + sim_j
             backward.append((f_i_info, f_j, pair_score, sim_i, sim_j))
 
-    # 3. Merge forward + backward, dedup by (f_i_id, f_j_id), keep higher score, filter, rank
+    # 5. Merge direct + forward + backward, dedup by (f_i_id, f_j_id), keep higher score, filter, rank
     best: dict[tuple[str, str], tuple[dict, dict, float, float, float]] = {}
-    for item in forward + backward:
+    for item in direct_pairs + forward + backward:
         f_i, f_j, ps, si, sj = item
         f_i_fid = f_i.get("frame_id")
         f_j_fid = f_j.get("frame_id")
@@ -430,9 +553,16 @@ def bidirectional_pair_search(
 # ── chain join ────────────────────────────────────────────────────────
 
 
+def _get_shot_num(sid: str | None) -> int | None:
+    if not sid:
+        return None
+    nums = re.findall(r"\d+", sid)
+    return int(nums[-1]) if nums else None
+
+
 def chain_join(
     pair_lists: list[list[tuple[dict, dict, float, float, float]]],
-    window: int = 300,
+    window: int = 15,
 ) -> list[tuple[list[dict], float]]:
     """Join N-1 independent pair lists into chains of N events.
 
@@ -455,15 +585,36 @@ def chain_join(
     for pairs_k in pair_lists[1:]:
         new_chains: list[tuple[list[dict], list[float]]] = []
         for chain_frames, chain_scores in chains:
-            last_id = chain_frames[-1]["frame_id"]
-            last_ts = chain_frames[-1]["timestamp_sec"]
+            last_frame = chain_frames[-1]
+            last_vid = last_frame.get("video_id")
+            last_shot = last_frame.get("shot_id")
+            last_shot_num = _get_shot_num(last_shot)
+            last_ts = last_frame.get("timestamp_sec")
+
             best_ext: tuple[dict, float] | None = None  # (f_j, sj)
             best_ps = -float("inf")
             for f_i, f_j, ps, si, sj in pairs_k:
-                if f_i["frame_id"] != last_id:
+                # 0. Ensure the joining point is within 3 shots
+                f_i_shot = f_i.get("shot_id")
+                f_i_shot_num = _get_shot_num(f_i_shot)
+
+                if last_shot_num is not None and f_i_shot_num is not None:
+                    if abs(f_i_shot_num - last_shot_num) > 3:
+                        continue
+                elif last_shot and f_i_shot and f_i_shot != last_shot:
                     continue
-                if last_ts >= f_j["timestamp_sec"]:
+
+                # 1. Next event frame f_j must be in the same video
+                if f_j.get("video_id") != last_vid:
                     continue
+                # 2. Next event f_j must occur AFTER last_ts (previous event's timestamp)
+                ts_j = f_j.get("timestamp_sec")
+                if last_ts is not None and ts_j is not None:
+                    if ts_j <= last_ts:
+                        continue
+                    # 3. Next event f_j must occur within window seconds after last_ts
+                    if ts_j - last_ts > window:
+                        continue
                 if ps > best_ps:
                     best_ps = ps
                     best_ext = (f_j, sj)
@@ -474,7 +625,18 @@ def chain_join(
         if not chains:
             break
 
-    # Score each chain
+    # Max-Normalized Sum Fusion (Bản 2 style)
+    num_events = len(chains[0][1]) if chains else 0
+    max_scores = [0.0] * num_events
+    for _, event_scores in chains:
+        for k in range(num_events):
+            if event_scores[k] > max_scores[k]:
+                max_scores[k] = event_scores[k]
+
+    for k in range(num_events):
+        if max_scores[k] <= 1e-12:
+            max_scores[k] = 1.0
+
     scored: list[tuple[list[dict], float]] = []
     seen_chains: set[tuple[str, ...]] = set()
     for chain_frames, chain_scores in chains:
@@ -482,8 +644,11 @@ def chain_join(
         if key in seen_chains:
             continue
         seen_chains.add(key)
-        chain_score = sum(chain_scores) / len(chain_scores)
-        scored.append((chain_frames, chain_score))
+
+        # Normalize each event score by its max_score across candidates
+        norm_scores = [chain_scores[k] / max_scores[k] for k in range(num_events)]
+        chain_score = sum(norm_scores) / num_events
+        scored.append((chain_frames, float(chain_score)))
 
     scored.sort(key=lambda x: -x[1])
     LOGGER.debug(
@@ -498,63 +663,89 @@ def chain_join(
 # ── main entry point ──────────────────────────────────────────────────
 
 
-def trake_search(
+def trake_bpj_search(
     experiment: Experiment,
     events: list[str] | list[dict],
     top_k: int = 300,
     window: int = 15,
+    enabled_models: list[str] | None = None,
+    use_reranker: bool | None = None,
+    use_llm: bool = True,
 ) -> dict:
-    """TRAKE pipeline — Bidirectional Pair Join (BPJ).
+    """TRAKE pipeline — Bidirectional Pair Join (BPJ) for Bản 1.
 
     Args:
         experiment: Experiment instance (config + run_dir).
         events: List of event texts (str) or event objects ``{"text": ..., "sub_details": [...]}``, at least 2.
         top_k: Number of candidate frames per event (and pairs per adjacent pair).
-        window: Temporal window (seconds), default 300 (5 minutes).
+        window: Temporal window (seconds), default 15.
+        enabled_models: List of selected model names from UI checkboxes.
+        use_reranker: Whether cross-encoder reranking is enabled.
 
     Returns:
         Dict with "videos" (list of chains) and "total_candidates".
         Compatible with server.py response format.
     """
-    # Normalise events: always list of dicts
+    # Normalize events: always list of dicts
     parsed_events: list[dict] = []
+    sub_details_list: list[list[str]] = []
     for e in events:
         if isinstance(e, str):
             text = e.strip()
             parsed_events.append({"text": text, "sub_details": []} if text else None)
+            sub_details_list.append([])
         elif isinstance(e, dict):
             text = e.get("text", "").strip()
             parsed_events.append(
                 {"text": text, "sub_details": e.get("sub_details", [])} if text else None
             )
+            sub_details_list.append(e.get("sub_details", []))
         else:
             parsed_events.append(None)
+            sub_details_list.append([])
     parsed_events = [p for p in parsed_events if p is not None]
+    sub_details_list = [s for s, p in zip(sub_details_list, events) if p is not None]
+
     if len(parsed_events) < 2:
         return {"error": "At least 2 non-empty events are required.", "videos": []}
 
     clean = [p["text"] for p in parsed_events]
-    sub_details_list = [p.get("sub_details", []) for p in parsed_events]
 
-    # 1. Build retriever (embedder + Qdrant)
-    retriever = build_retriever(experiment)
+    LOGGER.info(
+        "TRAKE BPJ search: %d events, window=%ds, top_k=%d, models=%s, reranker=%s",
+        len(clean),
+        window,
+        top_k,
+        enabled_models,
+        use_reranker,
+    )
 
-    # 2. Load all frame embeddings + metadata
+    # 1. Reuse cached retriever
+    from retrieval.vqa import _get_retriever
+
+    retriever = _get_retriever(experiment)
+
+    # 2. Load all frame embeddings + metadata (first active model)
     try:
-        frame_embeddings, frame_records = load_temporal_data(experiment.run_dir)
+        active_models = retriever._select_embedders(enabled_models)
+        first_model = list(active_models.keys())[0]
+        frame_embeddings, frame_records = load_temporal_data(experiment, model_name=first_model)
+        for rec in frame_records:
+            rec["timestamp_sec"] = _get_timestamp_sec(rec)
     except FileNotFoundError as exc:
         return {"error": str(exc), "videos": [], "total_candidates": 0}
 
     # 2b. Build in-memory video timestamp index
     video_index = _build_video_index(frame_records)
+    hydrator = ResultHydrator(experiment)
 
     # 3. Process each adjacent pair — fully independent
     n = len(parsed_events)
     pair_lists: list[list[tuple[dict, dict, float, float, float]]] = []
     for i in range(n - 1):
         pairs = bidirectional_pair_search(
+            experiment=experiment,
             retriever=retriever,
-            hydrator=retriever.hydrator,
             event_text_i=clean[i],
             event_text_j=clean[i + 1],
             event_index_i=i,
@@ -565,6 +756,10 @@ def trake_search(
             window=window,
             sub_details_i=sub_details_list[i],
             sub_details_j=sub_details_list[i + 1],
+            hydrator=hydrator,
+            enabled_models=enabled_models,
+            use_reranker=use_reranker,
+            use_llm=use_llm,
         )
         pair_lists.append(pairs)
 
@@ -624,30 +819,13 @@ def trake_search(
 
     out_videos.sort(key=lambda x: -x["score"])
     LOGGER.info(
-        "TRAKE: %d chains → %d unique → %d output from %d videos, top_vids: %s",
+        "TRAKE BPJ: %d chains → %d unique → %d output from %d videos, top_vids: %s",
         len(chains),
         len(unique),
         len(out_videos),
         len(out_vid_counter),
         dict(out_vid_counter.most_common(10)),
     )
-
-    # Print all output chains for inspection
-    LOGGER.info("── TRAKE OUTPUT ──────────────────────────────────")
-    for i, v in enumerate(out_videos):
-        fids = [e["frame_id"] for e in v["events"]]
-        timestamps = [e["timestamp_sec"] for e in v["events"]]
-        scores = [round(e["score"], 4) for e in v["events"]]
-        LOGGER.info(
-            "  [%d] video=%s score=%.4f ts=%s scores=%s frames=%s",
-            i,
-            v["video_id"],
-            v["score"],
-            timestamps,
-            scores,
-            fids,
-        )
-    LOGGER.info("──────────────────────────────────────────────────")
 
     return {
         "videos": out_videos,

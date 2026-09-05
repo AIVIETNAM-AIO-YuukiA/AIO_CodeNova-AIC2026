@@ -1,1 +1,0 @@
-npx skills add https://github.com/anthropics/skills --skill pdf --skill docx --skill frontend-design --skill web-artifacts-builder --skill mcp-builder --skill skill-creator --yes && npx skills add vercel-labs/skills --yes

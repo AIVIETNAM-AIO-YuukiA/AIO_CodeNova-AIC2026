@@ -17,14 +17,22 @@ from retrieval.temporal_search import (
     load_temporal_data,
 )
 from retrieval.search import Retriever, build_retriever
+from retrieval.trake_search import trake_bpj_search
 
 __all__ = [
     "Retriever",
     "build_retriever",
+    "trake_bpj_search",
     "ProcessedQuery",
     "QueryProcessor",
     "PassThroughQueryProcessor",
     "LlmQueryProcessor",
     "get_query_processor",
+    "ShotInput",
+    "ShotValidator",
+    "temporal_search_forward",
+    "temporal_search_backward",
+    "find_segments",
+    "gather_frame_s",
+    "load_temporal_data",
 ]
-

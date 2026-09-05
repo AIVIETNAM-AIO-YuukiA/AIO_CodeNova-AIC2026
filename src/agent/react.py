@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import logging
 
 from retrieval.temporal_search import ShotInput
-from agent.brain import VlmBrain
+from agent.brain import AgentBrain
 from agent.tools import Tool, default_tools
 
 LOGGER = logging.getLogger(__name__)
@@ -18,18 +17,18 @@ class Agent:
     """ReAct Agent for VQA answer generation.
 
     Args:
-        brain: VlmBrain instance (Gemini API).
+        brain: AgentBrain instance (OpenRouter LLM).
         tools: Dict of tool_name → Tool instance.
         max_steps: Maximum ReAct iterations before forced answer.
     """
 
     def __init__(
         self,
-        brain: VlmBrain | None = None,
+        brain: AgentBrain | None = None,
         tools: dict[str, Tool] | None = None,
         max_steps: int = MAX_STEPS,
     ) -> None:
-        self.brain = brain or VlmBrain()
+        self.brain = brain or AgentBrain()
         self.tools = tools or default_tools()
         self.max_steps = max_steps
 
@@ -37,12 +36,16 @@ class Agent:
         self,
         shot: ShotInput,
         question: str,
+        context: str = "",
     ) -> str:
         """Run ReAct loop to answer a VQA question.
 
         Args:
             shot: Validated shot input (frames with context).
             question: The VQA question.
+            context: Optional extra text context for the brain (e.g. captions
+                cached at index time) — lets the text-only LLM answer even
+                when the VLM caption/ocr service isn't running.
 
         Returns:
             Final answer text.
@@ -56,10 +59,12 @@ class Agent:
                 f"time=[{shot.start_timestamp:.1f}s - {shot.end_timestamp:.1f}s]"
             )
             if shot.start_timestamp
-            else (f"video={shot.video_name or shot.video_id}, " f"frames={shot.frame_count}")
+            else (f"video={shot.video_name or shot.video_id}, frames={shot.frame_count}")
         )
+        if context:
+            shot_info += f"\nIndexed context:\n{context}"
 
-        LOGGER.info("Agent starting: question=%s shot_info=%s", question, shot_info)
+        LOGGER.info("Agent starting: question=%s shot_info=%s", question, shot_info[:300])
 
         tool_results: list[dict] = []
         first_frame_path = shot.frame_paths[len(shot.frame_paths) // 2] if shot.frame_paths else ""
@@ -101,10 +106,10 @@ class Agent:
                 raw = response.action_input
                 tool_input = dict(raw) if isinstance(raw, dict) else {}
 
-                # Luôn gắn image_path mặc định nếu tool cần ảnh và chưa có
-                if response.action in ("caption", "ocr", "detect"):
-                    if "image_path" not in tool_input or not tool_input["image_path"]:
-                        tool_input["image_path"] = first_frame_path
+                # The model only sees text metadata and may invent a basename.
+                # Always use the validated shot's real centre frame path.
+                if response.action in ("caption", "ocr"):
+                    tool_input["image_path"] = first_frame_path
                     # Truyền câu hỏi làm prompt cho caption
                     if response.action == "caption":
                         tool_input["prompt"] = question
@@ -126,58 +131,17 @@ class Agent:
         LOGGER.warning("Agent reached max steps without final answer")
         final_context = "\n".join(f"{r['tool']}: {r['result'][:300]}" for r in tool_results)
         fallback = (
-            f"Based on the analysis of the video shot:\n"
-            f"{final_context}\n\n"
-            f"Question: {question}"
+            f"Based on the analysis of the video shot:\n{final_context}\n\nQuestion: {question}"
         )
         return fallback
 
 
-def _load_dotenv() -> None:
-    """Load .env file if GEMINI_API_KEY is not already set."""
-    import os
+def create_agent(backend: str = "local") -> Agent:
+    """Create the Agent over OpenRouter (AGENT_LOCAL_ENGINE_MODEL, falls back to OPENROUTER_MODEL).
 
-    if os.environ.get("GEMINI_API_KEY"):
-        return
-    env_path = Path(__file__).resolve().parent.parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, val = line.partition("=")
-                if key.strip() == "GEMINI_API_KEY":
-                    os.environ["GEMINI_API_KEY"] = val.strip()
-                    break
-
-
-def create_agent() -> Agent:
-    """Create an Agent.
-
-    Priority:
-      1. Gemini API key available → VlmBrain + cloud tools
-      2. Ollama running → LocalBrain + local tools
-      3. Otherwise → VlmBrain (will error gracefully at runtime)
+    ``backend`` is accepted for API compatibility with older callers but no
+    longer selects anything.
     """
-    import os
-
-    _load_dotenv()
-    if os.environ.get("GEMINI_API_KEY"):
-        LOGGER.info("GEMINI_API_KEY found — using cloud brain and tools")
-        brain = VlmBrain()
-        tools = default_tools()
-        return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-
-    try:
-        from agent.local import is_ollama_running, LocalBrain, local_default_tools
-
-        if is_ollama_running():
-            LOGGER.info("Ollama detected — using local brain and tools")
-            brain = LocalBrain()
-            tools = local_default_tools()
-            return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
-    except Exception as exc:
-        LOGGER.debug("Ollama detection failed: %s", exc)
-
-    brain = VlmBrain()
-    tools = default_tools()
-    return Agent(brain=brain, tools=tools, max_steps=MAX_STEPS)
+    if backend not in ("local", ""):
+        LOGGER.info("Agent backend %r requested; only OpenRouter exists — using it.", backend)
+    return Agent(brain=AgentBrain(), tools=default_tools(), max_steps=MAX_STEPS)

@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import importlib
+import os
+import subprocess
 import sys
 
 from core.errors import ShotDetectionError
 from core.types import ShotRecord, VideoRecord
+
+# TransNetV2's fixed input resolution.
+_INPUT_WIDTH = 48
+_INPUT_HEIGHT = 27
+
+# Windows per model call. Measured on a 4GB RTX 3050: batch 1 runs 28.7s
+# (169MB) vs 33.2s (1GB) at batch 8 — the 3D-CNN's activations are bandwidth-
+# bound, so bigger batches only pay off on GPUs with more memory bandwidth.
+_BATCH_SIZE = int(os.environ.get("TRANSNETV2_BATCH_SIZE", "1"))
 
 
 class ShotDetector:
@@ -37,48 +49,25 @@ class TransNetV2ShotDetector(ShotDetector):
 
     def detect(self, video: VideoRecord) -> list[ShotRecord]:
         """Detect shots using TransNetV2 cut probabilities."""
-        try:
-            import cv2
-            import numpy as np
-        except ImportError as exc:
-            raise ShotDetectionError("Install OpenCV and NumPy before running TransNetV2.") from exc
+        return self.detect_decoded(video, decode_video(video.path))
 
+    def detect_decoded(self, video: VideoRecord, decoded: DecodedVideo) -> list[ShotRecord]:
+        """Run detection on already-decoded frames (see ``decode_video``)."""
         model, torch, device = self._load_model()
-        capture = cv2.VideoCapture(video.path)
-        if not capture.isOpened():
-            raise ShotDetectionError(f"Cannot open video: {video.path}")
-
-        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
-        frames = []
-        try:
-            while True:
-                ok, frame = capture.read()
-                if not ok:
-                    break
-                frame = cv2.resize(frame, (48, 27), interpolation=cv2.INTER_AREA)
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frames.append(frame)
-        finally:
-            capture.release()
-
-        if not frames:
-            raise ShotDetectionError(f"No frames decoded from video: {video.path}")
-
-        array = np.asarray(frames, dtype=np.uint8)
-        scores = predict_transnetv2_scores(model=model, torch=torch, frames=array, device=device)
-
+        scores = predict_transnetv2_scores(
+            model=model, torch=torch, frames=decoded.frames, device=device
+        )
         cut_frames = [index for index, score in enumerate(scores) if float(score) >= self.threshold]
-        return predictions_to_shots(video.video_id, cut_frames, len(frames), fps)
+        return predictions_to_shots(video.video_id, cut_frames, len(decoded.frames), decoded.fps)
 
     def _load_model(self):
         if self._model is not None and self._torch is not None:
             return self._model
 
         if self.weights_path is None or not self.weights_path.exists():
-            raise ShotDetectionError(
-                "TransNetV2 requires converted PyTorch weights. Pass "
-                "--transnetv2-weights /path/to/transnetv2-pytorch-weights.pth."
-            )
+            from core.external_setup import ensure_transnetv2
+
+            self.weights_path = ensure_transnetv2(self.weights_path)
         if self.module_dir is not None:
             sys.path.insert(0, str(self.module_dir))
 
@@ -99,6 +88,82 @@ class TransNetV2ShotDetector(ShotDetector):
         self._model = (model, torch, device)
         self._torch = torch
         return self._model
+
+
+@dataclass(frozen=True)
+class DecodedVideo:
+    """A video decoded to TransNetV2's input resolution, plus its frame rate."""
+
+    frames: object  # numpy uint8 array, shape (N, 27, 48, 3)
+    fps: float
+
+
+def decode_video(video_path: str) -> DecodedVideo:
+    """Decode a video for TransNetV2. Safe to call off the main thread."""
+    return DecodedVideo(frames=_decode_frames(video_path), fps=_probe_fps(video_path))
+
+
+def _ffmpeg_exe() -> str:
+    """Return the bundled ffmpeg binary path."""
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise ShotDetectionError("Install imageio-ffmpeg before running TransNetV2.") from exc
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+
+def _probe_fps(video_path: str) -> float:
+    """Read a video's frame rate with OpenCV (metadata only, no decoding)."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ShotDetectionError("Install OpenCV before running TransNetV2.") from exc
+
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        raise ShotDetectionError(f"Cannot open video: {video_path}")
+    try:
+        return capture.get(cv2.CAP_PROP_FPS) or 0.0
+    finally:
+        capture.release()
+
+
+def _decode_frames(video_path: str):
+    """Decode a whole video to a uint8 (N, 27, 48, 3) RGB array via ffmpeg.
+
+    ffmpeg decodes and scales in one multi-threaded pass, which is ~9x faster
+    than reading full-resolution frames through OpenCV and resizing each one.
+    """
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise ShotDetectionError("Install NumPy before running TransNetV2.") from exc
+
+    command = [
+        _ffmpeg_exe(),
+        "-v",
+        "error",
+        "-i",
+        video_path,
+        "-vf",
+        f"scale={_INPUT_WIDTH}:{_INPUT_HEIGHT}",
+        "-pix_fmt",
+        "rgb24",
+        "-f",
+        "rawvideo",
+        "-",
+    ]
+    process = subprocess.run(command, capture_output=True)
+    if process.returncode != 0:
+        message = process.stderr.decode("utf-8", "replace").strip()[:500]
+        raise ShotDetectionError(f"ffmpeg failed to decode {video_path}: {message}")
+
+    frame_bytes = _INPUT_WIDTH * _INPUT_HEIGHT * 3
+    count = len(process.stdout) // frame_bytes
+    if count == 0:
+        raise ShotDetectionError(f"No frames decoded from video: {video_path}")
+    usable = memoryview(process.stdout)[: count * frame_bytes]
+    return np.frombuffer(usable, dtype=np.uint8).reshape(count, _INPUT_HEIGHT, _INPUT_WIDTH, 3)
 
 
 def predictions_to_shots(
@@ -126,12 +191,13 @@ def predictions_to_shots(
     return shots
 
 
-def predict_transnetv2_scores(model, torch, frames, device) -> list[float]:
+def predict_transnetv2_scores(model, torch, frames, device, batch_size: int | None = None):
     """Run TransNetV2 in 100-frame windows and return one score per frame.
 
     This mirrors the official TransNetV2 inference wrapper: each model call sees
     100 frames, only predictions for frames 25..74 are kept, and the window
-    advances by 50 frames. This avoids allocating the whole video on the GPU.
+    advances by 50 frames. Windows are submitted ``batch_size`` at a time
+    (``TRANSNETV2_BATCH_SIZE``) so the whole video never sits on the GPU.
     """
     try:
         import numpy as np
@@ -141,19 +207,32 @@ def predict_transnetv2_scores(model, torch, frames, device) -> list[float]:
     if len(frames) == 0:
         return []
 
+    size = batch_size or _BATCH_SIZE
     predictions: list[np.ndarray] = []
     with torch.inference_mode():
-        for window in transnetv2_windows(frames):
-            tensor = torch.from_numpy(window).to(device)
+        for batch in _batched(transnetv2_windows(frames), size):
+            tensor = torch.from_numpy(np.concatenate(batch, axis=0)).to(device)
             single_frame_pred, _ = model(tensor)
-            scores = torch.sigmoid(single_frame_pred)[0, 25:75, 0]
-            predictions.append(scores.detach().cpu().numpy())
+            scores = torch.sigmoid(single_frame_pred)[:, 25:75, 0]
+            predictions.append(scores.detach().cpu().numpy().reshape(-1))
             del tensor, single_frame_pred, scores
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
     return np.concatenate(predictions).astype("float32")[: len(frames)].tolist()
+
+
+def _batched(iterable, size: int):
+    """Yield lists of up to ``size`` items from ``iterable``."""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def transnetv2_windows(frames):

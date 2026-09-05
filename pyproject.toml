@@ -11,12 +11,22 @@ dependencies = [
     "opencv-python>=4.13.0.92",
     "pillow>=12.2.0",
     "pre-commit>=4.6.0",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "transformers>=5.12.0",
+    "torch>=2.11.0,<2.12",
+    "torchvision>=0.26.0,<0.27",
+    # jina-clip-v2's remote code imports symbols removed in transformers 5.x.
+    "transformers>=4.55,<5",
     "google-genai>=2.8.0",
     "ollama>=0.6.2",
     "imageio-ffmpeg>=0.6.0",
+    "accelerate>=1.14.0",
+    "einops>=0.8.0",
+    "timm>=1.0.0",
+    "sentencepiece>=0.2.0",
+    "bitsandbytes>=0.46.1",
+    "fairscale>=0.4.13",
+    "sentence-transformers>=5.6.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
 ]
 
 [project.optional-dependencies]
@@ -40,7 +50,13 @@ dev = [
 ]
 
 [[tool.uv.index]]
+name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
 
 [tool.uv]
 index-strategy = "unsafe-best-match"
@@ -48,7 +64,7 @@ index-strategy = "unsafe-best-match"
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
-exclude = ["external"]
+exclude = ["external", "src/modules/embedding/_beit3_vendor"]
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -62,9 +78,18 @@ packages = [
     "src/retrieval",
     "src/stores",
     "src/ui",
+    "src/api",
     "src/video",
+    "src/agent",
+    "src/evaluation",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "integration: exercises more than one pipeline component",
+    "requires_ffmpeg: requires the bundled/system ffmpeg and OpenCV",
+    "gpu: requires an explicitly enabled CUDA smoke-test environment",
+    "slow: may load a real model or process real media",
+]

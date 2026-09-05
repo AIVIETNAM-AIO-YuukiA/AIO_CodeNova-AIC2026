@@ -17,11 +17,23 @@ def mock_experiment(tmp_path: Path) -> Experiment:
     run_dir = tmp_path / "runs" / "test"
     run_dir.mkdir(parents=True)
     config = MagicMock()
-    config.clip_model = "ViT-B/32"
-    config.embedding_model = "ViT-B/32"
+    config.embedding_models = ("siglip2-large",)
     config.device = "cpu"
     config.data_dir = tmp_path / "data"
     return Experiment(name="test", run_dir=run_dir, config=config)
+
+
+@pytest.fixture(autouse=True)
+def clear_retriever_cache():
+    """``_get_retriever`` caches by experiment name across calls (real usage:
+    one retriever per running server). Tests share the same mock experiment
+    name, so without clearing this cache a retriever mocked in one test would
+    leak into the next and mask the real assertion under test."""
+    from retrieval import vqa
+
+    vqa._RETRIEVER_CACHE.clear()
+    yield
+    vqa._RETRIEVER_CACHE.clear()
 
 
 @pytest.fixture
@@ -49,9 +61,8 @@ class TestVqaSearch:
         from retrieval.temporal_search import ShotInput
 
         with (
-            patch("retrieval.vqa.build_retriever") as mock_build_retriever,
+            patch("retrieval.vqa._get_retriever") as mock_get_retriever,
             patch("retrieval.vqa.load_temporal_data") as mock_load,
-            patch("retrieval.vqa.build_embedder") as mock_build_embedder,
             patch("retrieval.vqa.find_segments") as mock_find_seg,
             patch("retrieval.vqa.gather_frame_s") as mock_gather,
             patch("retrieval.vqa.create_agent") as mock_create_agent,
@@ -70,13 +81,13 @@ class TestVqaSearch:
             ]
             mock_load.return_value = (mock_embeddings, mock_records)
 
-            mock_retriever = MagicMock()
-            mock_retriever.search.return_value = mock_search_results
-            mock_build_retriever.return_value = mock_retriever
-
             mock_embedder = MagicMock()
             mock_embedder.embed_text.return_value = [0.1] * 512
-            mock_build_embedder.return_value = mock_embedder
+
+            mock_retriever = MagicMock()
+            mock_retriever.search.return_value = mock_search_results
+            mock_retriever.embedders = {"siglip2-large": mock_embedder}
+            mock_get_retriever.return_value = mock_retriever
 
             mock_find_seg.return_value = [
                 {"start_pos": 2, "end_pos": 6, "length": 5, "center_idx": 4}
@@ -90,7 +101,7 @@ class TestVqaSearch:
                 frame_count=5,
                 start_timestamp=4.0,
                 end_timestamp=12.0,
-                clip_score=0.75,
+                sim_score=0.75,
             )
             mock_gather.return_value = mock_shot
 
@@ -104,6 +115,7 @@ class TestVqaSearch:
                 question="What color is the shirt?",
                 context="outdoor scene",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert "answer" in result
@@ -111,7 +123,7 @@ class TestVqaSearch:
         assert "results" in result
         assert len(result["results"]) == 5
         assert "pipeline" in result
-        assert "clip_search" in result["pipeline"]
+        assert "embed_search" in result["pipeline"]
         assert "temporal_search" in result["pipeline"]
         assert "gather_shot" in result["pipeline"]
         assert "shot_validation" in result["pipeline"]
@@ -122,16 +134,17 @@ class TestVqaSearch:
     def test_vqa_search_no_results(self, mock_experiment):
         from retrieval.vqa import vqa_search
 
-        with patch("retrieval.vqa.build_retriever") as mock_build:
+        with patch("retrieval.vqa._get_retriever") as mock_get_retriever:
             mock_retriever = MagicMock()
             mock_retriever.search.return_value = []
-            mock_build.return_value = mock_retriever
+            mock_get_retriever.return_value = mock_retriever
 
             result = vqa_search(
                 experiment=mock_experiment,
                 query="nothing",
                 question="Any?",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert result["answer"] == "No relevant frames found."
@@ -141,19 +154,57 @@ class TestVqaSearch:
         from retrieval.vqa import vqa_search
 
         with (
-            patch("retrieval.vqa.build_retriever") as mock_build,
+            patch("retrieval.vqa._get_retriever") as mock_get_retriever,
             patch("retrieval.vqa.load_temporal_data", side_effect=FileNotFoundError("Missing")),
         ):
             mock_retriever = MagicMock()
             mock_retriever.search.return_value = mock_search_results
-            mock_build.return_value = mock_retriever
+            mock_get_retriever.return_value = mock_retriever
 
             result = vqa_search(
                 experiment=mock_experiment,
                 query="test",
                 question="Q?",
                 top_k=5,
+                pipeline_mode="legacy",
             )
 
         assert "Could not find" in result["answer"] or "not" in result["answer"]
         assert len(result["results"]) == 5
+
+    def test_grounded_mode_propagates_controls_and_never_falls_back_to_react(
+        self, mock_experiment
+    ):
+        from retrieval.vqa import vqa_search
+
+        abstention = {
+            "answer": "Chưa đủ bằng chứng để xác định X.",
+            "answer_status": "insufficient_evidence",
+            "results": [],
+        }
+        with (
+            patch("retrieval.vqa._get_retriever", return_value=object()),
+            patch(
+                "retrieval.grounded_vqa.grounded_vqa_search",
+                return_value=abstention,
+            ) as grounded_search,
+            patch("retrieval.vqa.create_agent") as create_agent,
+        ):
+            result = vqa_search(
+                experiment=mock_experiment,
+                query="đặt bốn con X lên đĩa",
+                question="X là con gì?",
+                top_k=50,
+                enabled_models=["siglip2-large"],
+                use_reranker=False,
+                use_llm=False,
+                pipeline_mode="grounded",
+            )
+
+        assert result["answer_status"] == "insufficient_evidence"
+        assert result["pipeline_mode"] == "grounded"
+        create_agent.assert_not_called()
+        assert grounded_search.call_args.kwargs["top_k"] == 50
+        assert grounded_search.call_args.kwargs["enabled_models"] == ["siglip2-large"]
+        assert grounded_search.call_args.kwargs["use_reranker"] is False
+        assert grounded_search.call_args.kwargs["use_llm"] is False

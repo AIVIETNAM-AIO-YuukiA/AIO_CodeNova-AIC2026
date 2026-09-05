@@ -1,7 +1,8 @@
 """ASR interface.
 
-Stub only: defines the contract so a Whisper/Qwen3-ASR backend can be added
-later without touching the indexing or retrieval layers.
+See ``modules/asr/gipformer.py`` for the concrete backend
+(g-group-ai-lab/gipformer-65M-rnnt via sherpa-onnx, in its own isolated
+``external/gipformer/`` repo+venv).
 """
 
 from __future__ import annotations

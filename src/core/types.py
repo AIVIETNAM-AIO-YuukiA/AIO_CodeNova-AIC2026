@@ -98,10 +98,22 @@ class SearchResult:
     shot_id: str | None = None
     frame_index: int | None = None
     timestamp_sec: float | None = None
+    caption: str | None = None
 
     def to_dict(self) -> dict[str, str | int | float | None]:
         """Serialize the result."""
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RetrievalQuery:
+    """Structured query representation for retrieval."""
+
+    text: str = ""
+
+    def to_search_string(self) -> str:
+        """Convert query object to plain search text string."""
+        return self.text
 
 
 def _optional_float(value: object) -> float | None:

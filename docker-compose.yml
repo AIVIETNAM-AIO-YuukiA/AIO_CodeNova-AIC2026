@@ -8,3 +8,59 @@ services:
     volumes:
       - ./qdrant_storage:/qdrant/storage
     restart: unless-stopped
+
+  # Full-text index for OCR/ASR search (BM25).
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.1.0
+    container_name: codenova-elasticsearch
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+      http.cors.enabled: "true"
+      http.cors.allow-origin: '"*"'
+      http.cors.allow-headers: X-Requested-With,Content-Type,Content-Length,Authorization
+    ports:
+      - "8882:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+
+  # Web UI for Elasticsearch (ES itself has no built-in UI, only a REST API).
+  elasticvue:
+    image: cars10/elasticvue:latest
+    container_name: codenova-elasticvue
+    ports:
+      - "8883:8080"
+    restart: unless-stopped
+
+  # Second-stage reranker, served via vLLM's OpenAI-compatible /v1/score (or
+  # /rerank) endpoint. GPU-hosted, so this is meant for a machine with real
+  # VRAM headroom (e.g. a rented Vast.ai GPU) rather than a 4GB laptop GPU
+  # already carrying the embedders (jina, siglip2) in the same process.
+  vllm-reranker:
+    image: vllm/vllm-openai:latest
+    container_name: codenova-vllm-reranker
+    command:
+      - --model=Qwen/Qwen3-VL-Reranker-2B
+      - --task=score
+      - --port=8000
+      - --gpu-memory-utilization=0.3
+      - --max-model-len=8192
+      - --dtype=bfloat16
+    ports:
+      - "8884:8000"
+    volumes:
+      - huggingface_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  elasticsearch_data:
+  huggingface_cache:
